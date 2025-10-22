@@ -24,8 +24,9 @@ def save_state():
 
 # ==== Metin yardımcıları ====
 STOP_PHRASES = [
-    r"işbu açıklama.*?amaçla", r"bu açıklama.*?kapsamında", r"kamunun bilgisine arz olunur",
-    r"saygılarımızla", r"yatırımcılarımızın bilgisine", r"özel durum açıklaması",
+    r"işbu açıklama.*?amaçla", r"bu açıklama.*?kapsamında",
+    r"kamunun bilgisine arz olunur", r"saygılarımızla",
+    r"yatırımcılarımızın bilgisine", r"özel durum açıklaması",
     r"yatırım tavsiyesi", r"işbu .*? kapsamındadır"
 ]
 def clean_text(t: str) -> str:
@@ -35,19 +36,15 @@ def clean_text(t: str) -> str:
     return t.strip(" -–—:.")
 
 def summarize(text: str, limit: int) -> str:
-    """Kısa ve doğal bir özet: ilk 1–2 anlamlı cümleyi al, limite yaklaşınca dur."""
     text = clean_text(text)
     sents = re.split(r"(?<=[.!?])\s+", text)
     out = ""
     for s in sents:
-        if not s: 
-            continue
+        if not s: continue
         cand = (out + " " + s).strip()
-        if len(cand) > limit:
-            break
+        if len(cand) > limit: break
         out = cand
-        if len(out) >= limit * 0.7:
-            break
+        if len(out) >= limit * 0.7: break
     return out or text[:limit]
 
 def is_pnl_news(title: str, body: str) -> bool:
@@ -64,8 +61,7 @@ def extract_kv_table(page) -> dict:
     """th/td tablosunu sözlüğe çevirir (alan adı -> değer)."""
     kv = {}
     rows = page.locator("table tr")
-    n = rows.count()
-    for i in range(n):
+    for i in range(rows.count()):
         th = rows.nth(i).locator("th")
         td = rows.nth(i).locator("td")
         if th.count() > 0 and td.count() > 0:
@@ -75,31 +71,47 @@ def extract_kv_table(page) -> dict:
                 kv[key] = val
     return kv
 
-def build_finance_summary(kv: dict) -> str:
-    """Tutar, vade, faiz, ISIN, aracı vb. alanlardan kısa özet üretir."""
-    # isim varyasyonları
-    tutar = kv.get("tutar") or kv.get("gerçekleştirilen nominal tutar") or kv.get("satışa konu nominal tutar") or kv.get("ihraç tavanı tutarı")
-    vade  = kv.get("vade tarihi") or kv.get("vade") or kv.get("vade (gün)")
-    faiz  = kv.get("faiz oranı - yıllık basit (%)") or kv.get("faiz oranı (%)") or kv.get("faiz oranı") or kv.get("kupon faizi")
-    isin  = kv.get("isin kodu") or kv.get("isin kod") or kv.get("isin")
-    arac  = kv.get("aracılık hizmeti alınan yatırım kuruluşu") or kv.get("aracı kurum") or kv.get("aracı kurum/kuruluş")
-    tip   = kv.get("bildirim konusu") or kv.get("konu") or kv.get("işlem türü")
+# Anahtar seçiminde öncelik vereceğimiz (ama bununla sınırlı olmayan) kelimeler
+KEY_PRIORITIES = [
+    "konu", "işlem türü", "sözleşme", "iş ilişkisi", "taraf", "karar", "tarih",
+    "tutar", "fiyat", "adet", "oran", "pay", "vade", "faiz", "temettü",
+    "ihale", "alım", "satış", "devralma", "devretme", "yatırım", "proje",
+    "isin", "aracı", "müşteri", "tedarikçi"
+]
+KEY_BLACKLIST = [
+    "gönderim tarihi", "yıl", "periyot", "bildirim tipi", "yapılan açıklamanın",
+    "yapılan açıklama ertelenmiş", "ekler", "dil", "referans", "versiyon"
+]
 
-    parts = []
-    if tip:   parts.append(tip)
-    if tutar: parts.append(tutar)
-    if vade:  parts.append(f"vade {vade}")
-    if faiz:  parts.append(f"faiz %{faiz}")
-    if isin:  parts.append(f"ISIN {isin}")
-    if arac:  parts.append(f"aracı: {arac}")
-    return ", ".join([p for p in parts if p])
+def pick_informative_pairs(kv: dict, max_pairs: int = 4):
+    """Anahtar-değer sözlüğünden en bilgilendirici birkaç çifti seç."""
+    if not kv: return []
+    scored = []
+    for k, v in kv.items():
+        if any(b in k for b in KEY_BLACKLIST): 
+            continue
+        score = 0
+        for i, word in enumerate(KEY_PRIORITIES[::-1]):  # sondakilere az, baştakilere çok puan
+            if word in k:
+                score += (i + 1)
+        # uzun ama gereksiz anahtarları bastır
+        score += min(len(v), 40) / 40.0
+        scored.append((score, k, v))
+    scored.sort(reverse=True)
+    out = []
+    for _, k, v in scored:
+        out.append(f"{k}: {v}")
+        if len(out) >= max_pairs:
+            break
+    return out
+
+def build_generic_summary(kv: dict) -> str:
+    """Her ilan türü için çalışacak genel özet: en iyi 3–4 anahtar=değer."""
+    pairs = pick_informative_pairs(kv, max_pairs=4)
+    return ", ".join(pairs)
 
 def extract_company_note(page) -> str:
-    """
-    Sayfanın altındaki 'Ek Açıklamalar' / 'Açıklamalar' vb. serbest metni döndürür.
-    Yoksa boş string.
-    """
-    # 1) 'Ek Açıklamalar' bir th/td satırı olarak gelebilir
+    """Sayfanın altındaki serbest metni döndürür (Ek Açıklamalar / paragraflar)."""
     try:
         el = page.locator("xpath=//th[contains(.,'Ek Açıklamalar')]/following-sibling::td")
         if el.count() > 0:
@@ -108,15 +120,12 @@ def extract_company_note(page) -> str:
                 return txt
     except Exception:
         pass
-    # 2) En alttaki paragraflar
     try:
         p_tags = page.locator("article p, .content p, p")
         n = p_tags.count()
         if n > 0:
-            # sondan birkaç paragrafı birleştir (genelde not en altta)
             tail = " ".join(p_tags.nth(i).inner_text() for i in range(max(0, n-3), n))
             tail = clean_text(tail)
-            # çok uzunsa kısalacak zaten; yeter ki en az 20 karakter olsun
             if len(tail) > 20:
                 return tail
     except Exception:
@@ -125,26 +134,16 @@ def extract_company_note(page) -> str:
 
 # ==== Liste sayfasından satır çekme ====
 def fetch_list_items(page):
-    """
-    Bildirim listesinde her satır için:
-    - code (hisse kodu)
-    - title (Konu)
-    - url (Detay linki)
-    - id  (linkten çıkarılan numerik id)
-    döner.
-    """
     items = []
-    rows = page.locator("table tbody tr")
-    n = rows.count()
-    for i in range(n):
+    rows = page.locator("table tbody tr, .table tbody tr")
+    for i in range(rows.count()):
         row = rows.nth(i)
         tds = row.locator("td")
-        if tds.count() < 5:
+        if tds.count() < 5: 
             continue
         code  = tds.nth(1).inner_text().strip()
         title = tds.nth(4).inner_text().strip()
 
-        # Detay linki; ikon veya metin olabilir
         link = ""
         lc = row.locator('a[href*="/tr/Bildirim/"], a[href*="/tr/bildirim/"]')
         if lc.count() > 0:
@@ -176,12 +175,13 @@ def main():
             timezone_id="Europe/Istanbul"
         )
         page = context.new_page()
-        page.set_default_timeout(20000)
+        page.set_default_timeout(30000)
 
-        # Liste sayfasını aç
         try:
-            page.goto("https://www.kap.org.tr/tr/bildirim-sorgu", wait_until="load")
-            # Çerez/KVKK bandı varsa kapat
+            # 1) Liste sayfası
+            page.goto("https://www.kap.org.tr/tr/bildirim-sorgu", wait_until="networkidle")
+
+            # 2) Çerez/KVKK bandı varsa kapat
             try:
                 btn = page.locator("button:has-text('Kabul Et'), button:has-text('KABUL ET')")
                 if btn.count() > 0:
@@ -189,32 +189,43 @@ def main():
                     print(">> cookie accepted")
             except Exception:
                 pass
-            page.wait_for_selector("table tbody tr", timeout=15000)
+
+            # 3) 'Ara' butonuna bas (tablo bu tıkla geliyor)
+            try:
+                search_btn = page.locator("button:has-text('Ara'), [role='button']:has-text('Ara')")
+                search_btn.first.click()
+                print(">> search clicked")
+            except Exception as e:
+                print("!! search click failed:", e)
+
+            # 4) Tabloyu bekle
+            page.wait_for_selector("table tbody tr, .table tbody tr", timeout=30000)
+
         except PWTimeout:
             print("!! tablo gelmedi (timeout)")
             browser.close()
             return
 
+        # 5) Satırları topla
         items = fetch_list_items(page)
         print(f">> parsed items: {len(items)}")
 
-        # Sadece yeni olanlar
+        # 6) Sadece yeni olanları işle
         new_items = [it for it in items if it["id"] not in posted]
         print(f">> new items: {len(new_items)} (posted: {len(posted)})")
 
-        # Kronolojik sırayla gönder (eskiden yeniye)
-        new_items.reverse()
+        new_items.reverse()  # eskiden yeniye
 
         for it in new_items:
             # Detay sayfasını aç
             page.goto(it["url"], wait_until="load")
             page.wait_for_timeout(1200)
 
-            # 1) KV tablo → finansal özet
+            # a) KV tablo (varsa) → genel özet
             kv = extract_kv_table(page)
-            fin_sum = build_finance_summary(kv)
+            kv_sum = build_generic_summary(kv) if kv else ""
 
-            # 2) Özet Bilgi (varsa)
+            # b) Özet Bilgi (varsa)
             ozet = ""
             try:
                 el = page.locator("xpath=//th[contains(.,'Özet Bilgi')]/following-sibling::td")
@@ -223,11 +234,11 @@ def main():
             except Exception:
                 pass
 
-            # 3) Şirketin serbest "açıklama notu" (en altta)
+            # c) Şirketin serbest "açıklama notu" (en altta)
             note = extract_company_note(page)
 
-            # Öncelik: açıklama notu > finansal özet > özet bilgi > başlık
-            body = note or fin_sum or ozet or it["title"]
+            # Öncelik: açıklama notu > kv özet > özet bilgi > başlık
+            body = note or kv_sum or ozet or it["title"]
 
             tweet = format_tweet(it["code"], it["title"], body)
             print(">> TWEET:", tweet)
@@ -237,7 +248,7 @@ def main():
                 posted.add(it["id"])
                 save_state()
                 print(">> tweet sent ✓")
-                time.sleep(1.5)  # nazikçe
+                time.sleep(1.5)
             except Exception as e:
                 print("!! tweet error:", e)
 
