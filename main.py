@@ -159,7 +159,7 @@ class KapNewsBot:
                 if locator.count() > 0:
                     locator.first.click()
                     page.wait_for_load_state("networkidle")
-                    page.wait_for_timeout(1500)
+                    page.wait_for_timeout(2000)  # Artırıldı
                     logger.info("Öne çıkanlar sekmesine geçildi")
                     return True
             except Exception as e:
@@ -173,39 +173,70 @@ class KapNewsBot:
         """Debug için sayfa içeriğini kontrol et"""
         logger.info("Sayfa debug ediliyor...")
         
-        # Sayfanın HTML'sini kaydet
+        # Sayfanın screenshot'ını al
+        page.screenshot(path="debug_screenshot.png")
+        logger.info("Sayfa screenshot'ı alındı: debug_screenshot.png")
+        
+        # Sayfa HTML'sini kaydet
         html_content = page.content()
         with open("debug_page.html", "w", encoding="utf-8") as f:
             f.write(html_content)
         logger.info("Debug HTML kaydedildi: debug_page.html")
         
-        # KAP içeren tüm elementleri bul
-        kap_elements = page.locator(":has-text('KAP')")
-        logger.info(f"Sayfada {kap_elements.count()} adet 'KAP' içeren element bulundu")
+        # TÜM KAP elementlerini detaylı logla
+        all_kap_elements = page.locator(':has-text("KAP")')
+        logger.info(f"Sayfada toplam {all_kap_elements.count()} KAP elementi var")
         
-        # İlk 5 elementi logla
-        for i in range(min(5, kap_elements.count())):
+        # İlk 10 KAP elementinin detayını logla
+        for i in range(min(10, all_kap_elements.count())):
             try:
-                text = kap_elements.nth(i).inner_text()
-                logger.info(f"KAP Element {i+1}: {text[:100]}...")
+                element = all_kap_elements.nth(i)
+                text = element.inner_text()
+                logger.info(f"KAP Element {i+1}: {text[:200]}...")
             except Exception as e:
-                logger.error(f"Element {i+1} okunamadı: {e}")
+                logger.error(f"KAP Element {i+1} okunamadı: {e}")
     
     def get_kap_rows(self, page: Page) -> List[Dict]:
-        """KAP satırlarını bul"""
+        """KAP satırlarını bul - GÜNCELLENMİŞ VERSİYON"""
         logger.info("KAP haberleri aranıyor...")
         
         try:
             page.goto(self.cfg.AKIS_URL, wait_until="networkidle")
-            page.wait_for_timeout(3000)
             
-            # Önce debug yapalım
+            # DAHA UZUN BEKLE - JavaScript'in yüklenmesi için
+            logger.info("Sayfanın yüklenmesi bekleniyor...")
+            page.wait_for_timeout(5000)
+            
+            # Debug için mevcut durumu kaydet
             self.debug_page_content(page)
             
-            # Öne çıkanlar sekmesine geçmeyi dene
+            # "Öne çıkanlar" sekmesine geç
             self.go_highlights(page)
             
-            # Daha geniş selector deneyelim
+            # HABERLERİN GELMESİ İÇİN EK BEKLEME
+            logger.info("Haberlerin yüklenmesi bekleniyor...")
+            page.wait_for_timeout(4000)
+            
+            # HABER CONTAINER'INI BEKLE
+            try:
+                # Haber container'ı için farklı selector'lar dene
+                news_selectors = [
+                    "[class*='news']", "[class*='haber']", "[class*='flow']",
+                    "[class*='list']", "[class*='container']", "ul", "ol", "li"
+                ]
+                
+                for selector in news_selectors:
+                    elements = page.locator(selector)
+                    if elements.count() > 0:
+                        logger.info(f"Haber container bulundu: {selector} ({elements.count()} element)")
+                        break
+                else:
+                    logger.warning("Hiçbir haber container selector'ı çalışmadı")
+                        
+            except Exception as e:
+                logger.warning(f"Haber container beklenirken hata: {e}")
+
+            # ANA KAP Arama kodu
             rows = []
             seen = set()
             
@@ -213,7 +244,7 @@ class KapNewsBot:
             container_selectors = [
                 "div", "li", "article", "section", 
                 "[class*='news']", "[class*='haber']", "[class*='card']",
-                "[class*='item']", "[class*='flow']"
+                "[class*='item']", "[class*='flow']", "[class*='list']"
             ]
             
             for selector in container_selectors:
@@ -222,16 +253,20 @@ class KapNewsBot:
                     count = containers.count()
                     logger.info(f"Selector '{selector}': {count} element bulundu")
                     
-                    for i in range(min(20, count)):
+                    for i in range(min(25, count)):  # Limit artırıldı
                         try:
                             container = containers.nth(i)
                             text = container.inner_text().strip()
+                            
+                            # DEBUG: Tüm KAP text'lerini görelim
+                            if "KAP" in text:
+                                logger.info(f"KAP Text Örneği: {text[:150]}...")
                             
                             # KAP pattern'ını ara
                             match = self.cfg.KAP_LINE_RE.search(text)
                             if match:
                                 code = match.group(1)
-                                logger.info(f"KAP bulundu: {code}")
+                                logger.info(f"KAP EŞLEŞTİ: {code}")
                                 
                                 # Link bul
                                 link = container.locator("a").first
@@ -248,6 +283,10 @@ class KapNewsBot:
                                             "raw_text": text
                                         })
                                         logger.info(f"KAP eklendi: {code} - {text[:50]}...")
+                                else:
+                                    logger.warning(f"KAP {code} için link bulunamadı")
+                            else:
+                                logger.debug(f"KAP bulundu ama regex eşleşmedi: {text[:80]}...")
                                 
                         except Exception as e:
                             logger.debug(f"Container {i} işlenirken hata: {e}")
@@ -277,7 +316,7 @@ class KapNewsBot:
                 "div[role='dialog'], .modal, .MuiDialog-root, .ant-modal", 
                 timeout=10000
             )
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(1500)  # Artırıldı
             
             headline = ""
             
