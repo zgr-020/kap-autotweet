@@ -1,12 +1,13 @@
 name: KAP AutoTweet (Playwright)
 
 on:
+  # İstersen sıklaştırıp seyrekleştirebilirsin (*/2 = 2 dakikada bir)
   schedule:
-    - cron: "*/1 * * * *"   # dakikada bir
+    - cron: "*/2 * * * *"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   run:
@@ -16,7 +17,7 @@ jobs:
       - name: Repo’yu getir
         uses: actions/checkout@v4
 
-      - name: Python kurulum
+      - name: Python kur
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -24,8 +25,7 @@ jobs:
       - name: Bağımlılıkları kur
         run: |
           python -m pip install --upgrade pip
-          python -m pip install tweepy playwright "pdfminer.six==20231228"
-          python -m pip show pdfminer.six
+          python -m pip install tweepy playwright
           python -m playwright install --with-deps chromium
 
       - name: Çalıştır
@@ -35,3 +35,12 @@ jobs:
           ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
           ACCESS_TOKEN_SECRET: ${{ secrets.ACCESS_TOKEN_SECRET }}
         run: python main.py
+
+      # Hata olursa ekran görüntüsü/HTML bırakmışsak indirmeye yarar (opsiyonel)
+      - name: Debug çıktıları (varsa) yükle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kap-debug
+          path: debug/
+          if-no-files-found: ignore
