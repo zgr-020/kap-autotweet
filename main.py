@@ -38,7 +38,7 @@ class BotConfig:
     
     # Regex patterns
     UPPER_TR = "A-ZÇĞİÖŞÜ"
-    KAP_LINE_RE = re.compile(rf"^\s*KAP\s*·\s*([{UPPER_TR}0-9]{{3,6}})\b", re.M)
+    KAP_LINE_RE = re.compile(rf"^\s*KAP\s*[·:]\s*([{UPPER_TR}0-9]{{3,6}})\b", re.M)
     
     STOP_PHRASES = [
         r"işbu açıklama.*?amaçla", r"yatırım tavsiyesi değildir", r"kamunun bilgisine arz olunur",
