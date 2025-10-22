@@ -1,6 +1,5 @@
 import os, re, json, time
 from pathlib import Path
-from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright
 import tweepy
 
@@ -26,7 +25,7 @@ def save_state():
 # ================== Yardımcılar ==============================
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
 UPPER_TR = "A-ZÇĞİÖŞÜ"
-CODE_RE = re.compile(rf"\b[{UPPER_TR}0-9]{{3,6}}\b")
+KAP_LINE_RE = re.compile(rf"^\s*KAP\s*·\s*([{UPPER_TR}0-9]{{3,6}})\b", re.M)  # tam 'KAP · KOD'
 
 STOP_PHRASES = [
     r"işbu açıklama.*?amaçla", r"yatırım tavsiyesi değildir", r"kamunun bilgisine arz olunur",
@@ -40,10 +39,8 @@ def clean_text(t: str) -> str:
 
 def summarize(text: str, limit: int) -> str:
     text = clean_text(text)
-    # modal başlığı zaten kısa olur; yine de emniyet
     if len(text) <= limit:
         return text
-    # cümle sonuna kadar kes
     parts = re.split(r"(?<=[.!?])\s+", text)
     out = ""
     for s in parts:
@@ -53,7 +50,6 @@ def summarize(text: str, limit: int) -> str:
         out = cand
     return out or text[:limit]
 
-# Basit bir “özgünleştirici”: çekirdek anlam ve sayıları korur, kalıpları sadeleştirir
 REWRITE_MAP = [
     (r"\bbildirdi\b", "duyurdu"),
     (r"\bbildirimi\b", "açıklaması"),
@@ -61,17 +57,13 @@ REWRITE_MAP = [
     (r"\bgerçekleştirdi\b", "tamamladı"),
     (r"\bbaşladı\b", "başlattı"),
     (r"\bdevam ediyor\b", "sürdürülüyor"),
-    (r"\butağında\b", "kapsamında"),
 ]
 def rewrite_turkish_short(s: str) -> str:
     s = clean_text(s)
-    # tırnak/boş parantez/tekrar temizliği
     s = re.sub(r"[“”\"']", "", s)
     s = re.sub(r"\(\s*\)", "", s)
-    # bazı kalıpları sadeleştir
     for pat, rep in REWRITE_MAP:
         s = re.sub(pat, rep, s, flags=re.I)
-    # baştaki “Şirket/…;” gibi etiketleri kırp
     s = re.sub(r"^\s*[-–—•·]\s*", "", s)
     return s.strip()
 
@@ -81,93 +73,101 @@ def is_pnl_news(text: str) -> bool:
 
 def build_tweet(code: str, headline: str) -> str:
     base = rewrite_turkish_short(headline)
-    base = summarize(base, 240)  # biraz pay bırakalım
+    base = summarize(base, 240)  # birkaç karakter buffer
     head = ("💰" if is_pnl_news(base) else "📰") + f" #{code} | "
     return (head + base)[:279]
 
-# ================== Fintables → “KAP” satırları ==================
+# =============== Sayfada 'Öne çıkanlar' sekmesine geç =========
+def go_highlights(page):
+    """Akış sayfasında 'Öne çıkanlar' sekmesini açar."""
+    for sel in [
+        "button:has-text('Öne çıkanlar')",
+        "[role='tab']:has-text('Öne çıkanlar')",
+        "a:has-text('Öne çıkanlar')",
+        "text=Öne çıkanlar",
+    ]:
+        try:
+            loc = page.locator(sel)
+            if loc.count():
+                loc.first.click()
+                page.wait_for_load_state("networkidle")
+                page.wait_for_timeout(800)
+                print(">> highlights ON")
+                return True
+        except Exception:
+            continue
+    print(">> highlights button not found; staying on 'Tümü'")
+    return False
+
+# =============== 'KAP · KOD' satırlarını çek ==================
 def get_kap_rows(page):
-    """
-    Akış sayfasındaki 'KAP' etiketli satırlardan:
-    - benzersiz id (satır metni + zaman damgasından türetilir)
-    - hisse kodu (mavi chip/etiket)
-    - modalı açmak için tıklanacak anchor
-    döndürür.
-    """
     page.goto(AKIS_URL, wait_until="networkidle")
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(1200)
+    go_highlights(page)
 
-    # Satır kapsayıcıları: her satır genelde <li> veya <div> blok
-    candidates = page.locator("li, div").filter(has_text=re.compile(r"\bKAP\b"))
-    rows = []
-    seen_ids = set()
+    containers = page.locator("li, div").filter(has_text="KAP")
+    rows, seen = [], set()
 
-    for i in range(min(200, candidates.count())):  # ilk 200 satır yeter
-        row = candidates.nth(i)
+    for i in range(min(250, containers.count())):
+        row = containers.nth(i)
         text = row.inner_text().strip()
-        if "KAP" not in text:
-            continue
 
-        # hisse kodu: mavi etiketin metni (regex + yakın çevre fallback)
-        m = CODE_RE.search(text)
-        code = m.group(0) if m else ""
-        if not code:
-            inner_tags = row.locator("a, span, div")
-            for j in range(min(10, inner_tags.count())):
-                t = (inner_tags.nth(j).inner_text() or "").strip()
-                mm = CODE_RE.search(t)
-                if mm:
-                    code = mm.group(0); break
-        if not code:
-            continue
+        m = KAP_LINE_RE.search(text)
+        if not m:
+            continue  # KAP değil → at
 
-        # tıklanacak link (aynı satır içindeki ilk anchor)
+        code = m.group(1)
+
         link = row.locator("a").first
         if link.count() == 0:
             continue
 
-        # benzersiz id oluştur: link href + görünen metinden
         href = link.get_attribute("href") or f"row-{i}"
         mslug = re.search(r"([a-z0-9_-]{8,}|[0-9]{6,})", href, re.I)
         rid = (mslug.group(1) if mslug else href) + "_" + code
 
-        if rid in seen_ids:
+        if rid in seen:
             continue
-        seen_ids.add(rid)
+        seen.add(rid)
 
         rows.append({"id": rid, "code": code, "link": link})
 
     return rows
 
-# ================== Modal başlığını çek ========================
+# =============== Modal başlığını oku ==========================
 def open_row_and_read_headline(page, link_locator):
-    """
-    Satır linkine tıklar, modal açılınca başlık metnini döndürür.
-    """
-    # Modal açtır
-    link_locator.scroll_into_view_if_needed()
+    link_locator.scroll_into_view_if_needed(timeout=10000)
     link_locator.click()
-    # Modal köşesindeki kapat/çarpı ikonuna göre bekle
     page.wait_for_selector("div[role='dialog'], .modal, .MuiDialog-root, .ant-modal", timeout=10000)
 
-    # Başlık: modal içindeki ilk <h> veya güçlü başlık alanı
     headline = ""
     for sel in [
-        "div[role='dialog'] h1, .modal h1, .MuiDialog-root h1, .ant-modal h1",
-        "div[role='dialog'] h2, .modal h2, .MuiDialog-root h2, .ant-modal h2",
-        "div[role='dialog'] .title, .modal .title, .MuiDialog-root .MuiTypography-root",
+        "div[role='dialog'] h1",
+        ".modal h1",
+        ".MuiDialog-root h1",
+        ".ant-modal h1",
+        "div[role='dialog'] h2",
+        ".modal h2",
+        ".MuiDialog-root .MuiTypography-root.MuiTypography-h6",
+        ".ant-modal .ant-modal-title",
     ]:
         loc = page.locator(sel)
         if loc.count():
             headline = loc.first.inner_text().strip()
-            break
-    if not headline:
-        # fallback: modal içindeki ilk satır
-        modal = page.locator("div[role='dialog'], .modal, .MuiDialog-root, .ant-modal").first
-        if modal.count():
-            headline = modal.inner_text().split("\n")[0].strip()
+            if len(headline) > 5:
+                break
 
-    # modalı kapat (sağ üst çarpı)
+    if not headline:
+        try:
+            modal = page.locator("div[role='dialog'], .modal, .MuiDialog-root, .ant-modal").first
+            ps = modal.locator("p")
+            if ps.count():
+                headline = " ".join(ps.nth(i).inner_text().strip() for i in range(min(2, ps.count())))
+                headline = headline.strip()
+        except Exception:
+            pass
+
+    # modalı kapat
     try:
         close_btn = page.locator("button:has-text('Kapat'), [aria-label='Close'], .ant-modal-close, .MuiDialog-root button[aria-label='close']")
         if close_btn.count():
@@ -196,18 +196,13 @@ def main():
         page = ctx.new_page()
         page.set_default_timeout(30000)
 
-        # 1) KAP satırlarını çek
         rows = get_kap_rows(page)
         print(f">> kap rows: {len(rows)}")
 
-        # 2) yeni olanları filtrele
         new_rows = [r for r in rows if r["id"] not in posted]
         print(f">> new: {len(new_rows)} (posted: {len(posted)})")
-
-        # eskiden yeniye
         new_rows.reverse()
 
-        # 3) her satır için modal başlığını al → özgünleştir → tweet
         for r in new_rows:
             try:
                 headline = open_row_and_read_headline(page, r["link"])
@@ -216,7 +211,8 @@ def main():
                 continue
 
             if not headline:
-                continue
+                print("!! headline not found, skipping")
+                continue  # başlık yoksa tweet atma
 
             tweet = build_tweet(r["code"], headline)
             print(">> TWEET:", tweet)
