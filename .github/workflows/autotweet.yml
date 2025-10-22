@@ -23,8 +23,9 @@ jobs:
 
       - name: Bağımlılıkları kur
         run: |
-          pip install --upgrade pip
-          pip install tweepy playwright pdfminer.six
+          python -m pip install --upgrade pip
+          python -m pip install tweepy playwright "pdfminer.six==20231228"
+          python -m pip show pdfminer.six
           python -m playwright install --with-deps chromium
 
       - name: Çalıştır
