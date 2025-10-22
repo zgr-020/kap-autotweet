@@ -1,10 +1,10 @@
-import os, re, json, time, tempfile
+import os, re, json, time
 from pathlib import Path
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-from pdfminer.high_level import extract_text
+from urllib.parse import urljoin
+from playwright.sync_api import sync_playwright
 import tweepy
 
-# ==== X (Twitter) erişimi ====
+# ================== X (Twitter) anahtarları ==================
 API_KEY = os.getenv("API_KEY")
 API_KEY_SECRET = os.getenv("API_KEY_SECRET")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
@@ -14,199 +14,223 @@ client = tweepy.Client(
     consumer_key=API_KEY,
     consumer_secret=API_KEY_SECRET,
     access_token=ACCESS_TOKEN,
-    access_token_secret=ACCESS_TOKEN_SECRET
+    access_token_secret=ACCESS_TOKEN_SECRET,
 )
 
-# ==== Kalıcı durum ====
+# ================== Durum (aynı şeyi iki kez atma) ==========
 STATE_FILE = Path("state.json")
 posted = set(json.loads(STATE_FILE.read_text())) if STATE_FILE.exists() else set()
-def save_state(): STATE_FILE.write_text(json.dumps(sorted(list(posted)), ensure_ascii=False))
+def save_state():
+    STATE_FILE.write_text(json.dumps(sorted(list(posted)), ensure_ascii=False))
 
-# ==== Metin yardımcıları ====
+# ================== Yardımcılar ==============================
+AKIS_URL = "https://fintables.com/borsa-haber-akisi"
+UPPER_TR = "A-ZÇĞİÖŞÜ"
+CODE_RE = re.compile(rf"\b[{UPPER_TR}0-9]{{3,6}}\b")
+
 STOP_PHRASES = [
-    r"işbu açıklama.*?amaçla", r"bu açıklama.*?kapsamında", r"kamunun bilgisine arz olunur",
-    r"saygılarımızla", r"yatırımcılarımızın bilgisine", r"özel durum açıklaması",
-    r"yatırım tavsiyesi", r"işbu .*? kapsamındadır"
+    r"işbu açıklama.*?amaçla", r"yatırım tavsiyesi değildir", r"kamunun bilgisine arz olunur",
+    r"saygılarımızla", r"özel durum açıklaması", r"yatırımcılarımızın bilgisine",
 ]
 def clean_text(t: str) -> str:
     t = re.sub(r"\s+", " ", (t or "")).strip()
-    for p in STOP_PHRASES: t = re.sub(p, "", t, flags=re.I)
+    for p in STOP_PHRASES:
+        t = re.sub(p, "", t, flags=re.I)
     return t.strip(" -–—:.")
 
 def summarize(text: str, limit: int) -> str:
     text = clean_text(text)
-    sents = re.split(r"(?<=[.!?])\s+", text)
+    # modal başlığı zaten kısa olur; yine de emniyet
+    if len(text) <= limit:
+        return text
+    # cümle sonuna kadar kes
+    parts = re.split(r"(?<=[.!?])\s+", text)
     out = ""
-    for s in sents:
+    for s in parts:
         if not s: continue
         cand = (out + " " + s).strip()
         if len(cand) > limit: break
         out = cand
-        if len(out) >= limit * 0.7: break
     return out or text[:limit]
 
-def is_pnl_news(title: str, body: str) -> bool:
-    blob = (title or "") + " " + (body or "")
-    return bool(re.search(r"\b(kâr|kar|zarar|net dönem kar|dönem karı|zararı|finansal sonuç)\b", blob.lower()))
+# Basit bir “özgünleştirici”: çekirdek anlam ve sayıları korur, kalıpları sadeleştirir
+REWRITE_MAP = [
+    (r"\bbildirdi\b", "duyurdu"),
+    (r"\bbildirimi\b", "açıklaması"),
+    (r"\bilgisine\b", "paylaştı"),
+    (r"\bgerçekleştirdi\b", "tamamladı"),
+    (r"\bbaşladı\b", "başlattı"),
+    (r"\bdevam ediyor\b", "sürdürülüyor"),
+    (r"\butağında\b", "kapsamında"),
+]
+def rewrite_turkish_short(s: str) -> str:
+    s = clean_text(s)
+    # tırnak/boş parantez/tekrar temizliği
+    s = re.sub(r"[“”\"']", "", s)
+    s = re.sub(r"\(\s*\)", "", s)
+    # bazı kalıpları sadeleştir
+    for pat, rep in REWRITE_MAP:
+        s = re.sub(pat, rep, s, flags=re.I)
+    # baştaki “Şirket/…;” gibi etiketleri kırp
+    s = re.sub(r"^\s*[-–—•·]\s*", "", s)
+    return s.strip()
 
-def format_tweet(code: str, title: str, body: str) -> str:
-    head_emoji = "💰" if is_pnl_news(title, body) else "📰"
-    head = f"{head_emoji} #{code} | "
-    return (head + summarize(body or title, 279 - len(head)))[:279]
+def is_pnl_news(text: str) -> bool:
+    txt = text.lower()
+    return any(k in txt for k in ["kâr", "kar", "zarar", "net dönem", "temettü", "temettu"])
 
-# ==== Listeyi al (XHR ya da DOM) ====
-def fetch_list_items(page):
-    # Sayfaya git → “Kabul Et” → “Ara”
-    page.goto("https://www.kap.org.tr/tr/bildirim-sorgu", wait_until="networkidle")
-    try:
-        btn = page.get_by_role("button", name=re.compile("Kabul Et", re.I))
-        if btn.count(): btn.first.click()
-    except Exception: pass
-    try:
-        page.get_by_role("button", name=re.compile("^Ara$", re.I)).first.click()
-    except Exception:
-        page.locator("button:has-text('Ara'), [role='button']:has-text('Ara')").first.click()
+def build_tweet(code: str, headline: str) -> str:
+    base = rewrite_turkish_short(headline)
+    base = summarize(base, 240)  # biraz pay bırakalım
+    head = ("💰" if is_pnl_news(base) else "📰") + f" #{code} | "
+    return (head + base)[:279]
 
-    # 1) XHR yanıtından yakalamayı dene
-    def is_resp(r):
-        u = r.url.lower()
-        return r.status==200 and ("api" in u) and ("disclosure" in u or "bildirim" in u or "search" in u)
-    items = []
-    try:
-        resp = page.wait_for_response(lambda r: is_resp(r), timeout=30000)
-        j = resp.json()
-        data = j.get("data") if isinstance(j, dict) else j
-        for it in (data or []):
-            code = it.get("companyCode") or it.get("code") or ""
-            title = it.get("title") or it.get("subject") or ""
-            href  = it.get("detailUrl") or ""
-            _id   = it.get("id") or ""
-            if not href and _id:
-                href = f"https://www.kap.org.tr/tr/Bildirim/{_id}"
-            if not (_id or href) or not code or not title: continue
-            if not _id:
-                m = re.search(r"(\d{6,})", href); _id = m.group(1) if m else href
-            items.append({"id": _id, "code": code, "title": title, "url": href})
-    except Exception:
-        pass
-
-    # 2) Olmazsa DOM’dan al
-    if not items:
-        page.wait_for_selector("table tbody tr, .table tbody tr", timeout=30000)
-        rows = page.locator("table tbody tr, .table tbody tr")
-        for i in range(rows.count()):
-            row = rows.nth(i); tds = row.locator("td")
-            if tds.count() < 5: continue
-            code = tds.nth(1).inner_text().strip()
-            title = tds.nth(4).inner_text().strip()
-            link = ""
-            lc = row.locator('a[href*="/tr/Bildirim/"], a[href*="/tr/bildirim/"]')
-            if lc.count(): link = lc.first.get_attribute("href")
-            if not link:
-                a = row.locator("a"); 
-                if a.count(): link = a.first.get_attribute("href")
-            if not (code and title and link): continue
-            m = re.search(r"(\d{6,})", link); _id = m.group(1) if m else link
-            items.append({"id": _id, "code": code, "title": title, "url": link})
-    return items
-
-# ==== Detay PDF → metin ====
-def extract_text_from_pdf(page) -> str:
+# ================== Fintables → “KAP” satırları ==================
+def get_kap_rows(page):
     """
-    Detay sayfasının sağındaki 'PDF' tuşunu tıkla,
-    PDF response'ını yakala ve metni çıkar.
+    Akış sayfasındaki 'KAP' etiketli satırlardan:
+    - benzersiz id (satır metni + zaman damgasından türetilir)
+    - hisse kodu (mavi chip/etiket)
+    - modalı açmak için tıklanacak anchor
+    döndürür.
     """
-    text = ""
-    # 1) PDF düğmesini bul
-    pdf_btn = None
-    for sel in [
-        "a:has-text('PDF')",
-        "button:has-text('PDF')",
-        "a[title*='PDF' i]",
-        "a[href*='.pdf']",
-    ]:
-        try:
-            cand = page.locator(sel)
-            if cand.count():
-                pdf_btn = cand.first; break
-        except Exception:
+    page.goto(AKIS_URL, wait_until="networkidle")
+    page.wait_for_timeout(1500)
+
+    # Satır kapsayıcıları: her satır genelde <li> veya <div> blok
+    candidates = page.locator("li, div").filter(has_text=re.compile(r"\bKAP\b"))
+    rows = []
+    seen_ids = set()
+
+    for i in range(min(200, candidates.count())):  # ilk 200 satır yeter
+        row = candidates.nth(i)
+        text = row.inner_text().strip()
+        if "KAP" not in text:
             continue
-    if not pdf_btn:
-        return text
 
-    # 2) PDF response'u bekle (bazı sayfalarda indirme olabiliyor)
+        # hisse kodu: mavi etiketin metni (regex + yakın çevre fallback)
+        m = CODE_RE.search(text)
+        code = m.group(0) if m else ""
+        if not code:
+            inner_tags = row.locator("a, span, div")
+            for j in range(min(10, inner_tags.count())):
+                t = (inner_tags.nth(j).inner_text() or "").strip()
+                mm = CODE_RE.search(t)
+                if mm:
+                    code = mm.group(0); break
+        if not code:
+            continue
+
+        # tıklanacak link (aynı satır içindeki ilk anchor)
+        link = row.locator("a").first
+        if link.count() == 0:
+            continue
+
+        # benzersiz id oluştur: link href + görünen metinden
+        href = link.get_attribute("href") or f"row-{i}"
+        mslug = re.search(r"([a-z0-9_-]{8,}|[0-9]{6,})", href, re.I)
+        rid = (mslug.group(1) if mslug else href) + "_" + code
+
+        if rid in seen_ids:
+            continue
+        seen_ids.add(rid)
+
+        rows.append({"id": rid, "code": code, "link": link})
+
+    return rows
+
+# ================== Modal başlığını çek ========================
+def open_row_and_read_headline(page, link_locator):
+    """
+    Satır linkine tıklar, modal açılınca başlık metnini döndürür.
+    """
+    # Modal açtır
+    link_locator.scroll_into_view_if_needed()
+    link_locator.click()
+    # Modal köşesindeki kapat/çarpı ikonuna göre bekle
+    page.wait_for_selector("div[role='dialog'], .modal, .MuiDialog-root, .ant-modal", timeout=10000)
+
+    # Başlık: modal içindeki ilk <h> veya güçlü başlık alanı
+    headline = ""
+    for sel in [
+        "div[role='dialog'] h1, .modal h1, .MuiDialog-root h1, .ant-modal h1",
+        "div[role='dialog'] h2, .modal h2, .MuiDialog-root h2, .ant-modal h2",
+        "div[role='dialog'] .title, .modal .title, .MuiDialog-root .MuiTypography-root",
+    ]:
+        loc = page.locator(sel)
+        if loc.count():
+            headline = loc.first.inner_text().strip()
+            break
+    if not headline:
+        # fallback: modal içindeki ilk satır
+        modal = page.locator("div[role='dialog'], .modal, .MuiDialog-root, .ant-modal").first
+        if modal.count():
+            headline = modal.inner_text().split("\n")[0].strip()
+
+    # modalı kapat (sağ üst çarpı)
     try:
-        with page.expect_response(lambda r: "application/pdf" in (r.headers.get("content-type","").lower()), timeout=20000) as resp_info:
-            pdf_btn.click()
-        resp = resp_info.value
-        pdf_bytes = resp.body()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
-            f.write(pdf_bytes); pdf_path = f.name
-        text = extract_text(pdf_path) or ""
-        try: os.remove(pdf_path)
-        except Exception: pass
-        if text: return text
+        close_btn = page.locator("button:has-text('Kapat'), [aria-label='Close'], .ant-modal-close, .MuiDialog-root button[aria-label='close']")
+        if close_btn.count():
+            close_btn.first.click()
+        else:
+            page.keyboard.press("Escape")
     except Exception:
         pass
 
-    # 3) Fallback: indirme olayı (download) ile yakala
-    try:
-        with page.expect_download(timeout=20000) as dl_info:
-            pdf_btn.click()
-        download = dl_info.value
-        pdf_path = download.path()
-        if not pdf_path:
-            pdf_path = download.save_as(str(Path(tempfile.gettempdir()) / f"kap_{int(time.time())}.pdf"))
-        text = extract_text(pdf_path) or ""
-        return text
-    except Exception:
-        return ""
+    return headline
 
+# ================== ANA AKIŞ ==================================
 def main():
     print(">> start")
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-gpu","--disable-dev-shm-usage"])
-        context = browser.new_context(
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
+        )
+        ctx = browser.new_context(
             user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                         "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
             locale="tr-TR",
-            timezone_id="Europe/Istanbul"
+            timezone_id="Europe/Istanbul",
         )
-        page = context.new_page(); page.set_default_timeout(30000)
+        page = ctx.new_page()
+        page.set_default_timeout(30000)
 
-        # 1) Listeyi al
-        try:
-            items = fetch_list_items(page)
-        except PWTimeout:
-            print("!! page timeout (list)"); browser.close(); return
+        # 1) KAP satırlarını çek
+        rows = get_kap_rows(page)
+        print(f">> kap rows: {len(rows)}")
 
-        if not items:
-            print("!! no items from xhr/dom"); browser.close(); return
+        # 2) yeni olanları filtrele
+        new_rows = [r for r in rows if r["id"] not in posted]
+        print(f">> new: {len(new_rows)} (posted: {len(posted)})")
 
-        print(f">> parsed items: {len(items)}")
-        new_items = [it for it in items if it["id"] not in posted]
-        print(f">> new items: {len(new_items)} (posted: {len(posted)})")
-        new_items.reverse()  # eskiden yeniye
+        # eskiden yeniye
+        new_rows.reverse()
 
-        # 2) Her yeni ilanın detayına gir → PDF → özet → tweet
-        for it in new_items:
-            page.goto(it["url"], wait_until="load")
-            page.wait_for_timeout(1200)
+        # 3) her satır için modal başlığını al → özgünleştir → tweet
+        for r in new_rows:
+            try:
+                headline = open_row_and_read_headline(page, r["link"])
+            except Exception as e:
+                print("!! modal open/read error:", e)
+                continue
 
-            pdf_text = extract_text_from_pdf(page)  # PDF metni (varsa)
-            body = pdf_text or it["title"]
-            tweet = format_tweet(it["code"], it["title"], body)
+            if not headline:
+                continue
 
+            tweet = build_tweet(r["code"], headline)
             print(">> TWEET:", tweet)
+
             try:
                 client.create_tweet(text=tweet)
-                posted.add(it["id"]); save_state()
+                posted.add(r["id"]); save_state()
                 print(">> tweet sent ✓")
-                time.sleep(1.5)
+                time.sleep(1.0)
             except Exception as e:
                 print("!! tweet error:", e)
 
-        browser.close(); print(">> done")
+        browser.close()
+        print(">> done")
 
 if __name__ == "__main__":
     main()
