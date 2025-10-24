@@ -30,13 +30,15 @@ def save_state():
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
 
 UPPER_TR = "A-ZÇĞİÖŞÜ"
-# KAP·AKSA, KAP · AKSA, KAP.AKSA vs → tüm varyasyonlar
-KAP_LINE_RE = re.compile(rf"\bKAP\s*[·\.]?\s*([{UPPER_TR}0-9]{{3,6}})\b")
-# Haber dışı kalıplar (görünüyorsa at)
+# Hisse etiketi için geniş desen (3–6 harf; sonda sayi/uzanti gelebilir)
+TICKER_RE = re.compile(rf"\b[{UPPER_TR}]{{3,6}}[0-9]?\b")
+
+# Haber dışı kalıplar
 NON_NEWS_PATTERNS = [
     r"\bGünlük Bülten\b",
     r"\bBülten\b",
     r"\bPiyasa temkini\b",
+    r"\bPiyasa değerlendirmesi\b",
 ]
 
 STOP_PHRASES = [
@@ -84,7 +86,7 @@ def is_pnl_news(text: str) -> bool:
 
 def build_tweet(code: str, snippet: str) -> str:
     base = rewrite_tr_short(snippet)
-    base = summarize(base, 240)   # biraz buffer
+    base = summarize(base, 240)   # buffer
     head = ("💰" if is_pnl_news(base) else "📰") + f" #{code} | "
     return (head + base)[:279]
 
@@ -105,45 +107,56 @@ def go_highlights(page):
     print(">> highlights button not found; staying on 'Tümü'")
     return False
 
-def infinite_scroll_a_bit(page, steps=4, pause_ms=500):
-    # “Öne çıkanlar” kısa olursa aşağı kaydırıp birkaç sayfa daha veri yükleyelim
+def infinite_scroll_a_bit(page, steps=5, pause_ms=450):
+    # Liste kısa ise birkaç ekran aşağı kaydırıp daha fazla satır yükletelim
     for _ in range(steps):
-        page.mouse.wheel(0, 2000)
+        page.mouse.wheel(0, 2200)
         page.wait_for_timeout(pause_ms)
 
-def extract_kap_snippets_from_list(page):
+def extract_company_rows(page):
     """
-    Modal AÇMADAN, listede görünen metinden KAP · KOD ve yanındaki kısa özeti alır.
+    Modal AÇMADAN, listede şirket etiketi (hisse kodu) olan satırları topla.
     Dönüş: [{'id', 'code', 'snippet'}]
     """
-    containers = page.locator("li, div").filter(has_text="KAP")
-    print(">> raw container count:", containers.count())
+    # Akış alanındaki liste satırları (olası kapsayıcılar)
+    rows = page.locator("main li, main div[role='listitem'], main div")
+    total = min(600, rows.count())
+    print(">> raw rows:", total)
 
     items, seen = [], set()
-    for i in range(min(400, containers.count())):
-        row = containers.nth(i)
+    for i in range(total):
+        row = rows.nth(i)
+
+        # Satırda görünen şirket etiketi: çoğu zaman <a> veya <span> içinde mavi chip
+        code = ""
+        anchors = row.locator("a, span, div")
+        acount = min(20, anchors.count())
+        for j in range(acount):
+            tt = (anchors.nth(j).inner_text() or "").strip()
+            m = TICKER_RE.fullmatch(tt) or TICKER_RE.search(tt)
+            if m:
+                code = m.group(0)
+                break
+        if not code:
+            continue
+
+        # Satırın tüm metni
         text = row.inner_text().strip()
         text_norm = re.sub(r"\s+", " ", text)
 
-        # Haber dışı ise at
+        # Haber dışı kalıpları ele
         if any(re.search(p, text_norm, flags=re.I) for p in NON_NEWS_PATTERNS):
             continue
 
-        m = KAP_LINE_RE.search(text_norm)
-        if not m:
+        # Etiket ve “KAP · / Fintables ·” gibi önekleri kırp
+        # “KOD”dan sonraki kısmı kısa özet olarak al
+        pos = text_norm.find(code)
+        snippet = text_norm[pos + len(code):].strip(" -–—•·:|")
+        if len(snippet) < 15:  # çok kısa/boşsa kullanma
             continue
-        code = m.group(1)
 
-        # “KAP · KOD” dan sonraki kısmı kısa özete çevir
-        # Ör: "KAP · AKSA Emniyet Ticaret, 12,10-12,53 TL fiyat..." => sadece cümle kısmı
-        snippet = text_norm[m.end():].strip(" -–—•·:|")
-
-        # çok uzun, gürültülü varsa ilk cümleye indir
-        snippet = summarize(snippet, 260)
-
-        # benzersiz anahtar (satır metninden karma + kod)
         rid = f"{code}-{hash(text_norm)}"
-        if rid in seen: 
+        if rid in seen or rid in posted:
             continue
         seen.add(rid)
         items.append({"id": rid, "code": code, "snippet": snippet})
@@ -168,16 +181,16 @@ def main():
         page = ctx.new_page(); page.set_default_timeout(30000)
 
         page.goto(AKIS_URL, wait_until="networkidle")
-        page.wait_for_timeout(800)
+        page.wait_for_timeout(700)
         go_highlights(page)
-        infinite_scroll_a_bit(page, steps=3, pause_ms=450)
+        infinite_scroll_a_bit(page, steps=5, pause_ms=400)
 
-        items = extract_kap_snippets_from_list(page)
-        print(f">> kap snippets: {len(items)}")
+        items = extract_company_rows(page)
+        print(f">> company-tag rows: {len(items)}")
 
         new_items = [it for it in items if it["id"] not in posted]
         print(f">> new: {len(new_items)} (posted: {len(posted)})")
-        new_items.reverse()  # eskiden yeniye gönder
+        new_items.reverse()  # eskiden yeniye
 
         for it in new_items:
             tweet = build_tweet(it["code"], it["snippet"])
