@@ -2,16 +2,15 @@ name: KAP AutoTweet (Playwright)
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # her 10 dakikada bir
-  workflow_dispatch:         # elle başlatma
+    - cron: "*/5 * * * *"   # her 5 dakikada bir (UTC)
+  workflow_dispatch:         # elle tetikleme de açık
 
-# state.json'ı repo'ya yazacağımız için write izni gerekiyor
 permissions:
   contents: write
 
 concurrency:
   group: kap-autotweet
-  cancel-in-progress: false
+  cancel-in-progress: true   # önceki run sürüyorsa iptal et, yenisi başlasın
 
 jobs:
   run:
@@ -42,7 +41,6 @@ jobs:
           ACCESS_TOKEN_SECRET: ${{ secrets.ACCESS_TOKEN_SECRET }}
         run: python main.py
 
-      # state.json değiştiyse commit/push et → tekrar tweet’i önler
       - name: state.json’ı kalıcılaştır (commit & push)
         if: always()
         env:
