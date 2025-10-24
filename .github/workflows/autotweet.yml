@@ -1,13 +1,17 @@
 name: KAP AutoTweet (Playwright)
 
 on:
-  # İstersen sıklaştırıp seyrekleştirebilirsin (*/2 = 2 dakikada bir)
   schedule:
-    - cron: "*/2 * * * *"
-  workflow_dispatch:
+    - cron: "*/10 * * * *"   # her 10 dakikada bir
+  workflow_dispatch:         # elle başlatma
 
+# state.json'ı repo'ya yazacağımız için write izni gerekiyor
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: kap-autotweet
+  cancel-in-progress: false
 
 jobs:
   run:
@@ -16,6 +20,8 @@ jobs:
     steps:
       - name: Repo’yu getir
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Python kur
         uses: actions/setup-python@v5
@@ -28,7 +34,7 @@ jobs:
           python -m pip install tweepy playwright
           python -m playwright install --with-deps chromium
 
-      - name: Çalıştır
+      - name: Botu çalıştır
         env:
           API_KEY: ${{ secrets.API_KEY }}
           API_KEY_SECRET: ${{ secrets.API_KEY_SECRET }}
@@ -36,11 +42,18 @@ jobs:
           ACCESS_TOKEN_SECRET: ${{ secrets.ACCESS_TOKEN_SECRET }}
         run: python main.py
 
-      # Hata olursa ekran görüntüsü/HTML bırakmışsak indirmeye yarar (opsiyonel)
-      - name: Debug çıktıları (varsa) yükle
+      # state.json değiştiyse commit/push et → tekrar tweet’i önler
+      - name: state.json’ı kalıcılaştır (commit & push)
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: kap-debug
-          path: debug/
-          if-no-files-found: ignore
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f state.json ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            if ! git diff --staged --quiet; then
+              git commit -m "chore: update state [skip ci]"
+              git push https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }} HEAD:${{ github.ref_name }}
+            fi
+          fi
