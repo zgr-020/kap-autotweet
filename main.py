@@ -66,6 +66,14 @@ STOP_PHRASES = [
 ]
 TIME_PATTERNS = [r"\b\d{1,2}:\d{2}\b", r"\bDün\s+\d{1,2}:\d{2}\b", r"\bBugün\b", r"\bAz önce\b"]
 
+# -------- Göreli tarih öneklerini temizle (Dün/Bugün/Yesterday/Today) --------
+REL_PREFIX = re.compile(r'^(?:dün|bugün|yesterday|today)\b[:\-–]?\s*', re.IGNORECASE)
+def strip_relative_prefix(text: str) -> str:
+    # "Dün:", "Bugün -", "Yesterday " vb. önekleri ve yan ayıracı temizle
+    t = REL_PREFIX.sub('', text).lstrip('-–: ').strip()
+    return t
+# ---------------------------------------------------------------------------
+
 def clean_text(t: str) -> str:
     t = re.sub(r"\s+", " ", (t or "")).strip()
     for p in STOP_PHRASES: t = re.sub(p, "", t, flags=re.I)
@@ -104,6 +112,7 @@ def summarize(text: str, limit: int) -> str:
 def build_tweet(code: str, snippet: str) -> str:
     base = rewrite_tr_short(snippet)
     base = summarize(base, 240)
+    base = strip_relative_prefix(base)   # 👈 göreli tarih öneklerini sil
     return (f"📰 #{code} | " + base)[:279]
 
 def go_highlights(page):
