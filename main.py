@@ -206,26 +206,45 @@ def main():
             browser.close(); print(">> done"); return
 
         # çok geride kalmayı önlemek için tek run'da üst sınır (örn. 10)
-        MAX_PER_RUN = 10
+        MAX_PER_RUN = 5
+        SLEEP_BETWEEN_TWEETS = 15  # saniye
         to_tweet = to_tweet[:MAX_PER_RUN]
         # zaman akışı doğal olsun diye eski → yeni sırayla gönder
         to_tweet.reverse()
 
         sent = 0
-        for it in to_tweet:
-            if it["id"] in posted:
-                print(">> already posted, skip and continue")
-                continue
-            tweet = build_tweet(it["code"], it["snippet"])
-            print(">> TWEET:", tweet)
+for it in to_tweet:
+    if it["id"] in posted:
+        print(">> already posted, skip and continue")
+        continue
+
+    tweet = build_tweet(it["code"], it["snippet"])
+    print(">> TWEET:", tweet)
+
+    try:
+        if tw:
+            tw.create_tweet(text=tweet)
+        posted.add(it["id"])
+        sent += 1
+        print(">> tweet sent ✓")
+        time.sleep(SLEEP_BETWEEN_TWEETS)  # 🔹 15 sn bekle
+    except Exception as e:
+        print("!! tweet error:", e)
+        # 🔹 basit bir kibar retry: 429 görürsek bekle ve 1 kez daha dene
+        if "429" in str(e) or "Too Many Requests" in str(e):
             try:
-                if tw: tw.create_tweet(text=tweet)
+                print(">> hit rate limit; waiting 60s then retry once…")
+                time.sleep(60)
+                if tw:
+                    tw.create_tweet(text=tweet)
                 posted.add(it["id"])
                 sent += 1
-                print(">> tweet sent ✓")
-                time.sleep(1.0)
-            except Exception as e:
-                print("!! tweet error:", e)
+                print(">> tweet sent (after retry) ✓")
+                time.sleep(SLEEP_BETWEEN_TWEETS)
+            except Exception as e2:
+                print("!! retry failed:", e2)
+                # bu item’i atlayıp devam edelim
+                continue
 
         # en yeni görülen id'yi kaydet
         state["posted"] = sorted(list(posted))
