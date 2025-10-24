@@ -29,27 +29,39 @@ def save_state():
 # ================== Yardımcılar =======================================
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
 
+# BIST kodu: 3–6 Türkçe büyük harf + opsiyonel 1 rakam (örn. ISCTR, HEKTS, TUPRS, SISE, VESTL, KCHOL, KONTR, ALARK, BERA, etc.)
 UPPER_TR = "A-ZÇĞİÖŞÜ"
-# Hisse etiketi için geniş desen (3–6 harf; sonda sayi/uzanti gelebilir)
-TICKER_RE = re.compile(rf"\b[{UPPER_TR}]{{3,6}}[0-9]?\b")
+TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}[0-9]?$")
 
-# Haber dışı kalıplar
+# Kod OLAMAYACAK sabit etiketler
+BANNED_TAGS = {
+    "KAP", "FINTABLES", "FİNTABLES", "GÜNLÜK", "BÜLTEN", "BULTEN", "GUNLUK",
+    "HABER"
+}
+
+# Haber dışı satırları ele
 NON_NEWS_PATTERNS = [
-    r"\bGünlük Bülten\b",
-    r"\bBülten\b",
-    r"\bPiyasa temkini\b",
-    r"\bPiyasa değerlendirmesi\b",
+    r"\bGünlük Bülten\b", r"\bBülten\b", r"\bPiyasa temkini\b", r"\bPiyasa değerlendirmesi\b"
 ]
 
+# snippet temizliği
 STOP_PHRASES = [
     r"işbu açıklama.*?amaçla", r"yatırım tavsiyesi değildir", r"kamunun bilgisine arz olunur",
     r"saygılarımızla", r"özel durum açıklaması", r"yatırımcılarımızın bilgisine",
 ]
+TIME_PATTERNS = [
+    r"\b\d{1,2}:\d{2}\b",            # 10:45
+    r"\bDün\s+\d{1,2}:\d{2}\b",      # Dün 20:17
+    r"\bBugün\b", r"\bAz önce\b"
+]
+
 def clean_text(t: str) -> str:
     t = re.sub(r"\s+", " ", (t or "")).strip()
-    for p in STOP_PHRASES:
-        t = re.sub(p, "", t, flags=re.I)
-    return t.strip(" -–—:.")
+    for p in STOP_PHRASES: t = re.sub(p, "", t, flags=re.I)
+    for p in TIME_PATTERNS: t = re.sub(p, "", t, flags=re.I)
+    # kaynak kırpıntıları
+    t = re.sub(r"\b(Fintables|KAP)\b\s*[·\.]?\s*", "", t, flags=re.I)
+    return t.strip(" -–—:|•·")
 
 def summarize(text: str, limit: int) -> str:
     text = clean_text(text)
@@ -75,20 +87,14 @@ def rewrite_tr_short(s: str) -> str:
     s = clean_text(s)
     s = re.sub(r"[“”\"']", "", s)
     s = re.sub(r"\(\s*\)", "", s)
-    for pat, rep in REWRITE_MAP:
-        s = re.sub(pat, rep, s, flags=re.I)
+    for pat, rep in REWRITE_MAP: s = re.sub(pat, rep, s, flags=re.I)
     s = re.sub(r"^\s*[-–—•·]\s*", "", s)
     return s.strip()
-
-def is_pnl_news(text: str) -> bool:
-    t = text.lower()
-    return any(k in t for k in ["kâr", "kar", "zarar", "net dönem", "temettü", "temettu"])
 
 def build_tweet(code: str, snippet: str) -> str:
     base = rewrite_tr_short(snippet)
     base = summarize(base, 240)   # buffer
-    head = ("💰" if is_pnl_news(base) else "📰") + f" #{code} | "
-    return (head + base)[:279]
+    return (f"#{code} | " + base)[:279]
 
 def go_highlights(page):
     for sel in [
@@ -107,61 +113,61 @@ def go_highlights(page):
     print(">> highlights button not found; staying on 'Tümü'")
     return False
 
-def infinite_scroll_a_bit(page, steps=5, pause_ms=450):
-    # Liste kısa ise birkaç ekran aşağı kaydırıp daha fazla satır yükletelim
+def infinite_scroll_a_bit(page, steps=3, pause_ms=400):
+    # Yeterince satır gelsin diye az kaydırıyoruz (çok kaydırırsan eskileri de getirir)
     for _ in range(steps):
-        page.mouse.wheel(0, 2200)
+        page.mouse.wheel(0, 1600)
         page.wait_for_timeout(pause_ms)
+
+def best_ticker_in_row(row) -> str:
+    """Satırdaki etiketlerden gerçek hisse kodunu seç (KAP vb. hariç)."""
+    code = ""
+    anchors = row.locator("a, span, div")
+    for j in range(min(30, anchors.count())):
+        tt = (anchors.nth(j).inner_text() or "").strip()
+        tt_up = tt.upper()
+        if tt_up in BANNED_TAGS:    # KAP / Fintables / Bülten vs. değil
+            continue
+        # yalnızca düz kodu al (örn. ALARK, TUPRS, ISCTR, SISE gibi)
+        if TICKER_RE.fullmatch(tt_up):
+            code = tt_up
+            break
+    return code
 
 def extract_company_rows(page):
     """
-    Modal AÇMADAN, listede şirket etiketi (hisse kodu) olan satırları topla.
-    Dönüş: [{'id', 'code', 'snippet'}]
+    Modal açmadan, listede şirket etiketi (hisse kodu) olan satırlardan
+    EN YENİ (ilk görünen) haberi döndür.
     """
-    # Akış alanındaki liste satırları (olası kapsayıcılar)
     rows = page.locator("main li, main div[role='listitem'], main div")
-    total = min(600, rows.count())
+    total = min(300, rows.count())
     print(">> raw rows:", total)
 
-    items, seen = [], set()
-    for i in range(total):
+    for i in range(total):  # üstten aşağı — ilk uygun satır yeter
         row = rows.nth(i)
 
-        # Satırda görünen şirket etiketi: çoğu zaman <a> veya <span> içinde mavi chip
-        code = ""
-        anchors = row.locator("a, span, div")
-        acount = min(20, anchors.count())
-        for j in range(acount):
-            tt = (anchors.nth(j).inner_text() or "").strip()
-            m = TICKER_RE.fullmatch(tt) or TICKER_RE.search(tt)
-            if m:
-                code = m.group(0)
-                break
+        code = best_ticker_in_row(row)
         if not code:
             continue
 
-        # Satırın tüm metni
         text = row.inner_text().strip()
         text_norm = re.sub(r"\s+", " ", text)
 
-        # Haber dışı kalıpları ele
         if any(re.search(p, text_norm, flags=re.I) for p in NON_NEWS_PATTERNS):
             continue
 
-        # Etiket ve “KAP · / Fintables ·” gibi önekleri kırp
-        # “KOD”dan sonraki kısmı kısa özet olarak al
-        pos = text_norm.find(code)
-        snippet = text_norm[pos + len(code):].strip(" -–—•·:|")
-        if len(snippet) < 15:  # çok kısa/boşsa kullanma
+        # koddan sonrası snippet
+        pos = text_norm.upper().find(code)
+        snippet = text_norm[pos + len(code):].strip()
+        snippet = clean_text(snippet)
+
+        if len(snippet) < 15:
             continue
 
         rid = f"{code}-{hash(text_norm)}"
-        if rid in seen or rid in posted:
-            continue
-        seen.add(rid)
-        items.append({"id": rid, "code": code, "snippet": snippet})
+        return {"id": rid, "code": code, "snippet": snippet}  # sadece ilk uygun haber
 
-    return items
+    return None
 
 # ================== ANA AKIŞ ==================================
 def main():
@@ -181,28 +187,27 @@ def main():
         page = ctx.new_page(); page.set_default_timeout(30000)
 
         page.goto(AKIS_URL, wait_until="networkidle")
-        page.wait_for_timeout(700)
+        page.wait_for_timeout(600)
         go_highlights(page)
-        infinite_scroll_a_bit(page, steps=5, pause_ms=400)
+        infinite_scroll_a_bit(page, steps=2, pause_ms=350)
 
-        items = extract_company_rows(page)
-        print(f">> company-tag rows: {len(items)}")
+        item = extract_company_rows(page)
+        if not item:
+            print(">> no eligible row"); browser.close(); return
 
-        new_items = [it for it in items if it["id"] not in posted]
-        print(f">> new: {len(new_items)} (posted: {len(posted)})")
-        new_items.reverse()  # eskiden yeniye
+        if item["id"] in posted:
+            print(">> newest is already posted"); browser.close(); return
 
-        for it in new_items:
-            tweet = build_tweet(it["code"], it["snippet"])
-            print(">> TWEET:", tweet)
-            try:
-                if tw:
-                    tw.create_tweet(text=tweet)
-                posted.add(it["id"]); save_state()
-                print(">> tweet sent ✓")
-                time.sleep(1.0)
-            except Exception as e:
-                print("!! tweet error:", e)
+        tweet = build_tweet(item["code"], item["snippet"])
+        print(">> TWEET:", tweet)
+
+        try:
+            if tw:
+                tw.create_tweet(text=tweet)
+            posted.add(item["id"]); save_state()
+            print(">> tweet sent ✓")
+        except Exception as e:
+            print("!! tweet error:", e)
 
         browser.close()
         print(">> done")
