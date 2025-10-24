@@ -20,31 +20,51 @@ def twitter_client():
         access_token_secret=ACCESS_TOKEN_SECRET,
     )
 
-# ================== Durum (aynı şeyi iki kez atma) =====================
-STATE_FILE = Path("state.json")
-posted = set(json.loads(STATE_FILE.read_text())) if STATE_FILE.exists() else set()
-def save_state():
-    STATE_FILE.write_text(json.dumps(sorted(list(posted)), ensure_ascii=False))
+# ================== Durum (tekrarları önleme) ==========================
+STATE_PATH = Path("state.json")
+
+def load_state():
+    """
+    Eski sürümlerde state.json bir liste olabilirdi.
+    Yeni format:
+    {
+      "last_id": "en_son_görülen_haber_idsi",
+      "posted": ["id1","id2",...]
+    }
+    """
+    if not STATE_PATH.exists():
+        return {"last_id": None, "posted": []}
+    try:
+        data = json.loads(STATE_PATH.read_text())
+        if isinstance(data, list):  # eski formatı dönüştür
+            return {"last_id": None, "posted": data}
+        if "last_id" not in data: data["last_id"] = None
+        if "posted" not in data: data["posted"] = []
+        return data
+    except Exception:
+        return {"last_id": None, "posted": []}
+
+def save_state(state):
+    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+
+state = load_state()
+posted = set(state.get("posted", []))
+last_id = state.get("last_id")
 
 # ================== Yardımcılar =======================================
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
 
-# BIST kodu: 3–6 Türkçe büyük harf + opsiyonel 1 rakam (örn. ISCTR, HEKTS, TUPRS, SISE, VESTL, KCHOL, KONTR, ALARK, BERA, etc.)
 UPPER_TR = "A-ZÇĞİÖŞÜ"
-TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}[0-9]?$")
+TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}[0-9]?$")  # BIST kodu
 
-# Kod OLAMAYACAK sabit etiketler
-BANNED_TAGS = {
-    "KAP", "FINTABLES", "FİNTABLES", "GÜNLÜK", "BÜLTEN", "BULTEN", "GUNLUK",
-    "HABER"
-}
+# Kod OLAMAYACAK sabit etiketler (şirket kodu olmayan ifadeler)
+BANNED_TAGS = {"KAP", "FINTABLES", "FİNTABLES", "GÜNLÜK", "BÜLTEN", "BULTEN", "GUNLUK", "HABER"}
 
 # Haber dışı satırları ele
 NON_NEWS_PATTERNS = [
     r"\bGünlük Bülten\b", r"\bBülten\b", r"\bPiyasa temkini\b", r"\bPiyasa değerlendirmesi\b"
 ]
 
-# snippet temizliği
 STOP_PHRASES = [
     r"işbu açıklama.*?amaçla", r"yatırım tavsiyesi değildir", r"kamunun bilgisine arz olunur",
     r"saygılarımızla", r"özel durum açıklaması", r"yatırımcılarımızın bilgisine",
@@ -113,37 +133,28 @@ def go_highlights(page):
     print(">> highlights button not found; staying on 'Tümü'")
     return False
 
-def infinite_scroll_a_bit(page, steps=3, pause_ms=400):
-    # Yeterince satır gelsin diye az kaydırıyoruz (çok kaydırırsan eskileri de getirir)
-    for _ in range(steps):
-        page.mouse.wheel(0, 1600)
-        page.wait_for_timeout(pause_ms)
-
 def best_ticker_in_row(row) -> str:
-    """Satırdaki etiketlerden gerçek hisse kodunu seç (KAP vb. hariç)."""
-    code = ""
+    """Satırdaki etiketlerden gerçek hisse kodunu seç (KAP/Fintables vb. hariç)."""
     anchors = row.locator("a, span, div")
-    for j in range(min(30, anchors.count())):
-        tt = (anchors.nth(j).inner_text() or "").strip()
-        tt_up = tt.upper()
-        if tt_up in BANNED_TAGS:    # KAP / Fintables / Bülten vs. değil
+    for j in range(min(40, anchors.count())):
+        tt = (anchors.nth(j).inner_text() or "").strip().upper()
+        if tt in BANNED_TAGS:
             continue
-        # yalnızca düz kodu al (örn. ALARK, TUPRS, ISCTR, SISE gibi)
-        if TICKER_RE.fullmatch(tt_up):
-            code = tt_up
-            break
-    return code
+        if TICKER_RE.fullmatch(tt):
+            return tt
+    return ""
 
-def extract_company_rows(page):
+def extract_company_rows_list(page):
     """
-    Modal açmadan, listede şirket etiketi (hisse kodu) olan satırlardan
-    EN YENİ (ilk görünen) haberi döndür.
+    Modal açmadan, listede şirket etiketi olan **bütün** satırları (en yeni → eski)
+    döndürür. KAP içermeyen veya Fintables içeriği olanları eler.
     """
     rows = page.locator("main li, main div[role='listitem'], main div")
-    total = min(300, rows.count())
+    total = min(400, rows.count())
     print(">> raw rows:", total)
 
-    for i in range(total):  # üstten aşağı — ilk uygun satır yeter
+    items = []
+    for i in range(total):   # üstten aşağı = en yeni → eski
         row = rows.nth(i)
 
         code = best_ticker_in_row(row)
@@ -153,13 +164,13 @@ def extract_company_rows(page):
         text = row.inner_text().strip()
         text_norm = re.sub(r"\s+", " ", text)
 
-        # 🚫 Haber dışı & Fintables içeriği ele
+        # Haber dışı ve Fintables ele
         if any(re.search(p, text_norm, flags=re.I) for p in NON_NEWS_PATTERNS):
             continue
         if re.search(r"\bFintables\b", text_norm, flags=re.I):
             continue
 
-        # ✅ Sadece KAP içerikleri
+        # Sadece KAP içerikleri
         if not re.search(r"\bKAP\b", text_norm, flags=re.I):
             continue
 
@@ -167,14 +178,13 @@ def extract_company_rows(page):
         pos = text_norm.upper().find(code)
         snippet = text_norm[pos + len(code):].strip()
         snippet = clean_text(snippet)
-
         if len(snippet) < 15:
             continue
 
         rid = f"{code}-{hash(text_norm)}"
-        return {"id": rid, "code": code, "snippet": snippet}
+        items.append({"id": rid, "code": code, "snippet": snippet})
 
-    return None
+    return items  # en yeni → eski
 
 # ================== ANA AKIŞ ==================================
 def main():
@@ -196,28 +206,58 @@ def main():
         page.goto(AKIS_URL, wait_until="networkidle")
         page.wait_for_timeout(600)
         go_highlights(page)
-        infinite_scroll_a_bit(page, steps=2, pause_ms=350)
 
-        item = extract_company_rows(page)
-        if not item:
-            print(">> no eligible row"); browser.close(); return
+        items = extract_company_rows_list(page)  # en yeni → eski
+        print(f">> eligible items: {len(items)}")
+        if not items:
+            browser.close(); print(">> done (no items)"); return
 
-        if item["id"] in posted:
-            print(">> newest is already posted"); browser.close(); return
+        global last_id, posted, state
 
-        tweet = build_tweet(item["code"], item["snippet"])
-        print(">> TWEET:", tweet)
+        # 1) En yeni görülen id (liste başı)
+        newest_seen_id = items[0]["id"]
 
-        try:
-            if tw:
-                tw.create_tweet(text=tweet)
-            posted.add(item["id"]); save_state()
-            print(">> tweet sent ✓")
-        except Exception as e:
-            print("!! tweet error:", e)
+        # 2) En son gördüğümüz habere kadar olan kısmı al (yeni gelenlerin tamamı)
+        to_tweet = []
+        for it in items:
+            if last_id and it["id"] == last_id:
+                break  # buradan sonrası önceki taramada görülmüştü
+            to_tweet.append(it)
+
+        if not to_tweet:
+            print(">> no new items since last run")
+            # yine de last_id'i güncelle (sayfa farklı sırada gelebilir)
+            state["last_id"] = newest_seen_id
+            save_state(state)
+            browser.close(); print(">> done"); return
+
+        # 3) Sırayı korumak için eski → yeni gönder
+        to_tweet.reverse()
+
+        sent = 0
+        for it in to_tweet:
+            if it["id"] in posted:
+                print(">> already posted, skip and stop (safety)")
+                break  # güvenlik: beklenmedik tekrar varsa dur
+            tweet = build_tweet(it["code"], it["snippet"])
+            print(">> TWEET:", tweet)
+            try:
+                if tw:
+                    tw.create_tweet(text=tweet)
+                posted.add(it["id"])
+                sent += 1
+                print(">> tweet sent ✓")
+                time.sleep(1.0)
+            except Exception as e:
+                print("!! tweet error:", e)
+
+        # 4) last_id'i bu çalışmada görülen **en yeni** habere ayarla
+        state["posted"] = sorted(list(posted))
+        state["last_id"] = newest_seen_id
+        save_state(state)
 
         browser.close()
-        print(">> done")
+        print(f">> done (sent: {sent})")
 
 if __name__ == "__main__":
     main()
