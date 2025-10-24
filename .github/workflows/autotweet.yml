@@ -2,8 +2,11 @@ name: KAP AutoTweet (Playwright)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # her 5 dakikada bir (UTC)
-  workflow_dispatch:         # elle tetikleme de açık
+    # Aynı işi 3 farklı ofsette tetikle → birinden mutlaka yakalar
+    - cron: "*/5 * * * *"     # 0,5,10,15...
+    - cron: "1-59/5 * * * *"  # 1,6,11,16...
+    - cron: "2-59/5 * * * *"  # 2,7,12,17...
+  workflow_dispatch:
 
 permissions:
   contents: write
