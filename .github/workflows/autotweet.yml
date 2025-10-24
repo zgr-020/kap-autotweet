@@ -1,19 +1,15 @@
 name: KAP AutoTweet (Playwright)
 
 on:
-  schedule:
-    # Aynı işi 3 farklı ofsette tetikle → birinden mutlaka yakalar
-    - cron: "*/5 * * * *"     # 0,5,10,15...
-    - cron: "1-59/5 * * * *"  # 1,6,11,16...
-    - cron: "2-59/5 * * * *"  # 2,7,12,17...
-  workflow_dispatch:
+  workflow_dispatch:         # cron-job.org bu endpoint'i çağırıyor (dispatches)
+  # schedule:                # ❌ kapatıldı: GitHub kendi kendine tetiklemesin
 
 permissions:
   contents: write
 
 concurrency:
   group: kap-autotweet
-  cancel-in-progress: true   # önceki run sürüyorsa iptal et, yenisi başlasın
+  cancel-in-progress: true
 
 jobs:
   run:
