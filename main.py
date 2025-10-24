@@ -94,7 +94,7 @@ def rewrite_tr_short(s: str) -> str:
 def build_tweet(code: str, snippet: str) -> str:
     base = rewrite_tr_short(snippet)
     base = summarize(base, 240)   # buffer
-    return (f"#{code} | " + base)[:279]
+    return (f"📰 #{code} | " + base)[:279]
 
 def go_highlights(page):
     for sel in [
@@ -153,7 +153,14 @@ def extract_company_rows(page):
         text = row.inner_text().strip()
         text_norm = re.sub(r"\s+", " ", text)
 
+        # 🚫 Haber dışı & Fintables içeriği ele
         if any(re.search(p, text_norm, flags=re.I) for p in NON_NEWS_PATTERNS):
+            continue
+        if re.search(r"\bFintables\b", text_norm, flags=re.I):
+            continue
+
+        # ✅ Sadece KAP içerikleri
+        if not re.search(r"\bKAP\b", text_norm, flags=re.I):
             continue
 
         # koddan sonrası snippet
@@ -165,7 +172,7 @@ def extract_company_rows(page):
             continue
 
         rid = f"{code}-{hash(text_norm)}"
-        return {"id": rid, "code": code, "snippet": snippet}  # sadece ilk uygun haber
+        return {"id": rid, "code": code, "snippet": snippet}
 
     return None
 
