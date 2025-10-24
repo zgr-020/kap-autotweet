@@ -3,7 +3,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 import tweepy
 
-# -------- X credentials (Secrets) --------
+# ============== X (Twitter) Secrets ==============
 API_KEY = os.getenv("API_KEY")
 API_KEY_SECRET = os.getenv("API_KEY_SECRET")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
@@ -20,7 +20,7 @@ def twitter_client():
         access_token_secret=ACCESS_TOKEN_SECRET,
     )
 
-# -------- State (no duplicates) ----------
+# ============== State (duplicate koruması) ==============
 STATE_PATH = Path("state.json")
 
 def load_state():
@@ -28,7 +28,7 @@ def load_state():
         return {"last_id": None, "posted": []}
     try:
         data = json.loads(STATE_PATH.read_text())
-        # eski biçimi otomatik dönüştür
+        # eski biçim liste ise dönüştür
         if isinstance(data, list):
             return {"last_id": None, "posted": data}
         data.setdefault("last_id", None)
@@ -44,8 +44,10 @@ state = load_state()
 posted = set(state.get("posted", []))
 last_id = state.get("last_id")
 
-# -------- Parsing helpers ----------------
+# ============== Parsing helpers ==============
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
+MAX_PER_RUN = 5
+SLEEP_BETWEEN_TWEETS = 15  # saniye
 
 UPPER_TR = "A-ZÇĞİÖŞÜ"
 TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}[0-9]?$")  # BIST kodu
@@ -53,7 +55,7 @@ TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}[0-9]?$")  # BIST kodu
 # şirket kodu olamayacak etiketler
 BANNED_TAGS = {"KAP", "FINTABLES", "FİNTABLES", "GÜNLÜK", "BÜLTEN", "BULTEN", "GUNLUK", "HABER"}
 
-# bülten/günlük yazıları ele
+# bülten/günlük içerikleri ele
 NON_NEWS_PATTERNS = [
     r"\bGünlük Bülten\b", r"\bBülten\b", r"\bPiyasa temkini\b", r"\bPiyasa değerlendirmesi\b"
 ]
@@ -68,7 +70,7 @@ def clean_text(t: str) -> str:
     t = re.sub(r"\s+", " ", (t or "")).strip()
     for p in STOP_PHRASES: t = re.sub(p, "", t, flags=re.I)
     for p in TIME_PATTERNS: t = re.sub(p, "", t, flags=re.I)
-    t = re.sub(r"\b(Fintables|KAP)\b\s*[·\.]?\s*", "", t, flags=re.I)  # kaynak kırpıntıları
+    t = re.sub(r"\b(Fintables|KAP)\b\s*[·\.]?\s*", "", t, flags=re.I)  # kaynak kırpıntısı
     return t.strip(" -–—:|•·")
 
 REWRITE_MAP = [
@@ -122,26 +124,27 @@ def go_highlights(page):
     return False
 
 def best_ticker_in_row(row) -> str:
+    """Satırdaki etiketler içinden gerçek hisse kodunu bul (KAP/Fintables vb. hariç)."""
     anchors = row.locator("a, span, div")
     for j in range(min(40, anchors.count())):
         tt = (anchors.nth(j).inner_text() or "").strip().upper()
-        if tt in BANNED_TAGS: 
+        if tt in BANNED_TAGS:
             continue
         if TICKER_RE.fullmatch(tt):
             return tt
     return ""
 
 def extract_company_rows_list(page, max_scan=400):
-    """Modal açmadan, listede şirket etiketi olan bütün satırları döndür (en yeni → eski)."""
+    """Modal açmadan listede şirket etiketi olan satırları döndürür (en yeni → eski)."""
     rows = page.locator("main li, main div[role='listitem'], main div")
     total = min(max_scan, rows.count())
     print(">> raw rows:", total)
 
     items = []
-    for i in range(total):           # üstten aşağı = en yeni → eski
+    for i in range(total):  # en üstten aşağı = en yeni → eski
         row = rows.nth(i)
         code = best_ticker_in_row(row)
-        if not code: 
+        if not code:
             continue
 
         text = row.inner_text().strip()
@@ -149,10 +152,9 @@ def extract_company_rows_list(page, max_scan=400):
 
         if any(re.search(p, text_norm, flags=re.I) for p in NON_NEWS_PATTERNS):
             continue
-        if re.search(r"\bFintables\b", text_norm, flags=re.I):   # Fintables iç yazıları ele
+        if re.search(r"\bFintables\b", text_norm, flags=re.I):
             continue
 
-        # koddan sonraki cümleyi al
         pos = text_norm.upper().find(code)
         snippet = text_norm[pos + len(code):].strip()
         snippet = clean_text(snippet)
@@ -163,9 +165,9 @@ def extract_company_rows_list(page, max_scan=400):
         items.append({"id": rid, "code": code, "snippet": snippet})
 
     print(">> eligible items:", len(items))
-    return items     # en yeni → eski
+    return items  # en yeni → eski
 
-# -------------- main ---------------------
+# ============== MAIN ==============
 def main():
     print(">> start")
     tw = twitter_client()
@@ -185,18 +187,19 @@ def main():
         page.wait_for_timeout(600)
         go_highlights(page)
 
-        items = extract_company_rows_list(page)  # en yeni → eski
+        items = extract_company_rows_list(page)
         if not items:
             print(">> done (no items)")
             browser.close(); return
 
-        global last_id, posted, state
+        # en yeni görülen
+        newest_seen_id = items[0]["id"]
 
-        newest_seen_id = items[0]["id"]  # listenin başı = en yeni
+        # önceki run'dan bu yana gelenler (last_id görünene kadar)
         to_tweet = []
         for it in items:
             if last_id and it["id"] == last_id:
-                break                   # önceki çalışmada burada kalmıştık
+                break
             to_tweet.append(it)
 
         if not to_tweet:
@@ -205,48 +208,43 @@ def main():
             save_state(state)
             browser.close(); print(">> done"); return
 
-        # çok geride kalmayı önlemek için tek run'da üst sınır (örn. 10)
-        MAX_PER_RUN = 5
-        SLEEP_BETWEEN_TWEETS = 15  # saniye
+        # Run başına üst limit ve eski → yeni sırası
         to_tweet = to_tweet[:MAX_PER_RUN]
-        # zaman akışı doğal olsun diye eski → yeni sırayla gönder
         to_tweet.reverse()
 
         sent = 0
-for it in to_tweet:
-    if it["id"] in posted:
-        print(">> already posted, skip and continue")
-        continue
+        for it in to_tweet:
+            if it["id"] in posted:
+                print(">> already posted, skip and continue")
+                continue
 
-    tweet = build_tweet(it["code"], it["snippet"])
-    print(">> TWEET:", tweet)
+            tweet = build_tweet(it["code"], it["snippet"])
+            print(">> TWEET:", tweet)
 
-    try:
-        if tw:
-            tw.create_tweet(text=tweet)
-        posted.add(it["id"])
-        sent += 1
-        print(">> tweet sent ✓")
-        time.sleep(SLEEP_BETWEEN_TWEETS)  # 🔹 15 sn bekle
-    except Exception as e:
-        print("!! tweet error:", e)
-        # 🔹 basit bir kibar retry: 429 görürsek bekle ve 1 kez daha dene
-        if "429" in str(e) or "Too Many Requests" in str(e):
             try:
-                print(">> hit rate limit; waiting 60s then retry once…")
-                time.sleep(60)
                 if tw:
                     tw.create_tweet(text=tweet)
                 posted.add(it["id"])
                 sent += 1
-                print(">> tweet sent (after retry) ✓")
-                time.sleep(SLEEP_BETWEEN_TWEETS)
-            except Exception as e2:
-                print("!! retry failed:", e2)
-                # bu item’i atlayıp devam edelim
-                continue
+                print(">> tweet sent ✓")
+                time.sleep(SLEEP_BETWEEN_TWEETS)  # rate-limit güvenlik
+            except Exception as e:
+                print("!! tweet error:", e)
+                if "429" in str(e) or "Too Many Requests" in str(e):
+                    try:
+                        print(">> hit rate limit; waiting 60s then retry once…")
+                        time.sleep(60)
+                        if tw:
+                            tw.create_tweet(text=tweet)
+                        posted.add(it["id"])
+                        sent += 1
+                        print(">> tweet sent (after retry) ✓")
+                        time.sleep(SLEEP_BETWEEN_TWEETS)
+                    except Exception as e2:
+                        print("!! retry failed:", e2)
+                        continue
 
-        # en yeni görülen id'yi kaydet
+        # son görüleni kaydet
         state["posted"] = sorted(list(posted))
         state["last_id"] = newest_seen_id
         save_state(state)
