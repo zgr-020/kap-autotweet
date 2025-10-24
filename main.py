@@ -253,4 +253,19 @@ def main():
         print(f">> done (sent: {sent})")
 
 if __name__ == "__main__":
-    main()
+    print(">> entry", flush=True)
+    try:
+        main()
+        print(">> main() finished", flush=True)
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print("!! UNCAUGHT ERROR !!")
+        print(tb)
+        # ayrıca dosyaya bırak (artifacts ile görebilirsin)
+        try:
+            with open("debug.log", "a", encoding="utf-8") as f:
+                f.write(tb + "\n")
+        except Exception:
+            pass
+        raise
