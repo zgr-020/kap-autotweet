@@ -39,7 +39,16 @@ jobs:
           API_KEY_SECRET: ${{ secrets.API_KEY_SECRET }}
           ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
           ACCESS_TOKEN_SECRET: ${{ secrets.ACCESS_TOKEN_SECRET }}
-        run: python main.py
+          PYTHONUNBUFFERED: "1"           # çıktılar anında gelsin
+        run: |
+          set -euo pipefail
+          echo ">> PWD: $(pwd)"
+          echo ">> ls -la"
+          ls -la
+          echo ">> python -V"
+          python -V
+          echo ">> running main.py (unbuffered)"
+          python -u main.py || { echo "main.py exit code: $?"; exit 1; }
 
       - name: Persist state.json (commit & push)
         if: always()
