@@ -221,7 +221,7 @@ def main():
         to_tweet = to_tweet[:MAX_PER_RUN]
         to_tweet.reverse()
 
-        sent = 0
+                sent = 0
         for it in to_tweet:
             if it["id"] in posted:
                 print(">> already posted, skip and continue")
@@ -236,6 +236,12 @@ def main():
                 posted.add(it["id"])
                 sent += 1
                 print(">> tweet sent ✓")
+
+                # ⬇️ BAŞARILI GÖNDERİMDEN HEMEN SONRA STATE'İ KAYDET
+                state["posted"] = sorted(list(posted))
+                state["last_id"] = newest_seen_id
+                save_state(state)
+
                 time.sleep(SLEEP_BETWEEN_TWEETS)  # rate-limit güvenlik
             except Exception as e:
                 print("!! tweet error:", e)
@@ -248,6 +254,12 @@ def main():
                         posted.add(it["id"])
                         sent += 1
                         print(">> tweet sent (after retry) ✓")
+
+                        # ⬇️ RETRY BAŞARILIYSA DA HEMEN KAYDET
+                        state["posted"] = sorted(list(posted))
+                        state["last_id"] = newest_seen_id
+                        save_state(state)
+
                         time.sleep(SLEEP_BETWEEN_TWEETS)
                     except Exception as e2:
                         print("!! retry failed:", e2)
