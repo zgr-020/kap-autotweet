@@ -221,7 +221,7 @@ def main():
         to_tweet = to_tweet[:MAX_PER_RUN]
         to_tweet.reverse()
 
-                sent = 0
+        sent = 0
         for it in to_tweet:
             if it["id"] in posted:
                 print(">> already posted, skip and continue")
