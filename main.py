@@ -1,4 +1,4 @@
-# main.py — Fintables "Öne çıkanlar" -> X otomatik tweet (sağlamlaştırılmış)
+# main.py — Fintables "Öne çıkanlar" -> X otomatik tweet (timeout/loader fix)
 import os, re, json, time, random
 from pathlib import Path
 from playwright.sync_api import sync_playwright
@@ -49,7 +49,7 @@ AKIS_URL = "https://fintables.com/borsa-haber-akisi"
 MAX_PER_RUN = 5
 SLEEP_BETWEEN_TWEETS = 15  # saniye
 COOLDOWN_SECONDS = 10 * 60  # 429 rate-limitte bekleme
-PAGE_RELOAD_RETRIES = 3
+PAGE_RELOAD_RETRIES = 5     # ★ deneme sayısını artırdık
 
 UPPER_TR = "A-ZÇĞİÖŞÜ"
 TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}[0-9]?$")  # BIST kodu
@@ -68,7 +68,6 @@ STOP_PHRASES = [
 ]
 TIME_PATTERNS = [r"\b\d{1,2}:\d{2}\b", r"\bDün\s+\d{1,2}:\d{2}\b", r"\bBugün\b", r"\bAz önce\b"]
 
-# Göreli tarih öneklerini temizle (Dün/Bugün/Yesterday/Today)
 REL_PREFIX = re.compile(r'^(?:dün|bugün|yesterday|today)\b[:\-–]?\s*', re.IGNORECASE)
 def strip_relative_prefix(text: str) -> str:
     return REL_PREFIX.sub('', text).lstrip('-–: ').strip()
@@ -115,13 +114,12 @@ def build_tweet(code: str, snippet: str) -> str:
     base = strip_relative_prefix(base)
     return (f"📰 #{code} | " + base)[:279]
 
-# --- küçük yardımcılar: görünen mi? güvenli iç metin al ---
 def is_vis(loc):
     try:
         box = loc.bounding_box()
         return box is not None and box["width"] > 0 and box["height"] > 0
     except Exception:
-        return True  # en kötü ihtimal görünür varsay
+        return True
 
 def safe_text(loc, timeout=800):
     try:
@@ -129,17 +127,18 @@ def safe_text(loc, timeout=800):
     except Exception:
         return ""
 
-def go_highlights(page):
-    # çerez banner’ı/kaplamaları kapat
-    for sel in ["button:has-text('Kabul')", "button:has-text('Kabul et')", "button:has-text('Anladım')"]:
+def close_banners(page):
+    for sel in ["button:has-text('Kabul')", "button:has-text('Anladım')", "button:has-text('Kapat')"]:
         try:
             btn = page.locator(sel)
             if btn.count():
-                btn.first.click(timeout=1000)
+                btn.first.click(timeout=1200)
                 page.wait_for_timeout(200)
         except Exception:
             pass
 
+def go_highlights(page):
+    close_banners(page)
     # sekmeyi 'Öne çıkanlar' yap
     for sel in [
         "button:has-text('Öne çıkanlar')",
@@ -151,26 +150,22 @@ def go_highlights(page):
             loc = page.locator(sel)
             if loc.count():
                 loc.first.click(timeout=1500)
-                page.wait_for_load_state("networkidle")
-                page.wait_for_timeout(800)
+                page.wait_for_timeout(600)
                 print(">> highlights ON")
                 break
         except Exception:
             continue
-
-    # miniscroll ile içerik tetikle
+    # miniscroll tetikleme
     try:
-        page.mouse.wheel(0, 400)
-        page.wait_for_timeout(300)
-        page.mouse.wheel(0, -400)
-        page.wait_for_timeout(300)
+        page.mouse.wheel(0, 600); page.wait_for_timeout(250)
+        page.mouse.wheel(0, -600); page.wait_for_timeout(250)
     except Exception:
         pass
 
 def extract_company_rows_list(page, max_scan=400):
-    """Modal açmadan listede şirket etiketi olan satırları döndürür (en yeni → eski)."""
+    # DOM geldi mi?
     try:
-        page.wait_for_selector("main", state="attached", timeout=15000)
+        page.wait_for_selector("main", state="attached", timeout=25000)
     except Exception:
         print(">> no <main> found; returning empty")
         return []
@@ -182,19 +177,14 @@ def extract_company_rows_list(page, max_scan=400):
         "main div[role='row']",
         "main div"
     ]
-    rows = None
-    rows_sel = None
+    rows = None; rows_sel = None
     for sel in selector_candidates:
         try:
             loc = page.locator(sel)
-            cnt = loc.count()
-            if cnt and cnt > 0:
-                rows = loc
-                rows_sel = sel
-                break
+            if loc.count() > 0:
+                rows = loc; rows_sel = sel; break
         except Exception:
             continue
-
     if rows is None:
         print(">> no row selector matched; returning empty")
         return []
@@ -214,8 +204,7 @@ def extract_company_rows_list(page, max_scan=400):
         code = best_ticker_in_row(row)
         if not code:
             continue
-
-        text = safe_text(row, timeout=700)
+        text = safe_text(row, timeout=900)
         if not text:
             continue
         text_norm = re.sub(r"\s+", " ", text)
@@ -238,7 +227,6 @@ def extract_company_rows_list(page, max_scan=400):
     return items
 
 def best_ticker_in_row(row) -> str:
-    """Satırdaki etiketler içinden gerçek hisse kodunu bul (KAP/Fintables vb. hariç)."""
     anchors = row.locator("a, span, div")
     try:
         cnt = anchors.count()
@@ -249,8 +237,7 @@ def best_ticker_in_row(row) -> str:
         item = anchors.nth(j)
         if not is_vis(item):
             continue
-        tt = safe_text(item)  # kilitlenmez
-        tt = tt.upper()
+        tt = safe_text(item).upper()
         if not tt:
             continue
         if tt in BANNED_TAGS:
@@ -264,7 +251,6 @@ def main():
     print(">> entry", flush=True)
     tw = twitter_client()
 
-    # Rastgele ama gerçekçi bir UA havuzu
     ua_pool = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
@@ -307,22 +293,44 @@ def main():
 
         page = ctx.new_page()
         page.set_default_timeout(30000)
+        page.set_default_navigation_timeout(90000)  # ★ nav timeout arttı
 
-        # Sayfayı güvenli şekilde 3 denemeye kadar yükle
         items = []
         for attempt in range(1, PAGE_RELOAD_RETRIES+1):
             try:
                 print(f">> load attempt {attempt}")
-                page.goto(AKIS_URL, wait_until="networkidle")
+                # ★ networkidle yerine domcontentloaded + uzun timeout
+                page.goto(AKIS_URL, wait_until="domcontentloaded", timeout=60000)
+                # bazen ek istekler için kısa bekleme
                 page.wait_for_timeout(800)
+
                 go_highlights(page)
+
+                # Liste gerçekten oluştu mu? (polling ile kontrol)
+                try:
+                    page.wait_for_function(
+                        """() => {
+                            const m = document.querySelector('main');
+                            if(!m) return false;
+                            const lis = m.querySelectorAll('li, [role=listitem], article, div[role=row]');
+                            return lis && lis.length > 5;
+                        }""",
+                        timeout=15000
+                    )
+                except Exception:
+                    pass
+
                 items = extract_company_rows_list(page)
                 if items:
                     break
+
                 # hiç item gelmediyse ufak bekle + bir kez daha miniscroll dene
-                page.wait_for_timeout(800)
+                page.wait_for_timeout(1000)
+                go_highlights(page)
             except Exception as e:
                 print(f"!! page load error (attempt {attempt}): {e}")
+                # küçük gecikme ile tekrar dene
+                page.wait_for_timeout(1500)
                 continue
 
         if not items:
@@ -375,7 +383,6 @@ def main():
                 time.sleep(SLEEP_BETWEEN_TWEETS)
             except Exception as e:
                 print("!! tweet error:", e)
-                # 429: tek retry, yine olmazsa cooldown
                 if "429" in str(e) or "Too Many Requests" in str(e):
                     try:
                         print(">> hit rate limit; waiting 60s then retry once…")
