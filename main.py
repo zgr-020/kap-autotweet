@@ -1,4 +1,5 @@
-import os, re, json, time
+# main.py — Fintables "Öne çıkanlar" -> X otomatik tweet (sağlamlaştırılmış)
+import os, re, json, time, random
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 import tweepy
@@ -43,12 +44,12 @@ state = load_state()
 posted = set(state.get("posted", []))
 last_id = state.get("last_id")
 
-# ============== Parsing helpers ==============
+# ============== Ayarlar ==============
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
-
 MAX_PER_RUN = 5
 SLEEP_BETWEEN_TWEETS = 15  # saniye
-COOLDOWN_ON_429 = 10 * 60  # saniye (10 dk), X çok sık 429 verirse bekle
+COOLDOWN_SECONDS = 10 * 60  # 429 rate-limitte bekleme
+PAGE_RELOAD_RETRIES = 3
 
 UPPER_TR = "A-ZÇĞİÖŞÜ"
 TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}[0-9]?$")  # BIST kodu
@@ -114,34 +115,6 @@ def build_tweet(code: str, snippet: str) -> str:
     base = strip_relative_prefix(base)
     return (f"📰 #{code} | " + base)[:279]
 
-def go_highlights(page):
-    for sel in [
-        "button:has-text('Öne çıkanlar')",
-        "[role='tab']:has-text('Öne çıkanlar')",
-        "a:has-text('Öne çıkanlar')",
-        "text=Öne çıkanlar",
-    ]:
-        loc = page.locator(sel)
-        if loc.count():
-            loc.first.click()
-            page.wait_for_load_state("networkidle")
-            page.wait_for_timeout(600)
-            print(">> highlights ON")
-            return True
-    print(">> highlights button not found; staying on 'Tümü'")
-    return False
-
-def best_ticker_in_row(row) -> str:
-    """Satırdaki etiketler içinden gerçek hisse kodunu bul (KAP/Fintables vb. hariç)."""
-    anchors = row.locator("a, span, div")
-    for j in range(min(40, anchors.count())):
-        tt = (anchors.nth(j).inner_text() or "").strip().upper()
-        if tt in BANNED_TAGS:
-            continue
-        if TICKER_RE.fullmatch(tt):
-            return tt
-    return ""
-
 # --- küçük yardımcılar: görünen mi? güvenli iç metin al ---
 def is_vis(loc):
     try:
@@ -156,17 +129,52 @@ def safe_text(loc, timeout=800):
     except Exception:
         return ""
 
+def go_highlights(page):
+    # çerez banner’ı/kaplamaları kapat
+    for sel in ["button:has-text('Kabul')", "button:has-text('Kabul et')", "button:has-text('Anladım')"]:
+        try:
+            btn = page.locator(sel)
+            if btn.count():
+                btn.first.click(timeout=1000)
+                page.wait_for_timeout(200)
+        except Exception:
+            pass
+
+    # sekmeyi 'Öne çıkanlar' yap
+    for sel in [
+        "button:has-text('Öne çıkanlar')",
+        "[role='tab']:has-text('Öne çıkanlar')",
+        "a:has-text('Öne çıkanlar')",
+        "text=Öne çıkanlar",
+    ]:
+        try:
+            loc = page.locator(sel)
+            if loc.count():
+                loc.first.click(timeout=1500)
+                page.wait_for_load_state("networkidle")
+                page.wait_for_timeout(800)
+                print(">> highlights ON")
+                break
+        except Exception:
+            continue
+
+    # miniscroll ile içerik tetikle
+    try:
+        page.mouse.wheel(0, 400)
+        page.wait_for_timeout(300)
+        page.mouse.wheel(0, -400)
+        page.wait_for_timeout(300)
+    except Exception:
+        pass
+
 def extract_company_rows_list(page, max_scan=400):
     """Modal açmadan listede şirket etiketi olan satırları döndürür (en yeni → eski)."""
-
-    # 1) Ana kapsayıcı
     try:
         page.wait_for_selector("main", state="attached", timeout=15000)
     except Exception:
         print(">> no <main> found; returning empty")
         return []
 
-    # 2) Çeşitli satır seçicilerini sırayla dene
     selector_candidates = [
         "main li",
         "main [role='listitem']",
@@ -199,11 +207,10 @@ def extract_company_rows_list(page, max_scan=400):
     print(f">> rows selector: {rows_sel}  |  raw rows: {total}")
 
     items = []
-    for i in range(total):  # en üstten aşağı = en yeni → eski
+    for i in range(total):
         row = rows.nth(i)
         if not is_vis(row):
             continue
-
         code = best_ticker_in_row(row)
         if not code:
             continue
@@ -213,10 +220,8 @@ def extract_company_rows_list(page, max_scan=400):
             continue
         text_norm = re.sub(r"\s+", " ", text)
 
-        # Haber dışı akışları ele
         if any(re.search(p, text_norm, flags=re.I) for p in NON_NEWS_PATTERNS):
             continue
-        # Fintables kendi içerikleri
         if re.search(r"\bFintables\b", text_norm, flags=re.I):
             continue
 
@@ -230,34 +235,101 @@ def extract_company_rows_list(page, max_scan=400):
         items.append({"id": rid, "code": code, "snippet": snippet})
 
     print(">> eligible items:", len(items))
-    return items  # en yeni → eski
+    return items
+
+def best_ticker_in_row(row) -> str:
+    """Satırdaki etiketler içinden gerçek hisse kodunu bul (KAP/Fintables vb. hariç)."""
+    anchors = row.locator("a, span, div")
+    try:
+        cnt = anchors.count()
+    except Exception:
+        cnt = 0
+    cnt = min(40, max(0, cnt))
+    for j in range(cnt):
+        item = anchors.nth(j)
+        if not is_vis(item):
+            continue
+        tt = safe_text(item)  # kilitlenmez
+        tt = tt.upper()
+        if not tt:
+            continue
+        if tt in BANNED_TAGS:
+            continue
+        if TICKER_RE.fullmatch(tt):
+            return tt
+    return ""
 
 # ============== MAIN ==============
 def main():
-    print(">> start")
+    print(">> entry", flush=True)
     tw = twitter_client()
+
+    # Rastgele ama gerçekçi bir UA havuzu
+    ua_pool = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+    ]
+    ua = random.choice(ua_pool)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--no-sandbox","--disable-gpu","--disable-dev-shm-usage"],
+            args=[
+                "--no-sandbox","--disable-dev-shm-usage","--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=site-per-process,IsolateOrigins",
+            ],
         )
         ctx = browser.new_context(
-            user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
-            locale="tr-TR", timezone_id="Europe/Istanbul"
+            user_agent=ua,
+            locale="tr-TR",
+            timezone_id="Europe/Istanbul",
+            viewport={"width": 1366, "height": 900},
+            java_script_enabled=True,
+            ignore_https_errors=True,
+            extra_http_headers={
+                "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Upgrade-Insecure-Requests": "1",
+            },
         )
-        page = ctx.new_page(); page.set_default_timeout(30000)
-        page.goto(AKIS_URL, wait_until="networkidle")
-        page.wait_for_timeout(600)
-        go_highlights(page)
+        # webdriver izini azalt
+        ctx.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.chrome = { runtime: {} };
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+              parameters.name === 'notifications' ?
+              Promise.resolve({ state: Notification.permission }) :
+              originalQuery(parameters)
+            );
+        """)
 
-        items = extract_company_rows_list(page)
+        page = ctx.new_page()
+        page.set_default_timeout(30000)
+
+        # Sayfayı güvenli şekilde 3 denemeye kadar yükle
+        items = []
+        for attempt in range(1, PAGE_RELOAD_RETRIES+1):
+            try:
+                print(f">> load attempt {attempt}")
+                page.goto(AKIS_URL, wait_until="networkidle")
+                page.wait_for_timeout(800)
+                go_highlights(page)
+                items = extract_company_rows_list(page)
+                if items:
+                    break
+                # hiç item gelmediyse ufak bekle + bir kez daha miniscroll dene
+                page.wait_for_timeout(800)
+            except Exception as e:
+                print(f"!! page load error (attempt {attempt}): {e}")
+                continue
+
         if not items:
             print(">> done (no items)")
-            browser.close(); return
+            browser.close()
+            return
 
-        # en yeni görülen
         newest_seen_id = items[0]["id"]
 
         # önceki run'dan bu yana gelenler (last_id görünene kadar)
@@ -271,9 +343,11 @@ def main():
             print(">> no new items since last run")
             state["last_id"] = newest_seen_id
             save_state(state)
-            browser.close(); print(">> done"); return
+            browser.close()
+            print(">> done")
+            return
 
-        # Run başına üst limit ve eski → yeni sırası
+        # Run başına limit ve eski → yeni
         to_tweet = to_tweet[:MAX_PER_RUN]
         to_tweet.reverse()
 
@@ -293,7 +367,7 @@ def main():
                 sent += 1
                 print(">> tweet sent ✓")
 
-                # BAŞARILI GÖNDERİM SONRASI STATE'i ANINDA YAZ
+                # Anında state yaz
                 state["posted"] = sorted(list(posted))
                 state["last_id"] = newest_seen_id
                 save_state(state)
@@ -301,6 +375,7 @@ def main():
                 time.sleep(SLEEP_BETWEEN_TWEETS)
             except Exception as e:
                 print("!! tweet error:", e)
+                # 429: tek retry, yine olmazsa cooldown
                 if "429" in str(e) or "Too Many Requests" in str(e):
                     try:
                         print(">> hit rate limit; waiting 60s then retry once…")
@@ -310,21 +385,18 @@ def main():
                         posted.add(it["id"])
                         sent += 1
                         print(">> tweet sent (after retry) ✓")
-
                         state["posted"] = sorted(list(posted))
                         state["last_id"] = newest_seen_id
                         save_state(state)
-
                         time.sleep(SLEEP_BETWEEN_TWEETS)
                     except Exception as e2:
                         print("!! retry failed:", e2)
-                        # 429 devam ediyorsa uzun cooldown
                         if "429" in str(e2) or "Too Many Requests" in str(e2):
-                            print(f">> enter cooldown until {time.strftime('%H:%M:%S', time.localtime(time.time()+COOLDOWN_ON_429))} (for 10 min)")
-                            time.sleep(COOLDOWN_ON_429)
+                            until = time.strftime('%H:%M:%S', time.localtime(time.time()+COOLDOWN_SECONDS))
+                            print(f">> enter cooldown until {until} (for {COOLDOWN_SECONDS//60} min)")
                         continue
 
-        # son görüleni kaydet
+        # Son görüleni kaydet
         state["posted"] = sorted(list(posted))
         state["last_id"] = newest_seen_id
         save_state(state)
@@ -333,7 +405,6 @@ def main():
         print(f">> done (sent: {sent})")
 
 if __name__ == "__main__":
-    print(">> entry", flush=True)
     try:
         main()
         print(">> main() finished", flush=True)
