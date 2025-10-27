@@ -1,9 +1,9 @@
-import os, re, json, time
+import os, re, json, time, random, datetime as dt
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 import tweepy
 
-# ============== X (Twitter) Secrets ==============
+# ================== X (Twitter) Secrets ==================
 API_KEY = os.getenv("API_KEY")
 API_KEY_SECRET = os.getenv("API_KEY_SECRET")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
@@ -20,47 +20,88 @@ def twitter_client():
         access_token_secret=ACCESS_TOKEN_SECRET,
     )
 
-# ============== State (duplicate & cooldown) ==============
+# ================== Config / Limits ==================
+AKIS_URL = "https://fintables.com/borsa-haber-akisi"
+
+MAX_PER_RUN    = 4            # bir çalıştırmada en fazla kaç tweet
+TWEET_SLEEP_LO = 35           # tweet arası min bekleme (sn)
+TWEET_SLEEP_HI = 55           # tweet arası max bekleme (sn)
+MAX_PER_DAY    = 120          # günlük üst limit (free plan / güvenli)
+
+# 429 sonrası soğuma (dakika)
+COOLDOWN_MIN_FIRST = 20
+COOLDOWN_MIN_NEXT  = 60
+
+# ================== State (duplicate & cooldown) ==================
 STATE_PATH = Path("state.json")
+
+def _default_state():
+    return {
+        "last_id": None,
+        "posted": [],
+        "cooldown_until": None,     # ISO timestamp
+        "count_today": 0,
+        "day": dt.date.today().isoformat(),
+    }
 
 def load_state():
     if not STATE_PATH.exists():
-        return {"last_id": None, "posted": [], "cooldown_until": 0}
+        return _default_state()
     try:
         data = json.loads(STATE_PATH.read_text())
-        # eski biçim liste ise dönüştür
         if isinstance(data, list):
-            return {"last_id": None, "posted": data, "cooldown_until": 0}
-        data.setdefault("last_id", None)
-        data.setdefault("posted", [])
-        data.setdefault("cooldown_until", 0)
-        return data
+            # ultra eski format
+            s = _default_state()
+            s["posted"] = data
+            return s
+        # alanları tamamla
+        base = _default_state()
+        base.update(data)
+        # bugün reset
+        if base.get("day") != dt.date.today().isoformat():
+            base["day"] = dt.date.today().isoformat()
+            base["count_today"] = 0
+        return base
     except Exception:
-        return {"last_id": None, "posted": [], "cooldown_until": 0}
+        return _default_state()
 
 def save_state(state):
     STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2))
 
-state = load_state()
-posted = set(state.get("posted", []))
+state   = load_state()
+posted  = set(state.get("posted", []))
 last_id = state.get("last_id")
-cooldown_until = state.get("cooldown_until", 0)
 
-# ============== Parsing helpers ==============
-AKIS_URL = "https://fintables.com/borsa-haber-akisi"
+def now_utc():
+    return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
 
-# Daha temkinli hızlar
-MAX_PER_RUN = 3                 # bir run'da en fazla kaç tweet
-SLEEP_BETWEEN_TWEETS = 45       # tweetler arasında bekleme (sn)
-COOLDOWN_SECONDS = 10 * 60      # 429 sonrası topyekûn bekleme: 10 dk
+def in_cooldown(state) -> bool:
+    cu = state.get("cooldown_until")
+    if not cu:
+        return False
+    try:
+        until = dt.datetime.fromisoformat(cu)
+        return now_utc() < until
+    except Exception:
+        return False
 
+def set_cooldown(state, minutes: int):
+    until = now_utc() + dt.timedelta(minutes=minutes)
+    state["cooldown_until"] = until.isoformat()
+    save_state(state)
+    print(f">> enter cooldown until {until.isoformat()} (for {minutes} min)")
+
+def clear_cooldown(state):
+    if state.get("cooldown_until"):
+        state["cooldown_until"] = None
+        save_state(state)
+
+# ================== Parsing helpers ==================
 UPPER_TR = "A-ZÇĞİÖŞÜ"
-TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}[0-9]?$")  # BIST kodu
+TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}[0-9]?$")
 
-# şirket kodu olamayacak etiketler
 BANNED_TAGS = {"KAP", "FINTABLES", "FİNTABLES", "GÜNLÜK", "BÜLTEN", "BULTEN", "GUNLUK", "HABER"}
 
-# bülten/günlük içerikleri ele
 NON_NEWS_PATTERNS = [
     r"\bGünlük Bülten\b", r"\bBülten\b", r"\bPiyasa temkini\b", r"\bPiyasa değerlendirmesi\b"
 ]
@@ -71,18 +112,15 @@ STOP_PHRASES = [
 ]
 TIME_PATTERNS = [r"\b\d{1,2}:\d{2}\b", r"\bDün\s+\d{1,2}:\d{2}\b", r"\bBugün\b", r"\bAz önce\b"]
 
-# -------- Göreli tarih öneklerini temizle (Dün/Bugün/Yesterday/Today) --------
 REL_PREFIX = re.compile(r'^(?:dün|bugün|yesterday|today)\b[:\-–]?\s*', re.IGNORECASE)
 def strip_relative_prefix(text: str) -> str:
-    t = REL_PREFIX.sub('', text).lstrip('-–: ').strip()
-    return t
-# ---------------------------------------------------------------------------
+    return REL_PREFIX.sub('', text).lstrip('-–: ').strip()
 
 def clean_text(t: str) -> str:
     t = re.sub(r"\s+", " ", (t or "")).strip()
-    for p in STOP_PHRASES: t = re.sub(p, "", t, flags=re.I)
+    for p in STOP_PHRASES:  t = re.sub(p, "", t, flags=re.I)
     for p in TIME_PATTERNS: t = re.sub(p, "", t, flags=re.I)
-    t = re.sub(r"\b(Fintables|KAP)\b\s*[·\.]?\s*", "", t, flags=re.I)  # kaynak kırpıntısı
+    t = re.sub(r"\b(Fintables|KAP)\b\s*[·\.]?\s*", "", t, flags=re.I)
     return t.strip(" -–—:|•·")
 
 REWRITE_MAP = [
@@ -140,10 +178,8 @@ def best_ticker_in_row(row) -> str:
     anchors = row.locator("a, span, div")
     for j in range(min(40, anchors.count())):
         tt = (anchors.nth(j).inner_text() or "").strip().upper()
-        if tt in BANNED_TAGS:
-            continue
-        if TICKER_RE.fullmatch(tt):
-            return tt
+        if tt in BANNED_TAGS: continue
+        if TICKER_RE.fullmatch(tt): return tt
     return ""
 
 def extract_company_rows_list(page, max_scan=400):
@@ -152,11 +188,10 @@ def extract_company_rows_list(page, max_scan=400):
     print(">> raw rows:", total)
 
     items = []
-    for i in range(total):  # en yeni → eski
+    for i in range(total):
         row = rows.nth(i)
         code = best_ticker_in_row(row)
-        if not code:
-            continue
+        if not code: continue
 
         text = row.inner_text().strip()
         text_norm = re.sub(r"\s+", " ", text)
@@ -169,8 +204,7 @@ def extract_company_rows_list(page, max_scan=400):
         pos = text_norm.upper().find(code)
         snippet = text_norm[pos + len(code):].strip()
         snippet = clean_text(snippet)
-        if len(snippet) < 15:
-            continue
+        if len(snippet) < 15: continue
 
         rid = f"{code}-{hash(text_norm)}"
         items.append({"id": rid, "code": code, "snippet": snippet})
@@ -178,36 +212,18 @@ def extract_company_rows_list(page, max_scan=400):
     print(">> eligible items:", len(items))
     return items
 
-# ============== helpers: rate-limit & cooldown ==============
-def is_rate_limit_error(err: Exception) -> bool:
-    s = str(err)
-    return ("429" in s) or ("Too Many Requests" in s)
-
-def enter_cooldown(state: dict):
-    until = int(time.time()) + COOLDOWN_SECONDS
-    state["cooldown_until"] = until
-    save_state(state)
-    print(f">> enter cooldown until {time.strftime('%H:%M:%S', time.localtime(until))} (for {COOLDOWN_SECONDS//60} min)")
-
-def under_cooldown(state: dict) -> bool:
-    now = int(time.time())
-    cu = int(state.get("cooldown_until", 0) or 0)
-    if cu > now:
-        eta = cu - now
-        print(f">> under cooldown; {eta}s remaining — skipping this run")
-        return True
-    if cu and cu <= now:
-        # cooldown bitti, sıfırla
-        state["cooldown_until"] = 0
-        save_state(state)
-    return False
-
-# ============== MAIN ==============
+# ================== MAIN ==================
 def main():
-    print(">> start")
+    print(">> entry", flush=True)
 
-    # Cooldown aktifse hiç deneme yapma
-    if under_cooldown(state):
+    # 1) Cooldown kontrol
+    if in_cooldown(state):
+        print(">> in cooldown window; skipping run")
+        return
+
+    # 2) Günlük limit
+    if state.get("count_today", 0) >= MAX_PER_DAY:
+        print(f">> daily cap reached ({state['count_today']}/{MAX_PER_DAY}); skipping")
         return
 
     tw = twitter_client()
@@ -215,7 +231,7 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--no-sandbox","--disable-gpu","--disable-dev-shm-usage"],
+            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
         )
         ctx = browser.new_context(
             user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -232,10 +248,8 @@ def main():
             print(">> done (no items)")
             browser.close(); return
 
-        # en yeni görülen
         newest_seen_id = items[0]["id"]
 
-        # önceki run'dan bu yana gelenler (last_id görünene kadar)
         to_tweet = []
         for it in items:
             if last_id and it["id"] == last_id:
@@ -248,15 +262,21 @@ def main():
             save_state(state)
             browser.close(); print(">> done"); return
 
-        # Run başına üst limit ve eski → yeni sırası
+        # sırayı eski → yeni ve limit
         to_tweet = to_tweet[:MAX_PER_RUN]
         to_tweet.reverse()
 
         sent = 0
+        consecutive_429 = 0
+
         for it in to_tweet:
             if it["id"] in posted:
-                print(">> already posted, skip and continue")
+                print(">> already posted, skip")
                 continue
+
+            if state["count_today"] >= MAX_PER_DAY:
+                print(">> daily cap reached during loop; stop")
+                break
 
             tweet = build_tweet(it["code"], it["snippet"])
             print(">> TWEET:", tweet)
@@ -265,28 +285,36 @@ def main():
                 if tw:
                     tw.create_tweet(text=tweet)
                 posted.add(it["id"])
+                state["count_today"] = state.get("count_today", 0) + 1
                 sent += 1
+                consecutive_429 = 0
                 print(">> tweet sent ✓")
 
-                # başarılı gönderim → state'i hemen kaydet
+                # anında kalıcılaştır
                 state["posted"] = sorted(list(posted))
                 state["last_id"] = newest_seen_id
+                clear_cooldown(state)
                 save_state(state)
 
-                time.sleep(SLEEP_BETWEEN_TWEETS)
+                # jitter
+                time.sleep(random.randint(TWEET_SLEEP_LO, TWEET_SLEEP_HI))
 
             except Exception as e:
-                print("!! tweet error:", e)
+                msg = str(e)
+                print("!! tweet error:", msg)
 
-                if is_rate_limit_error(e):
-                    # Rate limit: cooldow'a geç, bu run'ı kapat
-                    enter_cooldown(state)
-                    break  # bu run bitti
+                if "429" in msg or "Too Many Requests" in msg:
+                    consecutive_429 += 1
+                    # ilk 429’da kısa, tekrarlarsa uzun cooldown
+                    minutes = COOLDOWN_MIN_FIRST if consecutive_429 == 1 else COOLDOWN_MIN_NEXT
+                    set_cooldown(state, minutes)
+                    print(">> stop run due to 429; cooldown set")
+                    break
+                else:
+                    # başka hata → bu tweet'i atla, devam et
+                    continue
 
-                # başka bir hata ise sadece atla
-                continue
-
-        # son görüleni kaydet (gönderim olmasa da güncelle)
+        # run bitimi
         state["posted"] = sorted(list(posted))
         state["last_id"] = newest_seen_id
         save_state(state)
@@ -295,15 +323,12 @@ def main():
         print(f">> done (sent: {sent})")
 
 if __name__ == "__main__":
-    print(">> entry", flush=True)
     try:
         main()
-        print(">> main() finished", flush=True)
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
-        print("!! UNCAUGHT ERROR !!")
-        print(tb)
+        print("!! UNCAUGHT ERROR !!\n", tb)
         try:
             with open("debug.log", "a", encoding="utf-8") as f:
                 f.write(tb + "\n")
