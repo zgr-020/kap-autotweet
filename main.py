@@ -1,4 +1,4 @@
-import os, re, json, time
+import os, re, json, time, hashlib
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 import tweepy
@@ -167,10 +167,13 @@ def extract_company_rows_list(page, max_scan=400):
         pos = text_norm.upper().find(code)
         snippet = text_norm[pos + len(code):].strip()
         snippet = clean_text(snippet)
-        if len(snippet) < 15:
+        if len(snippet) < 10:   # ⬅️ 15'ten 10'a esnetildi
             continue
 
-        rid = f"{code}-{hash(text_norm)}"
+        # ⬇️ Stabil kimlik: kod + temiz snippet (saat, küçük değişiklikler etkilemesin)
+        stable_key = f"{code}|{snippet}".encode("utf-8")
+        rid = f"{code}-{hashlib.md5(stable_key).hexdigest()[:10]}"
+
         items.append({"id": rid, "code": code, "snippet": snippet})
 
     print(">> eligible items:", len(items))
@@ -237,7 +240,7 @@ def main():
                 sent += 1
                 print(">> tweet sent ✓")
 
-                # ⬇️ BAŞARILI GÖNDERİMDEN HEMEN SONRA STATE'İ KAYDET
+                # ⬇️ BAŞARILI GÖNDERİM SONRASI ANINDA PERSIST
                 state["posted"] = sorted(list(posted))
                 state["last_id"] = newest_seen_id
                 save_state(state)
@@ -255,7 +258,7 @@ def main():
                         sent += 1
                         print(">> tweet sent (after retry) ✓")
 
-                        # ⬇️ RETRY BAŞARILIYSA DA HEMEN KAYDET
+                        # ⬇️ RETRY BAŞARILIYSA DA PERSIST
                         state["posted"] = sorted(list(posted))
                         state["last_id"] = newest_seen_id
                         save_state(state)
