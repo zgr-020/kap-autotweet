@@ -1,4 +1,4 @@
-import os, re, json, time, random
+import os, re, json, time
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 import tweepy
@@ -20,21 +20,23 @@ def twitter_client():
         access_token_secret=ACCESS_TOKEN_SECRET,
     )
 
-# ============== State (duplicate koruması) ==============
+# ============== State (duplicate & cooldown) ==============
 STATE_PATH = Path("state.json")
 
 def load_state():
     if not STATE_PATH.exists():
-        return {"last_id": None, "posted": []}
+        return {"last_id": None, "posted": [], "cooldown_until": 0}
     try:
         data = json.loads(STATE_PATH.read_text())
+        # eski biçim liste ise dönüştür
         if isinstance(data, list):
-            return {"last_id": None, "posted": data}
+            return {"last_id": None, "posted": data, "cooldown_until": 0}
         data.setdefault("last_id", None)
         data.setdefault("posted", [])
+        data.setdefault("cooldown_until", 0)
         return data
     except Exception:
-        return {"last_id": None, "posted": []}
+        return {"last_id": None, "posted": [], "cooldown_until": 0}
 
 def save_state(state):
     STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2))
@@ -42,13 +44,15 @@ def save_state(state):
 state = load_state()
 posted = set(state.get("posted", []))
 last_id = state.get("last_id")
+cooldown_until = state.get("cooldown_until", 0)
 
 # ============== Parsing helpers ==============
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
 
-# Daha nazik gönderim (rate-limit dostu)
-MAX_PER_RUN = 3
-SLEEP_BETWEEN_TWEETS = 75  # saniye (aşağıda ±10s jitter eklenecek)
+# Daha temkinli hızlar
+MAX_PER_RUN = 3                 # bir run'da en fazla kaç tweet
+SLEEP_BETWEEN_TWEETS = 45       # tweetler arasında bekleme (sn)
+COOLDOWN_SECONDS = 10 * 60      # 429 sonrası topyekûn bekleme: 10 dk
 
 UPPER_TR = "A-ZÇĞİÖŞÜ"
 TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}[0-9]?$")  # BIST kodu
@@ -78,7 +82,7 @@ def clean_text(t: str) -> str:
     t = re.sub(r"\s+", " ", (t or "")).strip()
     for p in STOP_PHRASES: t = re.sub(p, "", t, flags=re.I)
     for p in TIME_PATTERNS: t = re.sub(p, "", t, flags=re.I)
-    t = re.sub(r"\b(Fintables|KAP)\b\s*[·\.]?\s*", "", t, flags=re.I)
+    t = re.sub(r"\b(Fintables|KAP)\b\s*[·\.]?\s*", "", t, flags=re.I)  # kaynak kırpıntısı
     return t.strip(" -–—:|•·")
 
 REWRITE_MAP = [
@@ -172,11 +176,40 @@ def extract_company_rows_list(page, max_scan=400):
         items.append({"id": rid, "code": code, "snippet": snippet})
 
     print(">> eligible items:", len(items))
-    return items  # en yeni → eski
+    return items
+
+# ============== helpers: rate-limit & cooldown ==============
+def is_rate_limit_error(err: Exception) -> bool:
+    s = str(err)
+    return ("429" in s) or ("Too Many Requests" in s)
+
+def enter_cooldown(state: dict):
+    until = int(time.time()) + COOLDOWN_SECONDS
+    state["cooldown_until"] = until
+    save_state(state)
+    print(f">> enter cooldown until {time.strftime('%H:%M:%S', time.localtime(until))} (for {COOLDOWN_SECONDS//60} min)")
+
+def under_cooldown(state: dict) -> bool:
+    now = int(time.time())
+    cu = int(state.get("cooldown_until", 0) or 0)
+    if cu > now:
+        eta = cu - now
+        print(f">> under cooldown; {eta}s remaining — skipping this run")
+        return True
+    if cu and cu <= now:
+        # cooldown bitti, sıfırla
+        state["cooldown_until"] = 0
+        save_state(state)
+    return False
 
 # ============== MAIN ==============
 def main():
     print(">> start")
+
+    # Cooldown aktifse hiç deneme yapma
+    if under_cooldown(state):
+        return
+
     tw = twitter_client()
 
     with sync_playwright() as p:
@@ -235,27 +268,25 @@ def main():
                 sent += 1
                 print(">> tweet sent ✓")
 
-                # Başarılı gönderimden hemen sonra state'i kaydet
+                # başarılı gönderim → state'i hemen kaydet
                 state["posted"] = sorted(list(posted))
                 state["last_id"] = newest_seen_id
                 save_state(state)
 
-                # Jitter'lı bekleme (örn. 75 ± 10 sn)
-                time.sleep(SLEEP_BETWEEN_TWEETS + random.randint(-10, 10))
+                time.sleep(SLEEP_BETWEEN_TWEETS)
 
             except Exception as e:
-                msg = str(e)
-                print("!! tweet error:", msg)
+                print("!! tweet error:", e)
 
-                # 429: aynı pencerede zorlamayı bırak, koşuyu bitir
-                if "429" in msg or "Too Many Requests" in msg:
-                    print(">> rate limit hit; stopping this run early.")
-                    break
+                if is_rate_limit_error(e):
+                    # Rate limit: cooldow'a geç, bu run'ı kapat
+                    enter_cooldown(state)
+                    break  # bu run bitti
 
-                # diğer hatalarda devam
+                # başka bir hata ise sadece atla
                 continue
 
-        # son görüleni kaydet
+        # son görüleni kaydet (gönderim olmasa da güncelle)
         state["posted"] = sorted(list(posted))
         state["last_id"] = newest_seen_id
         save_state(state)
