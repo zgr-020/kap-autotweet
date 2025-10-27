@@ -1,4 +1,4 @@
-import os, re, json, time, hashlib
+import os, re, json, time, random
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 import tweepy
@@ -28,7 +28,6 @@ def load_state():
         return {"last_id": None, "posted": []}
     try:
         data = json.loads(STATE_PATH.read_text())
-        # eski biçim liste ise dönüştür
         if isinstance(data, list):
             return {"last_id": None, "posted": data}
         data.setdefault("last_id", None)
@@ -46,8 +45,10 @@ last_id = state.get("last_id")
 
 # ============== Parsing helpers ==============
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
-MAX_PER_RUN = 5
-SLEEP_BETWEEN_TWEETS = 15  # saniye
+
+# Daha nazik gönderim (rate-limit dostu)
+MAX_PER_RUN = 3
+SLEEP_BETWEEN_TWEETS = 75  # saniye (aşağıda ±10s jitter eklenecek)
 
 UPPER_TR = "A-ZÇĞİÖŞÜ"
 TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}[0-9]?$")  # BIST kodu
@@ -69,7 +70,6 @@ TIME_PATTERNS = [r"\b\d{1,2}:\d{2}\b", r"\bDün\s+\d{1,2}:\d{2}\b", r"\bBugün\b
 # -------- Göreli tarih öneklerini temizle (Dün/Bugün/Yesterday/Today) --------
 REL_PREFIX = re.compile(r'^(?:dün|bugün|yesterday|today)\b[:\-–]?\s*', re.IGNORECASE)
 def strip_relative_prefix(text: str) -> str:
-    # "Dün:", "Bugün -", "Yesterday " vb. önekleri ve yan ayıracı temizle
     t = REL_PREFIX.sub('', text).lstrip('-–: ').strip()
     return t
 # ---------------------------------------------------------------------------
@@ -78,7 +78,7 @@ def clean_text(t: str) -> str:
     t = re.sub(r"\s+", " ", (t or "")).strip()
     for p in STOP_PHRASES: t = re.sub(p, "", t, flags=re.I)
     for p in TIME_PATTERNS: t = re.sub(p, "", t, flags=re.I)
-    t = re.sub(r"\b(Fintables|KAP)\b\s*[·\.]?\s*", "", t, flags=re.I)  # kaynak kırpıntısı
+    t = re.sub(r"\b(Fintables|KAP)\b\s*[·\.]?\s*", "", t, flags=re.I)
     return t.strip(" -–—:|•·")
 
 REWRITE_MAP = [
@@ -112,7 +112,7 @@ def summarize(text: str, limit: int) -> str:
 def build_tweet(code: str, snippet: str) -> str:
     base = rewrite_tr_short(snippet)
     base = summarize(base, 240)
-    base = strip_relative_prefix(base)   # 👈 göreli tarih öneklerini sil
+    base = strip_relative_prefix(base)
     return (f"📰 #{code} | " + base)[:279]
 
 def go_highlights(page):
@@ -133,7 +133,6 @@ def go_highlights(page):
     return False
 
 def best_ticker_in_row(row) -> str:
-    """Satırdaki etiketler içinden gerçek hisse kodunu bul (KAP/Fintables vb. hariç)."""
     anchors = row.locator("a, span, div")
     for j in range(min(40, anchors.count())):
         tt = (anchors.nth(j).inner_text() or "").strip().upper()
@@ -144,13 +143,12 @@ def best_ticker_in_row(row) -> str:
     return ""
 
 def extract_company_rows_list(page, max_scan=400):
-    """Modal açmadan listede şirket etiketi olan satırları döndürür (en yeni → eski)."""
     rows = page.locator("main li, main div[role='listitem'], main div")
     total = min(max_scan, rows.count())
     print(">> raw rows:", total)
 
     items = []
-    for i in range(total):  # en üstten aşağı = en yeni → eski
+    for i in range(total):  # en yeni → eski
         row = rows.nth(i)
         code = best_ticker_in_row(row)
         if not code:
@@ -167,13 +165,10 @@ def extract_company_rows_list(page, max_scan=400):
         pos = text_norm.upper().find(code)
         snippet = text_norm[pos + len(code):].strip()
         snippet = clean_text(snippet)
-        if len(snippet) < 10:   # ⬅️ 15'ten 10'a esnetildi
+        if len(snippet) < 15:
             continue
 
-        # ⬇️ Stabil kimlik: kod + temiz snippet (saat, küçük değişiklikler etkilemesin)
-        stable_key = f"{code}|{snippet}".encode("utf-8")
-        rid = f"{code}-{hashlib.md5(stable_key).hexdigest()[:10]}"
-
+        rid = f"{code}-{hash(text_norm)}"
         items.append({"id": rid, "code": code, "snippet": snippet})
 
     print(">> eligible items:", len(items))
@@ -240,33 +235,25 @@ def main():
                 sent += 1
                 print(">> tweet sent ✓")
 
-                # ⬇️ BAŞARILI GÖNDERİM SONRASI ANINDA PERSIST
+                # Başarılı gönderimden hemen sonra state'i kaydet
                 state["posted"] = sorted(list(posted))
                 state["last_id"] = newest_seen_id
                 save_state(state)
 
-                time.sleep(SLEEP_BETWEEN_TWEETS)  # rate-limit güvenlik
+                # Jitter'lı bekleme (örn. 75 ± 10 sn)
+                time.sleep(SLEEP_BETWEEN_TWEETS + random.randint(-10, 10))
+
             except Exception as e:
-                print("!! tweet error:", e)
-                if "429" in str(e) or "Too Many Requests" in str(e):
-                    try:
-                        print(">> hit rate limit; waiting 60s then retry once…")
-                        time.sleep(60)
-                        if tw:
-                            tw.create_tweet(text=tweet)
-                        posted.add(it["id"])
-                        sent += 1
-                        print(">> tweet sent (after retry) ✓")
+                msg = str(e)
+                print("!! tweet error:", msg)
 
-                        # ⬇️ RETRY BAŞARILIYSA DA PERSIST
-                        state["posted"] = sorted(list(posted))
-                        state["last_id"] = newest_seen_id
-                        save_state(state)
+                # 429: aynı pencerede zorlamayı bırak, koşuyu bitir
+                if "429" in msg or "Too Many Requests" in msg:
+                    print(">> rate limit hit; stopping this run early.")
+                    break
 
-                        time.sleep(SLEEP_BETWEEN_TWEETS)
-                    except Exception as e2:
-                        print("!! retry failed:", e2)
-                        continue
+                # diğer hatalarda devam
+                continue
 
         # son görüleni kaydet
         state["posted"] = sorted(list(posted))
@@ -286,7 +273,6 @@ if __name__ == "__main__":
         tb = traceback.format_exc()
         print("!! UNCAUGHT ERROR !!")
         print(tb)
-        # ayrıca dosyaya bırak (artifacts ile görebilirsin)
         try:
             with open("debug.log", "a", encoding="utf-8") as f:
                 f.write(tb + "\n")
