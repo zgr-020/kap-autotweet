@@ -68,61 +68,45 @@ STOP_PHRASES = [
 ]
 REL_PREFIX = re.compile(r'^(?:dün|bugün|yesterday|today)\b[:\-–]?\s*', re.IGNORECASE)
 
-# ============== JS Extractor (SADECE KAP - XXXX) ==============
-JS_EXTRACTOR = r"""
+# ============== JS Extractor (GENİŞLETİLMİŞ: TERA GİBİ KODLAR) ==============
+JS_EXTRACTOR = """
 () => {
-  try {
-    const rows = Array.from(document.querySelectorAll('main li, main div[role="listitem"], main div')).slice(0, 500);
-    if (!rows.length) return [];
+    try {
+        const rows = Array.from(document.querySelectorAll('main li, main div[role="listitem"], main div'))
+            .slice(0, 300);
+        if (!rows.length) return [];
 
-    const banned = new Set(['ADET','TEK','MİLYON','TL','YÜZDE','PAY','HİSSE','ŞİRKET','BİST','KAP','FİNTABLES','BÜLTEN','GÜNLÜK','BURADA','KVKK','POLİTİKASI','YASAL','UYARI','BİLGİLENDİRME','GUNLUK','HABER']);
-    const nonNewsRe = /(Günlük Bülten|Bülten|Piyasa temkini|yatırım bilgi|yasal uyarı|kişisel veri|kvk)/i;
-    const codeRe = /([A-ZÇĞİÖŞÜ]{3,6}[0-9]?)/g;
+        const banned = new Set(['ADET','TEK','MİLYON','TL','YÜZDE','PAY','HİSSE','ŞİRKET','BİST','KAP','FİNTABLES','BÜLTEN','GÜNLÜK','BURADA','KVKK','POLİTİKASI','YASAL','UYARI','BİLGİLENDİRME','GUNLUK','HABER']);
+        const nonNewsRe = /(Günlük Bülten|Bülten|Piyasa temkini|yatırım bilgi|yasal uyarı|kişisel veri|kvk)/i;
 
-    function pickAllCodes(afterKapText) {
-      const set = new Set();
-      if (!afterKapText) return [];
-      const up = afterKapText.toUpperCase();
-      for (const m of up.matchAll(codeRe)) {
-        const tok = (m[1] || '').trim();
-        if (!tok) continue;
-        if (banned.has(tok)) continue;
-        if (/^[A-ZÇĞİÖŞÜ]{3,6}[0-9]?$/.test(tok)) set.add(tok);
-        if (set.size >= 4) break; // güvenlik
-      }
-      return Array.from(set);
+        return rows.map(row => {
+            const text = row.innerText || '';
+            if (!text.trim()) return null;
+            const norm = text.replace(/\\s+/g, ' ').trim();
+            if (nonNewsRe.test(norm) || /Fintables/i.test(norm)) return null;
+
+            // GENİŞLETİLMİŞ: KAP - XXXX VEYA KAP XXXX formatı
+            const kapMatch = norm.match(/\\bKAP\\s*[•·\\-\\.]?\\s*([A-ZÇĞİÖŞÜ]{2,5})(?:[0-9]?\\b)/i);
+            if (!kapMatch) return null;
+
+            const code = kapMatch[1].toUpperCase();
+            if (banned.has(code)) return null;
+            if (!/^[A-ZÇĞİÖŞÜ]+(?:[0-9])?$/.test(code)) return null;
+
+            const pos = norm.toUpperCase().indexOf(code) + code.length;
+            let snippet = norm.slice(pos).trim();
+            if (snippet.length < 30) return null;
+            if (/yatırım bilgi|yasal uyarı|kişisel veri|kvk|politikası/i.test(snippet)) return null;
+
+            const timestamp = Date.now();  // Zaman damgası ekle
+            const hash = norm.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) & 0xFFFFFFFF, 0);
+            const id = `${code}-${hash}-${timestamp}`;
+            return { id, code, snippet, raw: norm };
+        }).filter(Boolean);
+    } catch (e) {
+        console.error("JS Extractor Error:", e);
+        return [];
     }
-
-    return rows.map(row => {
-      const text = row.innerText || '';
-      if (!text.trim()) return null;
-      const norm = text.replace(/\s+/g, ' ').trim();
-      if (nonNewsRe.test(norm) || /Fintables/i.test(norm)) return null;
-
-      const up = norm.toUpperCase();
-      const kapIdx = up.indexOf('KAP');
-      if (kapIdx === -1) return null;
-
-      const afterKap = norm.slice(kapIdx + 3).replace(/^[\s•·\-\.:|]+/, '');
-      const codes = pickAllCodes(afterKap);
-      if (!codes.length) return null;
-
-      // açıklama: ilk kodun geçtiği yerden sonrası
-      const pos = up.indexOf(codes[0]);
-      let snippet = norm.slice(pos + codes[0].length).trim();
-      if (snippet.length < 30) return null;
-      if (/yatırım bilgi|yasal uyarı|kişisel veri|kvk|politikası/i.test(snippet)) return null;
-
-      // stabil id
-      let h = 0; for (let i = 0; i < norm.length; i++) h = (h * 31 + norm.charCodeAt(i)) >>> 0;
-      const id = `${codes[0]}-${h}`;
-
-      return { id, code: codes[0], codes, snippet, raw: norm };
-    }).filter(Boolean);
-  } catch (e) {
-    console.error('JS Extractor Error:', e);
-    return [];
-  }
 }
 """
 
@@ -137,33 +121,36 @@ def clean_text(t: str) -> str:
     t = re.sub(r"\s+ve\s+", " ve ", t)
     return t
 
-def build_tweet(code: str, snippet: str, codes=None) -> str:
-    codes = codes or [code]
+def build_tweet(code: str, snippet: str) -> str:
     base = clean_text(snippet)
-
-    # ikinci/üçüncü kodları metin içinde hashtag'le
-    for extra in codes[1:]:
-        # zaten hashtag'li değilse kelime bazlı değiştir
-        pat = re.compile(rf"\b{re.escape(extra)}\b", flags=re.I)
-        if pat.search(base):
-            base = pat.sub(f"#{extra}", base)
-        else:
-            # metinde yoksa, sona ekleyelim
-            base = base + f" #{extra}"
-
-    # ilk cümleyi al ve kısalt
+    
+    # İlk tam cümleyi al
     sentences = [s.strip() for s in base.split('.') if s.strip()]
-    first_sentence = sentences[0] if sentences else base.split(' ', 25)[0]
+    first_sentence = sentences[0] if sentences else ' '.join(base.split()[:35])
+    
+    # Kısa ise genişlet
     if len(first_sentence) < 30:
-        words = base.split()
-        first_sentence = ' '.join(words[:30])
-    if len(first_sentence) > 230:
-        first_sentence = first_sentence[:227].rsplit(' ', 1)[0] + "..."
+        first_sentence = ' '.join(base.split()[:40])
+    
+    # 270 karakter sınırı
+    max_len = 270
+    if len(first_sentence) > max_len:
+        words = first_sentence.split()
+        temp = ""
+        for w in words:
+            if len(temp + w + " ") <= max_len - 3:
+                temp += w + " "
+            else:
+                break
+        first_sentence = temp.strip() + "..."
+    
+    # Nokta ile bitir
     if not first_sentence.endswith(('.', '!', '?')):
         first_sentence += "."
-
-    tweet = f"📰 #{code} | {first_sentence}"
-    return tweet[:279]  # X sınırımız (279)
+    
+    # EMOJİ: Megafon
+    tweet = f"📢 #{code} | {first_sentence}"
+    return tweet[:280]
 
 def is_valid_ticker(code: str, text: str) -> bool:
     if len(code) < 2 or len(code) > 6: return False
@@ -243,6 +230,10 @@ def main():
             log(">> evaluating JS extractor...")
             raw_items = page.evaluate(JS_EXTRACTOR)
             log(f">> extracted {len(raw_items)} items in JS")
+            
+            # DEBUG: İlk 3 haberi logla
+            for i, item in enumerate(raw_items[:3]):
+                log(f">> DEBUG ITEM {i+1}: {item['raw'][:100]}...")
         except Exception as e:
             log(f"!! JS evaluation failed: {e}")
             raw_items = []
@@ -256,6 +247,7 @@ def main():
         to_tweet = []
         for it in raw_items:
             if last_id and it["id"] == last_id:
+                log(f">> found last_id: {last_id}, stopping")
                 break
             to_tweet.append(it)
         to_tweet = to_tweet[:MAX_PER_RUN]
@@ -276,7 +268,7 @@ def main():
                 log(f">> SKIP: #{it['code']} (geçersiz)")
                 continue
 
-            tweet = build_tweet(it["code"], it["snippet"], it.get("codes"))
+            tweet = build_tweet(it["code"], it["snippet"])
             log(f">> TWEET: {tweet}")
 
             try:
