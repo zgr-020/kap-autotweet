@@ -68,7 +68,7 @@ STOP_PHRASES = [
 ]
 REL_PREFIX = re.compile(r'^(?:dün|bugün|yesterday|today)\b[:\-–]?\s*', re.IGNORECASE)
 
-# ============== JS Extractor (GENİŞLETİLMİŞ: TERA GİBİ KODLAR) ==============
+# ============== JS Extractor (SADECE GERÇEK KAP HABERLERİ) ==============
 JS_EXTRACTOR = """
 () => {
     try {
@@ -76,7 +76,7 @@ JS_EXTRACTOR = """
             .slice(0, 300);
         if (!rows.length) return [];
 
-        const banned = new Set(['ADET','TEK','MİLYON','TL','YÜZDE','PAY','HİSSE','ŞİRKET','BİST','KAP','FİNTABLES','BÜLTEN','GÜNLÜK','BURADA','KVKK','POLİTİKASI','YASAL','UYARI','BİLGİLENDİRME','GUNLUK','HABER']);
+        const banned = new Set(['ADET','TEK','MİLYON','TL','YÜZDE','PAY','HİSSE','ŞİRKET','BİST','KAP','FİNTABLES','BÜLTEN','GÜNLÜK','BURADA','KVKK','POLİTİKASI','YASAL','UYARI','BİLGİLENDİRME','GUNLUK','HABER','ALTNY','YBTAS','RODRG','MAGEN']);
         const nonNewsRe = /(Günlük Bülten|Bülten|Piyasa temkini|yatırım bilgi|yasal uyarı|kişisel veri|kvk)/i;
 
         return rows.map(row => {
@@ -85,20 +85,20 @@ JS_EXTRACTOR = """
             const norm = text.replace(/\\s+/g, ' ').trim();
             if (nonNewsRe.test(norm) || /Fintables/i.test(norm)) return null;
 
-            // GENİŞLETİLMİŞ: KAP - XXXX VEYA KAP XXXX formatı
-            const kapMatch = norm.match(/\\bKAP\\s*[•·\\-\\.]?\\s*([A-ZÇĞİÖŞÜ]{2,5})(?:[0-9]?\\b)/i);
+            // SADECE "KAP - XXXX" formatı
+            const kapMatch = norm.match(/\\bKAP\\s*[•·\\-\\.]\\s*([A-ZÇĞİÖŞÜ]{3,5})(?:[0-9]?\\b)/i);
             if (!kapMatch) return null;
 
             const code = kapMatch[1].toUpperCase();
             if (banned.has(code)) return null;
-            if (!/^[A-ZÇĞİÖŞÜ]+(?:[0-9])?$/.test(code)) return null;
+            if (!/^[A-ZÇĞİÖŞÜ]{3,5}$/.test(code)) return null;
 
             const pos = norm.toUpperCase().indexOf(code) + code.length;
             let snippet = norm.slice(pos).trim();
-            if (snippet.length < 30) return null;
+            if (snippet.length < 40) return null;
             if (/yatırım bilgi|yasal uyarı|kişisel veri|kvk|politikası/i.test(snippet)) return null;
 
-            const timestamp = Date.now();  // Zaman damgası ekle
+            const timestamp = Date.now();
             const hash = norm.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) & 0xFFFFFFFF, 0);
             const id = `${code}-${hash}-${timestamp}`;
             return { id, code, snippet, raw: norm };
@@ -124,16 +124,15 @@ def clean_text(t: str) -> str:
 def build_tweet(code: str, snippet: str) -> str:
     base = clean_text(snippet)
     
-    # İlk tam cümleyi al
-    sentences = [s.strip() for s in base.split('.') if s.strip()]
-    first_sentence = sentences[0] if sentences else ' '.join(base.split()[:35])
+    # İlk tam cümleyi al (nokta ile biten)
+    sentences = [s.strip() for s in base.split('.') if s.strip() and len(s.strip()) > 20]
+    if not sentences:
+        first_sentence = ' '.join(base.split()[:30])
+    else:
+        first_sentence = sentences[0]
     
-    # Kısa ise genişlet
-    if len(first_sentence) < 30:
-        first_sentence = ' '.join(base.split()[:40])
-    
-    # 270 karakter sınırı
-    max_len = 270
+    # Kelime kesmeden kısalt
+    max_len = 230
     if len(first_sentence) > max_len:
         words = first_sentence.split()
         temp = ""
@@ -148,14 +147,14 @@ def build_tweet(code: str, snippet: str) -> str:
     if not first_sentence.endswith(('.', '!', '?')):
         first_sentence += "."
     
-    # EMOJİ: Megafon
-    tweet = f"📢 #{code} | {first_sentence}"
+    # ŞABLON: Megafon #KOD | Haber
+    tweet = f"Megafon #{code} | {first_sentence}"
     return tweet[:280]
 
 def is_valid_ticker(code: str, text: str) -> bool:
-    if len(code) < 2 or len(code) > 6: return False
-    if not re.match(r"^[A-ZÇĞİÖŞÜ]+(?:[0-9])?$", code): return False
-    forbidden = ["YATIRIM BİLGİ", "TAVSİYE", "YASAL UYARI", "KİŞİSEL VERİ", "POLİTİKASI", "KVK"]
+    if len(code) < 3 or len(code) > 5: return False
+    if not re.match(r"^[A-ZÇĞİÖŞÜ]{3,5}$", code): return False
+    forbidden = ["YATIRIM", "TAVSİYE", "UYARI", "KİŞİSEL", "POLİTİKASI", "KVK"]
     if any(phrase in text.upper() for phrase in forbidden): return False
     return True
 
@@ -178,7 +177,7 @@ def goto_with_retry(page, url, retries=3):
 def main():
     log(">> start (GitHub Actions)")
 
-    # COOLDOWN KONTROLÜ
+    # COOLDOWN
     if state.get("cooldown_until"):
         try:
             cooldown_dt = dt.fromisoformat(state["cooldown_until"].replace("Z", "+00:00"))
@@ -230,10 +229,8 @@ def main():
             log(">> evaluating JS extractor...")
             raw_items = page.evaluate(JS_EXTRACTOR)
             log(f">> extracted {len(raw_items)} items in JS")
-            
-            # DEBUG: İlk 3 haberi logla
             for i, item in enumerate(raw_items[:3]):
-                log(f">> DEBUG ITEM {i+1}: {item['raw'][:100]}...")
+                log(f">> DEBUG ITEM {i+1}: {item['raw'][:120]}...")
         except Exception as e:
             log(f"!! JS evaluation failed: {e}")
             raw_items = []
@@ -246,8 +243,8 @@ def main():
         newest_id = raw_items[0]["id"]
         to_tweet = []
         for it in raw_items:
-            if last_id and it["id"] == last_id:
-                log(f">> found last_id: {last_id}, stopping")
+            if last_id and it["id"].startswith(last_id.split('-')[0] + '-' + last_id.split('-')[1]):
+                log(f">> found last_id prefix, stopping")
                 break
             to_tweet.append(it)
         to_tweet = to_tweet[:MAX_PER_RUN]
