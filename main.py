@@ -61,10 +61,6 @@ AKIS_URL = "https://fintables.com/borsa-haber-akisi"
 MAX_PER_RUN = 5
 MAX_TODAY = 10
 
-BANNED_WORDS = {
-    "BURADA", "KVKK", "FINTABLES", "BÜLTEN", "GÜNLÜK", "BULTEN", "KAP", "FİNTABLES",
-    "POLİTİKASI", "YASAL", "UYARI", "BİLGİLENDİRME", "GUNLUK", "HABER", "BULTEN"
-}
 STOP_PHRASES = [
     r"işbu açıklama.*?amaçla", r"yatırım tavsiyesi değildir", r"kamunun bilgisine arz olunur",
     r"saygılarımızla", r"özel durum açıklaması", r"yatırımcılarımızın bilgisine",
@@ -72,7 +68,7 @@ STOP_PHRASES = [
 ]
 REL_PREFIX = re.compile(r'^(?:dün|bugün|yesterday|today)\b[:\-–]?\s*', re.IGNORECASE)
 
-# ============== JS Extractor (GÜVENLİ) ==============
+# ============== JS Extractor (SADECE KAP - XXXX FORMATI) ==============
 JS_EXTRACTOR = """
 () => {
     try {
@@ -80,8 +76,8 @@ JS_EXTRACTOR = """
             .slice(0, 300);
         if (!rows.length) return [];
 
-        const banned = new Set(['BURADA','KVKK','FINTABLES','BÜLTEN','GÜNLÜK','BULTEN','KAP','FİNTABLES','POLİTİKASI','YASAL','UYARI','BİLGİLENDİRME','GUNLUK','HABER','BULTEN']);
-        const nonNewsRe = /(Günlük Bülten|Bülten|Piyasa temkini|Piyasa değerlendirmesi|yatırım bilgi|yasal uyarı|kişisel veri|kvk)/i;
+        const banned = new Set(['ADET','TEK','MİLYON','TL','YÜZDE','PAY','HİSSE','ŞİRKET','BİST','KAP','FİNTABLES','BÜLTEN','GÜNLÜK','BURADA','KVKK','POLİTİKASI','YASAL','UYARI','BİLGİLENDİRME','GUNLUK','HABER']);
+        const nonNewsRe = /(Günlük Bülten|Bülten|Piyasa temkini|yatırım bilgi|yasal uyarı|kişisel veri|kvk)/i;
 
         return rows.map(row => {
             const text = row.innerText || '';
@@ -89,33 +85,17 @@ JS_EXTRACTOR = """
             const norm = text.replace(/\\s+/g, ' ').trim();
             if (nonNewsRe.test(norm) || /Fintables/i.test(norm)) return null;
 
-            const words = norm.split(/\\s+/);
-            let code = '';
+            // SADECE "KAP - XXXX" formatını al
+            const kapMatch = norm.match(/\\bKAP\\s*[•·\\-\\.]\\s*([A-ZÇĞİÖŞÜ]{2,5})(?:[0-9]?\\b)/i);
+            if (!kapMatch) return null;
 
-            for (let i = 0; i < words.length; i++) {
-                let w = words[i].replace(/[.:,]$/, '');
-                let up = w.toUpperCase();
-                if (banned.has(up)) continue;
-                if (up.length < 2 || up.length > 6) continue;
-                if (!/^[A-ZÇĞİÖŞÜ]+[0-9]?$/.test(up)) continue;
+            const code = kapMatch[1].toUpperCase();
+            if (banned.has(code)) return null;
+            if (!/^[A-ZÇĞİÖŞÜ]+(?:[0-9])?$/.test(code)) return null;
 
-                const next = i + 1 < words.length ? words[i + 1].toUpperCase() : '';
-                const prev = i > 0 ? words[i - 1].toUpperCase() : '';
-
-                if (prev === 'KAP' ||
-                    ['PAY', 'HİSSE', 'ADET', 'TL', '%', 'FİYAT'].includes(next) ||
-                    norm.includes(`KAP - ${up}`) ||
-                    norm.includes(`KAP • ${up}`) ||
-                    norm.includes(`KAP · ${up}`)) {
-                    code = up;
-                    break;
-                }
-            }
-
-            if (!code) return null;
-            const pos = norm.toUpperCase().indexOf(code);
-            let snippet = norm.slice(pos + code.length).trim();
-            if (snippet.length < 20) return null;
+            const pos = norm.toUpperCase().indexOf(code) + code.length;
+            let snippet = norm.slice(pos).trim();
+            if (snippet.length < 30) return null;
             if (/yatırım bilgi|yasal uyarı|kişisel veri|kvk|politikası/i.test(snippet)) return null;
 
             const hash = norm.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) & 0xFFFFFFFF, 0);
@@ -135,27 +115,23 @@ def clean_text(t: str) -> str:
     for p in STOP_PHRASES:
         t = re.sub(p, "", t, flags=re.I | re.DOTALL)
     t = re.sub(r"\b(Fintables|KAP)\b\s*[·\.\•]?\s*", "", t, flags=re.I)
-    return REL_PREFIX.sub('', t).strip(" -–—:|•·")
-
-def rewrite_tr_short(s: str) -> str:
-    s = clean_text(s)
-    s = s.replace('bildirdi', 'duyurdu')\
-         .replace('bildirimi', 'açıklaması')\
-         .replace('bilgisine', 'paylaştı')\
-         .replace('gerçekleştirdi', 'tamamladı')\
-         .replace('başladı', 'başlattı')\
-         .replace('devam ediyor', 'sürdürülüyor')
-    return re.sub(r"^\s*[-–—•·]\s*", "", s).strip()
+    t = REL_PREFIX.sub('', t).strip(" -–—:|•·")
+    t = re.sub(r"\s+ile\s+", " ile ", t)
+    t = re.sub(r"\s+ve\s+", " ve ", t)
+    return t
 
 def build_tweet(code: str, snippet: str) -> str:
-    base = rewrite_tr_short(snippet)
-    base = base[:235] if len(base) > 235 else base
-    return f"#{code} | {base}"[:280]
+    base = clean_text(snippet)
+    first_sentence = base.split('.')[0].strip()
+    if len(first_sentence) < 20:
+        first_sentence = ' '.join(base.split()[:25]).strip()
+    if len(first_sentence) > 230:
+        first_sentence = first_sentence[:227] + "..."
+    return f"#{code} | {first_sentence}."
 
 def is_valid_ticker(code: str, text: str) -> bool:
-    if code in BANNED_WORDS: return False
-    if not (2 <= len(code) <= 6): return False
-    if not re.match(r"^[A-ZÇĞİÖŞÜ]+[0-9]?$", code): return False
+    if len(code) < 2 or len(code) > 6: return False
+    if not re.match(r"^[A-ZÇĞİÖŞÜ]+(?:[0-9])?$", code): return False
     forbidden = ["YATIRIM BİLGİ", "TAVSİYE", "YASAL UYARI", "KİŞİSEL VERİ", "POLİTİKASI", "KVK"]
     if any(phrase in text.upper() for phrase in forbidden): return False
     return True
@@ -280,24 +256,24 @@ def main():
                 if sent >= 4:
                     time.sleep(3)
             except Exception as e:
-                if "429" in str(e) or "Too Many Requests" in str(e):
-                    log(">> rate limit → 15 dk cooldown")
-                    state["cooldown_until"] = (dt.now(timezone.utc) + timedelta(minutes=15)).isoformat()
+            if "429" in str(e) or "Too Many Requests" in str(e):
+                log(">> rate limit → 15 dk cooldown")
+                state["cooldown_until"] = (dt.now(timezone.utc) + timedelta(minutes=15)).isoformat()
+                save_state(state)
+                time.sleep(65)
+                try:
+                    if tw: tw.create_tweet(text=tweet)
+                    posted.add(it["id"])
+                    state["count_today"] = state.get("count_today", 0) + 1
+                    state["posted"] = sorted(list(posted))
+                    state["last_id"] = newest_id
                     save_state(state)
-                    time.sleep(65)
-                    try:
-                        if tw: tw.create_tweet(text=tweet)
-                        posted.add(it["id"])
-                        state["count_today"] = state.get("count_today", 0) + 1
-                        state["posted"] = sorted(list(posted))
-                        state["last_id"] = newest_id
-                        save_state(state)
-                        sent += 1
-                        log(">> sent (retry)")
-                    except:
-                        log("!! retry failed")
-                else:
-                    log(f"!! error: {e}")
+                    sent += 1
+                    log(">> sent (retry)")
+                except:
+                    log("!! retry failed")
+            else:
+                log(f"!! error: {e}")
 
         state["last_id"] = newest_id
         save_state(state)
