@@ -256,24 +256,24 @@ def main():
                 if sent >= 4:
                     time.sleep(3)
             except Exception as e:
-            if "429" in str(e) or "Too Many Requests" in str(e):
-                log(">> rate limit → 15 dk cooldown")
-                state["cooldown_until"] = (dt.now(timezone.utc) + timedelta(minutes=15)).isoformat()
-                save_state(state)
-                time.sleep(65)
-                try:
-                    if tw: tw.create_tweet(text=tweet)
-                    posted.add(it["id"])
-                    state["count_today"] = state.get("count_today", 0) + 1
-                    state["posted"] = sorted(list(posted))
-                    state["last_id"] = newest_id
+                if "429" in str(e) or "Too Many Requests" in str(e):
+                    log(">> rate limit → 15 dk cooldown")
+                    state["cooldown_until"] = (dt.now(timezone.utc) + timedelta(minutes=15)).isoformat()
                     save_state(state)
-                    sent += 1
-                    log(">> sent (retry)")
-                except:
-                    log("!! retry failed")
-            else:
-                log(f"!! error: {e}")
+                    time.sleep(65)
+                    try:
+                        if tw: tw.create_tweet(text=tweet)
+                        posted.add(it["id"])
+                        state["count_today"] = state.get("count_today", 0) + 1
+                        state["posted"] = sorted(list(posted))
+                        state["last_id"] = newest_id
+                        save_state(state)
+                        sent += 1
+                        log(">> sent (retry)")
+                    except:
+                        log("!! retry failed")
+                else:
+                    log(f"!! error: {e}")
 
         state["last_id"] = newest_id
         save_state(state)
