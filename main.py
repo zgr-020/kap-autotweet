@@ -147,27 +147,52 @@ def _uniq_in_order(seq: List[str]) -> List[str]:
 
 def extract_codes_from_kap_text(text: str) -> List[str]:
     """
-    KAP • TERA/BVSAN, KAP - TERA BVSAN, KAP TERA • BVSAN … gibi tüm varyantları yakalar.
-    Yalnızca 3–5 harfli gerçek BIST kodlarını döndürür (maks. 3 kod).
+    KAP haber metninden yalnızca geçerli Borsa İstanbul hisse kodlarını çeker.
+    Örnekler:
+        "KAP - TERA/BVSAN"  →  ["TERA", "BVSAN"]
+        "KAP • HDFGS"       →  ["HDFGS"]
+        "KAP TERA ve BVSAN" →  ["TERA", "BVSAN"]
     """
     if not text:
         return []
+
     t = re.sub(r"\s+", " ", text.upper())
-    # “KAP …” bloğundan sonra gelen kodları topla
+
+    # 'KAP' kelimesinden sonra gelen kısmı al
     after = re.split(r"\bKAP\b", t, maxsplit=1)
     cand = after[1] if len(after) > 1 else t
 
-    # Ayırıcıları normalize et
-    cand = re.sub(r"[•·\-\|,:]", " ", cand)
+    # ayırıcıları normalize et
+    cand = re.sub(r"[•·,;:|\\-]", " ", cand)
     cand = cand.replace("/", " ")
+    cand = re.sub(r"VE", " ", cand)
 
-    # Ham tarama
-    tokens = re.findall(rf"\b{CODE_RE}\b", cand)
-    # BIST olmayan yaygın kelimeleri at
-    banned = {"ADET","TEK","MİLYON","MILYON","TL","YÜZDE","PAY","HİSSE","SIRKET","ŞİRKET","BIST","BİST","KAP"}
-    codes = [tok for tok in tokens if tok not in banned]
-    codes = _uniq_in_order(codes)
-    return codes[:3]
+    # olası kod adaylarını bul
+    raw_codes = re.findall(r"\b[A-ZÇĞİÖŞÜ]{2,5}[0-9]?\b", cand)
+
+    # filtre: yalnızca büyük harflerden oluşan, anlamlı uzunlukta olan kodlar
+    banned = {
+        "KAP","ADET","TEK","MİLYON","MILYON","TL","YÜZDE","PAY","HİSSE",
+        "SIRKET","ŞİRKET","ORTAKLARINDAN","SAHIP","SAHİP","YATIRIM",
+        "BORSASI","BİST","BIST","KAMU","BILGILENDIRME","FINANCIAL"
+    }
+
+    codes = [c for c in raw_codes if c not in banned and 2 < len(c) <= 6]
+
+    # Türkçe harfleri büyük Latin’e çevir
+    tr_map = str.maketrans("ÇĞİÖŞÜ", "CGIOSU")
+    codes = [c.translate(tr_map) for c in codes]
+
+    # sıralı benzersiz
+    seen = set()
+    unique = []
+    for c in codes:
+        if c not in seen:
+            seen.add(c)
+            unique.append(c)
+
+    # en fazla 3 kod
+    return unique[:3]
 
 def _smart_first_sentence(text: str, min_len: int = 40, max_len: int = 240) -> str:
     """
