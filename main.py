@@ -2,6 +2,7 @@ import os, re, json, time, datetime
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 import tweepy
+from datetime import datetime as dt, timezone, timedelta
 
 # ============== X (Twitter) Secrets ==============
 API_KEY = os.getenv("API_KEY")
@@ -22,7 +23,7 @@ def twitter_client():
 
 # ============== Logging ==============
 def log(msg: str):
-    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+    timestamp = dt.now().strftime("%H:%M:%S")
     print(f"[{timestamp}] {msg}")
 
 # ============== State ==============
@@ -30,17 +31,20 @@ STATE_PATH = Path("state.json")
 
 def load_state():
     if not STATE_PATH.exists():
-        return {"last_id": None, "posted": []}
+        return {"last_id": None, "posted": [], "cooldown_until": None, "count_today": 0, "day": None}
     try:
         data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
         if isinstance(data, list):
-            return {"last_id": None, "posted": data}
+            return {"last_id": None, "posted": data, "cooldown_until": None, "count_today": 0, "day": None}
         data.setdefault("last_id", None)
         data.setdefault("posted", [])
+        data.setdefault("cooldown_until", None)
+        data.setdefault("count_today", 0)
+        data.setdefault("day", None)
         return data
     except Exception as e:
         log(f"!! state.json bozuk: {e}, sıfırlanıyor")
-        return {"last_id": None, "posted": []}
+        return {"last_id": None, "posted": [], "cooldown_until": None, "count_today": 0, "day": None}
 
 def save_state(state):
     try:
@@ -55,17 +59,12 @@ last_id = state.get("last_id")
 # ============== Constants ==============
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
 MAX_PER_RUN = 5
+MAX_TODAY = 10
 
-# Güçlü ticker regex + banned list
-TICKER_RE = re.compile(r"\b([A-ZÇĞİÖŞÜ]{2,5})(?=[0-9]?\b|$)")
 BANNED_WORDS = {
     "BURADA", "KVKK", "FINTABLES", "BÜLTEN", "GÜNLÜK", "BULTEN", "KAP", "FİNTABLES",
     "POLİTİKASI", "YASAL", "UYARI", "BİLGİLENDİRME", "GUNLUK", "HABER", "BULTEN"
 }
-NON_NEWS_PATTERNS = [
-    r"Günlük Bülten", r"Bülten", r"Piyasa temkini", r"Piyasa değerlendirmesi",
-    r"yatırım bilgi", r"yasal uyarı", r"kişisel veri", r"kvk"
-]
 STOP_PHRASES = [
     r"işbu açıklama.*?amaçla", r"yatırım tavsiyesi değildir", r"kamunun bilgisine arz olunur",
     r"saygılarımızla", r"özel durum açıklaması", r"yatırımcılarımızın bilgisine",
@@ -73,52 +72,60 @@ STOP_PHRASES = [
 ]
 REL_PREFIX = re.compile(r'^(?:dün|bugün|yesterday|today)\b[:\-–]?\s*', re.IGNORECASE)
 
-# ============== JS Extractor (GÜÇLENDİRİLMİŞ) ==============
+# ============== JS Extractor (GÜVENLİ) ==============
 JS_EXTRACTOR = """
 () => {
-    const rows = Array.from(document.querySelectorAll('main li, main div[role="listitem"], main div'))
-        .slice(0, 300);
-    const banned = new Set(['BURADA','KVKK','FINTABLES','BÜLTEN','GÜNLÜK','BULTEN','KAP','FİNTABLES','POLİTİKASI','YASAL','UYARI','BİLGİLENDİRME','GUNLUK','HABER','BULTEN']);
-    const nonNewsRe = /(Günlük Bülten|Bülten|Piyasa temkini|Piyasa değerlendirmesi|yatırım bilgi|yasal uyarı|kişisel veri|kvk)/i;
+    try {
+        const rows = Array.from(document.querySelectorAll('main li, main div[role="listitem"], main div'))
+            .slice(0, 300);
+        if (!rows.length) return [];
 
-    return rows.map(row => {
-        const text = row.innerText || '';
-        const norm = text.replace(/\\s+/g, ' ').trim();
-        if (nonNewsRe.test(norm) || /Fintables/i.test(norm)) return null;
+        const banned = new Set(['BURADA','KVKK','FINTABLES','BÜLTEN','GÜNLÜK','BULTEN','KAP','FİNTABLES','POLİTİKASI','YASAL','UYARI','BİLGİLENDİRME','GUNLUK','HABER','BULTEN']);
+        const nonNewsRe = /(Günlük Bülten|Bülten|Piyasa temkini|Piyasa değerlendirmesi|yatırım bilgi|yasal uyarı|kişisel veri|kvk)/i;
 
-        const words = norm.split(/\\s+/);
-        let code = '';
+        return rows.map(row => {
+            const text = row.innerText || '';
+            if (!text.trim()) return null;
+            const norm = text.replace(/\\s+/g, ' ').trim();
+            if (nonNewsRe.test(norm) || /Fintables/i.test(norm)) return null;
 
-        for (let i = 0; i < words.length; i++) {
-            let w = words[i].replace(/[.:,]$/, '');
-            let up = w.toUpperCase();
-            if (banned.has(up)) continue;
-            if (up.length < 2 || up.length > 6) continue;
-            if (!/^[A-ZÇĞİÖŞÜ]+[0-9]?$/.test(up)) continue;
+            const words = norm.split(/\\s+/);
+            let code = '';
 
-            const next = i + 1 < words.length ? words[i + 1].toUpperCase() : '';
-            const prev = i > 0 ? words[i - 1].toUpperCase() : '';
+            for (let i = 0; i < words.length; i++) {
+                let w = words[i].replace(/[.:,]$/, '');
+                let up = w.toUpperCase();
+                if (banned.has(up)) continue;
+                if (up.length < 2 || up.length > 6) continue;
+                if (!/^[A-ZÇĞİÖŞÜ]+[0-9]?$/.test(up)) continue;
 
-            if (prev === 'KAP' ||
-                ['PAY', 'HİSSE', 'ADET', 'TL', '%', 'FİYAT', 'TL', 'YÜZDE'].includes(next) ||
-                norm.includes(`KAP - ${up}`) ||
-                norm.includes(`KAP • ${up}`) ||
-                norm.includes(`KAP · ${up}`)) {
-                code = up;
-                break;
+                const next = i + 1 < words.length ? words[i + 1].toUpperCase() : '';
+                const prev = i > 0 ? words[i - 1].toUpperCase() : '';
+
+                if (prev === 'KAP' ||
+                    ['PAY', 'HİSSE', 'ADET', 'TL', '%', 'FİYAT'].includes(next) ||
+                    norm.includes(`KAP - ${up}`) ||
+                    norm.includes(`KAP • ${up}`) ||
+                    norm.includes(`KAP · ${up}`)) {
+                    code = up;
+                    break;
+                }
             }
-        }
 
-        if (!code) return null;
-        const pos = norm.toUpperCase().indexOf(code);
-        let snippet = norm.slice(pos + code.length).trim();
-        if (snippet.length < 20) return null;
-        if (/yatırım bilgi|yasal uyarı|kişisel veri|kvk|politikası/i.test(snippet)) return null;
+            if (!code) return null;
+            const pos = norm.toUpperCase().indexOf(code);
+            let snippet = norm.slice(pos + code.length).trim();
+            if (snippet.length < 20) return null;
+            if (/yatırım bilgi|yasal uyarı|kişisel veri|kvk|politikası/i.test(snippet)) return null;
 
-        const hash = norm.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) & 0xFFFFFFFF, 0);
-        const id = `${code}-${hash}`;
-        return { id, code, snippet, raw: norm };
-    }).filter(Boolean);
+            const hash = norm.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) & 0xFFFFFFFF, 0);
+            const id = `${code}-${hash}`;
+            return { id, code, snippet, raw: norm };
+        }).filter(Boolean);
+    } catch (e) {
+        console.error("JS Extractor Error:", e);
+        return [];
+    }
 }
 """
 
@@ -142,42 +149,61 @@ def rewrite_tr_short(s: str) -> str:
 
 def build_tweet(code: str, snippet: str) -> str:
     base = rewrite_tr_short(snippet)
-    base = base[:235] if len(base) > 235 else base  # #KOD | için yer
-    tweet = f"#{code} | {base}"
-    return tweet[:280]
+    base = base[:235] if len(base) > 235 else base
+    return f"#{code} | {base}"[:280]
 
 def is_valid_ticker(code: str, text: str) -> bool:
-    if code in BANNED_WORDS:
-        return False
-    if not (2 <= len(code) <= 6):
-        return False
-    if not re.match(r"^[A-ZÇĞİÖŞÜ]+[0-9]?$", code):
-        return False
+    if code in BANNED_WORDS: return False
+    if not (2 <= len(code) <= 6): return False
+    if not re.match(r"^[A-ZÇĞİÖŞÜ]+[0-9]?$", code): return False
     forbidden = ["YATIRIM BİLGİ", "TAVSİYE", "YASAL UYARI", "KİŞİSEL VERİ", "POLİTİKASI", "KVK"]
-    if any(phrase in text.upper() for phrase in forbidden):
-        return False
+    if any(phrase in text.upper() for phrase in forbidden): return False
     return True
 
 def goto_with_retry(page, url, retries=3):
     for i in range(retries):
         try:
+            log(f">> goto attempt {i+1}/{retries}")
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_selector("main", timeout=15000)
+            page.wait_for_load_state("networkidle", timeout=30000)
+            page.wait_for_timeout(2000)
             return True
         except Exception as e:
-            log(f">> goto retry {i+1}/{retries}: {e}")
-            time.sleep(5)
+            log(f">> goto retry {i+1}/{retries} failed: {e}")
+            if i < retries - 1:
+                time.sleep(5)
     return False
 
 # ============== MAIN ==============
 def main():
-    log(">> start (fast mode)")
+    log(">> start (GitHub Actions)")
+
+    # COOLDOWN KONTROLÜ
+    if state.get("cooldown_until"):
+        try:
+            cooldown_dt = dt.fromisoformat(state["cooldown_until"].replace("Z", "+00:00"))
+            if dt.now(timezone.utc) < cooldown_dt:
+                log(f">> cooldown aktif: {cooldown_dt.isoformat()}")
+                return
+        except Exception as e:
+            log(f"!! cooldown parse hatası: {e}")
+
+    # GÜNLÜK LİMİT
+    today = dt.now().strftime("%Y-%m-%d")
+    if state.get("day") != today:
+        state["count_today"] = 0
+        state["day"] = today
+    if state.get("count_today", 0) >= MAX_TODAY:
+        log(f">> günlük limit ({MAX_TODAY}) aşıldı")
+        return
+
     tw = twitter_client()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
         )
         ctx = browser.new_context(
             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
@@ -187,24 +213,27 @@ def main():
         page = ctx.new_page()
         page.set_default_timeout(30000)
 
-        # 1. Güvenli yükleme
         if not goto_with_retry(page, AKIS_URL):
-            log("!! Sayfa yüklenemedi, çıkılıyor")
+            log("!! Sayfa yüklenemedi")
             browser.close()
             return
 
-        # 2. Öne çıkanlar (güvenli)
         try:
             if page.get_by_text("Öne çıkanlar", exact=True).is_visible(timeout=3000):
                 page.click("text=Öne çıkanlar")
-                page.wait_for_load_state("domcontentloaded", timeout=10000)
+                page.wait_for_load_state("networkidle", timeout=15000)
+                page.wait_for_timeout(2000)
                 log(">> highlights ON")
         except:
             log(">> highlights not available")
 
-        # 3. JS ile veri çek
-        raw_items = page.evaluate(JS_EXTRACTOR)
-        log(f">> extracted {len(raw_items)} items in JS")
+        try:
+            log(">> evaluating JS extractor...")
+            raw_items = page.evaluate(JS_EXTRACTOR)
+            log(f">> extracted {len(raw_items)} items in JS")
+        except Exception as e:
+            log(f"!! JS evaluation failed: {e}")
+            raw_items = []
 
         if not raw_items:
             log(">> no items")
@@ -231,10 +260,8 @@ def main():
         for it in to_tweet:
             if it["id"] in posted:
                 continue
-
-            # Ekstra güvenlik: Python tarafında da kontrol
             if not is_valid_ticker(it["code"], it["snippet"]):
-                log(f">> SKIP: #{it['code']} (geçersiz haber)")
+                log(f">> SKIP: #{it['code']} (geçersiz)")
                 continue
 
             tweet = build_tweet(it["code"], it["snippet"])
@@ -245,20 +272,23 @@ def main():
                     tw.create_tweet(text=tweet)
                 posted.add(it["id"])
                 sent += 1
+                state["count_today"] = state.get("count_today", 0) + 1
                 state["posted"] = sorted(list(posted))
                 state["last_id"] = newest_id
                 save_state(state)
                 log(">> sent")
-
                 if sent >= 4:
                     time.sleep(3)
             except Exception as e:
                 if "429" in str(e) or "Too Many Requests" in str(e):
-                    log(">> rate limit, waiting 65s...")
+                    log(">> rate limit → 15 dk cooldown")
+                    state["cooldown_until"] = (dt.now(timezone.utc) + timedelta(minutes=15)).isoformat()
+                    save_state(state)
                     time.sleep(65)
                     try:
                         if tw: tw.create_tweet(text=tweet)
                         posted.add(it["id"])
+                        state["count_today"] = state.get("count_today", 0) + 1
                         state["posted"] = sorted(list(posted))
                         state["last_id"] = newest_id
                         save_state(state)
@@ -283,4 +313,4 @@ if __name__ == "__main__":
         log("!! FATAL ERROR !!")
         log(tb)
         with open("debug.log", "a", encoding="utf-8") as f:
-            f.write(f"\n--- {datetime.datetime.now()} ---\n{tb}\n")
+            f.write(f"\n--- {dt.now()} ---\n{tb}\n")
