@@ -169,132 +169,187 @@ def twitter_client(config: Config) -> Optional[tweepy.Client]:
 # ============== CONSTANTS ==============
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
 
-STOP_PHRASES = [
-    r"işbu açıklama.*?amaçla",
-    r"yatırım tavsiyesi değildir", 
-    r"kamunun bilgisine arz olunur",
-    r"saygılarımızla",
-    r"özel durum açıklaması",
-    r"yatırımcılarımızın bilgisine",
-    r"yasal uyarı",
-    r"kişisel verilerin korunması",
-    r"kvk"
-]
-
-REL_PREFIX = re.compile(r'^(?:dün|bugün|yesterday|today)\b[:\-–]?\s*', re.IGNORECASE)
-
 # ============== CONTENT PROCESSING ==============
-def clean_text(text: str) -> str:
-    """Clean and normalize text content"""
-    if not text or not isinstance(text, str):
+def extract_clean_content(text: str) -> str:
+    """Extract clean content from KAP text - SADECE öz haber içeriği"""
+    if not text:
         return ""
     
-    # Normalize whitespace
-    text = re.sub(r"\s+", " ", text).strip()
+    # KAP ve şirket kodunu temizle
+    text = re.sub(r'KAP\s*[•·\-\.]\s*[A-Z]+\s*', '', text, flags=re.IGNORECASE)
     
-    # Remove stop phrases
-    for pattern in STOP_PHRASES:
-        text = re.sub(pattern, "", text, flags=re.IGNORECASE | re.DOTALL)
+    # Tarih/saat bilgilerini temizle (09:30, Dün 21:38, Bugün 20:59 gibi)
+    text = re.sub(r'(Dün|Bugün|Yesterday|Today)?\s*\d{1,2}:\d{2}\s*', '', text, flags=re.IGNORECASE)
     
-    # Remove source identifiers
-    text = re.sub(r"\b(Fintables|KAP)\b\s*[·\.\•]?\s*", "", text, flags=re.IGNORECASE)
+    # "Şirket" ile başlayan gereksiz ön ekleri temizle
+    text = re.sub(r'^\s*Şirket\s*(?:emti|iştiraki|ortaklığı|hissedarı)?\s*', '', text, flags=re.IGNORECASE)
     
-    # Remove time prefixes
-    text = REL_PREFIX.sub('', text).strip(" -–—:|•·")
+    # "İş" ile başlayan ön ekleri temizle
+    text = re.sub(r'^\s*İş\s*', '', text, flags=re.IGNORECASE)
     
-    # Normalize conjunctions
-    text = re.sub(r"\s+ile\s+", " ile ", text)
-    text = re.sub(r"\s+ve\s+", " ve ", text)
+    # Fazla boşlukları temizle
+    text = re.sub(r'\s+', ' ', text).strip()
     
-    return text.strip()
+    return text
 
-def build_tweet(code: str, snippet: str) -> str:
-    """Build tweet text from code and snippet"""
-    base_text = clean_text(snippet)
+def build_tweet_quanta_style(code: str, content: str) -> str:
+    """Build tweet in Quanta Finance style - SADECE #KOD | içerik"""
+    clean_content = extract_clean_content(content)
     
-    if not base_text:
-        return f"Megafon #{code} | Yeni haber"
+    # Çok uzunsa kısalt
+    if len(clean_content) > 240:
+        clean_content = clean_content[:237] + "..."
     
-    # Extract first meaningful sentence
-    sentences = [s.strip() for s in base_text.split('.') if s.strip() and len(s.strip()) > 20]
-    first_sentence = sentences[0] if sentences else ' '.join(base_text.split()[:25])
-    
-    # Truncate if too long
-    max_len = 230
-    if len(first_sentence) > max_len:
-        words = first_sentence.split()
-        temp = ""
-        for word in words:
-            if len(temp + word + " ") <= max_len - 3:
-                temp += word + " "
-            else:
-                break
-        first_sentence = temp.strip() + "..."
-    
-    # Ensure proper ending
-    if first_sentence and not first_sentence.endswith(('.', '!', '?')):
-        first_sentence += "."
-    
-    tweet_text = f"Megafon #{code} | {first_sentence}"
-    return tweet_text[:280]
+    tweet = f"#{code} | {clean_content}"
+    return tweet[:280]
 
-def is_valid_ticker(code: str, text: str) -> bool:
-    """Validate stock ticker and content"""
-    if not code or not text:
+def is_valid_content(text: str) -> bool:
+    """Validate if content is worth tweeting"""
+    if not text or len(text) < 20:
         return False
     
-    # Length and format check
-    if len(code) < 3 or len(code) > 5:
-        return False
+    # Spam/legal içerik kontrolü
+    spam_phrases = [
+        "yatırım tavsiyesi değildir",
+        "yasal uyarı", 
+        "kişisel veri",
+        "kvk",
+        "saygılarımızla",
+        "kamunun bilgisine"
+    ]
     
-    if not re.match(r"^[A-ZÇĞİÖŞÜ]{3,5}$", code):
-        return False
-    
-    # Content validation
-    forbidden_phrases = ["YATIRIM", "TAVSİYE", "UYARI", "KİŞİSEL", "POLİTİKASI", "KVK"]
-    text_upper = text.upper()
-    
-    if any(phrase in text_upper for phrase in forbidden_phrases):
+    text_lower = text.lower()
+    if any(phrase in text_lower for phrase in spam_phrases):
         return False
     
     return True
 
 # ============== BROWSER & SCRAPING ==============
-JS_EXTRACTOR = """
+JS_EXTRACTOR_SIMPLE = """
 () => {
     try {
-        const rows = Array.from(document.querySelectorAll('main li, main div[role="listitem"], main div'))
-            .slice(0, 300);
-        if (!rows.length) return [];
-
-        const banned = new Set(['ADET','TEK','MİLYON','TL','YÜZDE','PAY','HİSSE','ŞİRKET','BİST','KAP','FİNTABLES','BÜLTEN','GÜNLÜK','BURADA','KVKK','POLİTİKASI','YASAL','UYARI','BİLGİLENDİRME','GUNLUK','HABER','ALTNY','YBTAS','RODRG','MAGEN','TERA']);
-        const nonNewsRe = /(Günlük Bülten|Bülten|Piyasa temkini|yatırım bilgi|yasal uyarı|kişisel veri|kvk)/i;
-
-        return rows.map(row => {
-            const text = row.innerText || '';
-            if (!text.trim()) return null;
-            const norm = text.replace(/\\s+/g, ' ').trim();
-            if (nonNewsRe.test(norm) || /Fintables/i.test(norm)) return null;
-
-            const kapMatch = norm.match(/\\bKAP\\s*[•·\\-\\.]\\s*([A-ZÇĞİÖŞÜ]{3,5})(?:[0-9]?\\b)/i);
-            if (!kapMatch) return null;
-
-            const code = kapMatch[1].toUpperCase();
-            if (banned.has(code)) return null;
-            if (!/^[A-ZÇĞİÖŞÜ]{3,5}$/.test(code)) return null;
-
-            const pos = norm.toUpperCase().indexOf(code) + code.length;
-            let snippet = norm.slice(pos).trim();
-            if (snippet.length < 40) return null;
-            if (/yatırım bilgi|yasal uyarı|kişisel veri|kvk|politikası/i.test(snippet)) return null;
-
-            const timestamp = Date.now();
-            const hash = norm.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) & 0xFFFFFFFF, 0);
-            const id = `${code}-${hash}-${timestamp}`;
-            return { id, code, snippet, raw: norm };
-        }).filter(Boolean);
+        const items = [];
+        const selectors = [
+            'main div[class*="hover"]',
+            'main div[class*="card"]', 
+            'main div[class*="item"]',
+            'main div[class*="news"]',
+            'main li',
+            'main > div > div'
+        ];
+        
+        for (const selector of selectors) {
+            const elements = document.querySelectorAll(selector);
+            for (const el of elements) {
+                const text = el.innerText || el.textContent || '';
+                const cleanText = text.replace(/\\s+/g, ' ').trim();
+                
+                // KAP haberlerini bul
+                if (cleanText.length > 50 && /KAP\\s*[•·\\-\\.]\\s*[A-Z]{3,5}/i.test(cleanText)) {
+                    // Spam/legal içerik kontrolü
+                    if (/yatırım tavsiyesi|yasal uyarı|kişisel veri|kvk/i.test(cleanText)) {
+                        continue;
+                    }
+                    
+                    // KAP kodunu çıkar
+                    const kapMatch = cleanText.match(/KAP\\s*[•·\\-\\.]\\s*([A-ZÇĞİÖŞÜ]{3,5})/i);
+                    if (kapMatch) {
+                        const code = kapMatch[1].toUpperCase();
+                        
+                        // Geçersiz kodları filtrele
+                        const invalidCodes = ['ADET', 'TEK', 'MİLYON', 'TL', 'YÜZDE', 'PAY', 'HİSSE', 'ŞİRKET', 'BİST', 'KAP'];
+                        if (invalidCodes.includes(code)) {
+                            continue;
+                        }
+                        
+                        // ID oluştur
+                        const timestamp = Date.now();
+                        const hash = cleanText.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) & 0xFFFFFFFF, 0);
+                        const id = `${code}-${hash}-${timestamp}`;
+                        
+                        items.push({
+                            id: id,
+                            code: code,
+                            content: cleanText,
+                            raw: cleanText
+                        });
+                    }
+                }
+            }
+            if (items.length > 0) break;
+        }
+        
+        return items;
     } catch (e) {
-        console.error("JS Extractor Error:", e);
+        console.error("Extractor error:", e);
+        return [];
+    }
+}
+"""
+
+JS_EXTRACTOR_ADVANCED = """
+() => {
+    try {
+        console.log("Starting advanced extraction...");
+        const items = [];
+        
+        // Tüm div elementlerini tarama
+        const allDivs = document.querySelectorAll('div');
+        console.log(`Found ${allDivs.length} div elements`);
+        
+        for (const div of allDivs) {
+            try {
+                const text = div.innerText || div.textContent || '';
+                const cleanText = text.replace(/\\s+/g, ' ').trim();
+                
+                // Minimum uzunluk ve KAP pattern kontrolü
+                if (cleanText.length > 40 && /KAP\\s*[•·\\-\\.]\\s*[A-Z]{3,5}/i.test(cleanText)) {
+                    console.log("Found KAP item:", cleanText.substring(0, 100));
+                    
+                    // Spam/legal içerik filtreleme
+                    if (/yatırım tavsiyesi|yasal uyarı|kişisel veri|kvk|saygılarımızla/i.test(cleanText)) {
+                        continue;
+                    }
+                    
+                    // KAP kodunu çıkar
+                    const kapMatch = cleanText.match(/KAP\\s*[•·\\-\\.]\\s*([A-ZÇĞİÖŞÜ]{3,5})/i);
+                    if (kapMatch) {
+                        const code = kapMatch[1].toUpperCase();
+                        
+                        // Geçersiz kodları filtrele
+                        const invalidCodes = ['ADET', 'TEK', 'MİLYON', 'TL', 'YÜZDE', 'PAY', 'HİSSE', 'ŞİRKET', 'BİST', 'KAP', 'ALTNY', 'YBTAS', 'RODRG', 'MAGEN', 'TERA'];
+                        if (invalidCodes.includes(code)) {
+                            continue;
+                        }
+                        
+                        // Benzersiz ID oluştur
+                        const timestamp = Date.now();
+                        const contentForHash = cleanText.replace(/\\s*\\d{1,2}:\\d{2}\\s*/, ''); // Saat bilgisini çıkar
+                        const hash = contentForHash.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) & 0xFFFFFFFF, 0);
+                        const id = `${code}-${hash}`;
+                        
+                        // Duplicate kontrolü
+                        if (!items.find(item => item.id === id)) {
+                            items.push({
+                                id: id,
+                                code: code,
+                                content: cleanText,
+                                raw: cleanText
+                            });
+                            console.log(`Added item: ${code} - ${cleanText.substring(0, 80)}`);
+                        }
+                    }
+                }
+            } catch (e) {
+                console.log("Error processing div:", e);
+                continue;
+            }
+        }
+        
+        console.log(`Total items found: ${items.length}`);
+        return items;
+    } catch (e) {
+        console.error("Advanced extractor error:", e);
         return [];
     }
 }
@@ -314,16 +369,24 @@ class BrowserManager:
                 "--no-sandbox",
                 "--disable-setuid-sandbox", 
                 "--disable-dev-shm-usage",
-                "--disable-gpu"
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled"
             ]
         )
         self.context = self.browser.new_context(
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
             locale="tr-TR",
-            timezone_id="Europe/Istanbul"
+            timezone_id="Europe/Istanbul",
+            viewport={"width": 1920, "height": 1080}
         )
         self.page = self.context.new_page()
         self.page.set_default_timeout(self.config.request_timeout)
+        
+        # Stealth settings
+        self.page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        """)
+        
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -339,12 +402,14 @@ class BrowserManager:
         for attempt in range(retries):
             try:
                 log(f"Navigation attempt {attempt + 1}/{retries}")
-                self.page.goto(url, wait_until="domcontentloaded")
-                self.page.wait_for_selector("main", timeout=15000)
-                self.page.wait_for_load_state("networkidle")
-                self.page.wait_for_timeout(2000)
-                return True
+                self.page.goto(url, wait_until="networkidle")
+                self.page.wait_for_timeout(3000)  # Sayfanın tam yüklenmesi için bekle
                 
+                # Sayfanın yüklendiğini kontrol et
+                if self.page.locator("body").is_visible():
+                    log("Page loaded successfully")
+                    return True
+                    
             except PlaywrightTimeoutError as e:
                 log(f"Timeout on attempt {attempt + 1}: {e}", "warning")
                 if attempt < retries - 1:
@@ -357,15 +422,28 @@ class BrowserManager:
         return False
     
     def extract_items(self) -> List[dict]:
-        """Extract news items using JavaScript"""
+        """Extract news items using advanced JavaScript"""
         try:
-            log("Evaluating JS extractor...")
-            raw_items = self.page.evaluate(JS_EXTRACTOR)
+            log("Evaluating advanced JS extractor...")
+            
+            # Sayfanın daha iyi yüklenmesi için scroll yap
+            self.page.evaluate("window.scrollTo(0, document.body.scrollHeight / 3)")
+            self.page.wait_for_timeout(2000)
+            self.page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)") 
+            self.page.wait_for_timeout(2000)
+            
+            # Advanced extractor'ü dene
+            raw_items = self.page.evaluate(JS_EXTRACTOR_ADVANCED)
+            
+            if not raw_items:
+                log("Advanced extractor failed, trying simple extractor...")
+                raw_items = self.page.evaluate(JS_EXTRACTOR_SIMPLE)
+            
             log(f"Extracted {len(raw_items)} items")
             
-            # Debug first few items
-            for i, item in enumerate(raw_items[:3]):
-                log(f"DEBUG ITEM {i+1}: {item['raw'][:100]}...")
+            # Debug için ilk birkaç item'ı göster
+            for i, item in enumerate(raw_items[:5]):
+                log(f"ITEM {i+1}: {item['code']} - {item['content'][:120]}...")
                 
             return raw_items
             
@@ -377,12 +455,12 @@ class BrowserManager:
 def send_tweet(client: Optional[tweepy.Client], tweet_text: str) -> bool:
     """Send tweet with error handling"""
     if not client:
-        log("No Twitter client, running in simulation mode")
+        log(f"SIMULATION: {tweet_text}")
         return True
     
     try:
         response = client.create_tweet(text=tweet_text)
-        log(f"Tweet sent successfully: {tweet_text[:80]}...")
+        log(f"Tweet sent: {tweet_text}")
         return True
         
     except TooManyRequests:
@@ -407,23 +485,25 @@ def process_new_items(items: List[dict], state: StateManager, config: Config,
             break
         
         if state.is_posted(item["id"]):
+            log(f"Already posted: {item['code']}")
             continue
             
-        if not is_valid_ticker(item["code"], item["snippet"]):
-            log(f"Invalid ticker/content: {item['code']}")
+        if not is_valid_content(item["content"]):
+            log(f"Invalid content: {item['code']} - {item['content'][:100]}...")
             continue
         
         try:
-            tweet_text = build_tweet(item["code"], item["snippet"])
+            # QUANTA STYLE TWEET - sadece #KOD | içerik
+            tweet_text = build_tweet_quanta_style(item["code"], item["content"])
             log(f"Attempting tweet: {tweet_text}")
             
             if send_tweet(twitter_client, tweet_text):
                 state.mark_posted(item["id"])
                 sent_count += 1
                 
-                # Small delay between tweets to be respectful
+                # Küçük gecikme
                 if sent_count < config.max_per_run and twitter_client:
-                    time.sleep(3)
+                    time.sleep(2)
                     
         except TwitterError as e:
             if "Rate limit" in str(e):
@@ -457,54 +537,42 @@ def main():
                 log("Failed to load page after retries", "error")
                 return
             
-            # Try to click highlights if available
-            try:
-                if browser.page.get_by_text("Öne çıkanlar", exact=True).is_visible(timeout=3000):
-                    browser.page.click("text=Öne çıkanlar")
-                    browser.page.wait_for_load_state("networkidle")
-                    browser.page.wait_for_timeout(2000)
-                    log("Highlights section activated")
-            except Exception as e:
-                log(f"Could not activate highlights: {e}", "debug")
+            # Daha uzun bekleme süresi
+            browser.page.wait_for_timeout(5000)
             
             # Extract items
             all_items = browser.extract_items()
             if not all_items:
-                log("No items extracted")
+                log("No items extracted - trying alternative approach")
+                # Alternatif yaklaşım: sayfa kaynağını kontrol et
+                page_content = browser.page.content()
+                if "KAP" in page_content:
+                    log("KAP content found in page source but not extracted")
                 return
             
-            # Get newest ID for state tracking
-            newest_id = all_items[0]["id"] if all_items else None
+            log(f"Successfully extracted {len(all_items)} items")
             
-            # Filter new items
+            # Yeni item'ları filtrele
             new_items = []
             for item in all_items:
-                if state_manager.last_id and item["id"].startswith(
-                    state_manager.last_id.split('-')[0] + '-' + state_manager.last_id.split('-')[1]
-                ):
-                    break
-                new_items.append(item)
-            
-            new_items = new_items[:config.max_per_run * 2]  # Get some buffer
+                if not state_manager.is_posted(item["id"]):
+                    new_items.append(item)
             
             if not new_items:
                 log("No new items to process")
-                if newest_id:
-                    state_manager.last_id = newest_id
-                    state_manager.save()
                 return
             
             log(f"Found {len(new_items)} new items to process")
             
-            # Process in chronological order (oldest first)
-            new_items.reverse()
+            # En yeni haberler önce gelsin (ters sıra)
+            new_items = new_items[:config.max_per_run]
             
             # Send tweets
             sent_count = process_new_items(new_items, state_manager, config, twitter)
             
             # Update state
-            if newest_id:
-                state_manager.last_id = newest_id
+            if new_items:
+                state_manager.last_id = new_items[-1]["id"]
             
             state_manager.cleanup_old_entries()
             state_manager.save()
@@ -522,12 +590,10 @@ if __name__ == "__main__":
         log("Interrupted by user")
     except Exception as e:
         log(f"Fatal error: {e}", "error")
-        # Log full traceback for debugging
         import traceback
         traceback_str = traceback.format_exc()
         log(f"Traceback: {traceback_str}", "error")
         
-        # Write to debug log file
         debug_log = Path("debug.log")
         with open(debug_log, "a", encoding="utf-8") as f:
             f.write(f"\n--- {datetime.now()} ---\n{traceback_str}\n")
