@@ -170,42 +170,85 @@ def twitter_client(config: Config) -> Optional[tweepy.Client]:
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
 
 # ============== CONTENT PROCESSING ==============
-def extract_clean_content(text: str) -> str:
-    """Extract clean content from KAP text - SADECE öz haber içeriği"""
+def extract_codes_from_kap_text(text: str) -> List[str]:
+    """Extract multiple stock codes from KAP text"""
+    # KAP-TERA/BVSAN formatını yakala
+    matches = re.findall(r'KAP\s*[•·\-\.]?\s*([A-ZÇĞİÖŞÜ]{3,5})(?:[/\s]([A-ZÇĞİÖŞÜ]{3,5}))?', text, re.IGNORECASE)
+    
+    codes = []
+    for match in matches:
+        if match[0]:  # İlk kod
+            codes.append(match[0].upper())
+        if match[1]:  # İkinci kod (varsa)
+            codes.append(match[1].upper())
+    
+    # Benzersiz kodları döndür
+    return list(set(codes))
+
+def extract_clean_single_news_content(text: str) -> str:
+    """Extract clean content for a SINGLE news item"""
     if not text:
         return ""
     
-    # KAP ve şirket kodunu temizle
-    text = re.sub(r'KAP\s*[•·\-\.]\s*[A-Z]+\s*', '', text, flags=re.IGNORECASE)
+    # KAP başlığını temizle (KAP-TERA/BVSAN 11:35 gibi)
+    text = re.sub(r'KAP\s*[•·\-\.]?\s*[A-Z/]+\s*\d{1,2}:\d{2}\s*', '', text)
     
-    # Tarih/saat bilgilerini temizle (09:30, Dün 21:38, Bugün 20:59 gibi)
-    text = re.sub(r'(Dün|Bugün|Yesterday|Today)?\s*\d{1,2}:\d{2}\s*', '', text, flags=re.IGNORECASE)
-    
-    # "Şirket" ile başlayan gereksiz ön ekleri temizle
+    # "Şirket" ile başlayan ön ekleri temizle
     text = re.sub(r'^\s*Şirket\s*(?:emti|iştiraki|ortaklığı|hissedarı)?\s*', '', text, flags=re.IGNORECASE)
     
-    # "İş" ile başlayan ön ekleri temizle
-    text = re.sub(r'^\s*İş\s*', '', text, flags=re.IGNORECASE)
+    # Fintables ile başlayan diğer haberleri kes
+    text = re.split(r'Fintables\s*[•·\-\.]', text)[0]
+    
+    # Noktaya kadar olan kısmı al (ilk cümle)
+    sentences = re.split(r'[.!?]+', text)
+    if sentences and sentences[0].strip():
+        first_sentence = sentences[0].strip()
+        # Eğer ilk cümle çok kısaysa, ikinci cümleyi de al
+        if len(first_sentence) < 30 and len(sentences) > 1:
+            text = (first_sentence + '. ' + sentences[1].strip()).strip()
+        else:
+            text = first_sentence
     
     # Fazla boşlukları temizle
     text = re.sub(r'\s+', ' ', text).strip()
     
     return text
 
-def build_tweet_quanta_style(code: str, content: str) -> str:
+def build_tweet_quanta_style(codes: List[str], content: str) -> str:
     """Build tweet in Quanta Finance style - 📰 #KOD | içerik"""
-    clean_content = extract_clean_content(content)
+    if not codes:
+        return ""
+    
+    # Kodları # ile birleştir
+    codes_str = " ".join([f"#{code}" for code in codes])
+    
+    # İçeriği temizle
+    clean_content = extract_clean_single_news_content(content)
+    
+    if not clean_content:
+        return ""
+    
+    # Tweet uzunluğunu kontrol et
+    base_tweet = f"📰 {codes_str} | {clean_content}"
+    
+    if len(base_tweet) <= 280:
+        return base_tweet
     
     # Çok uzunsa kısalt
-    if len(clean_content) > 235:  # Emoji ve kod için yer bırak
-        clean_content = clean_content[:232] + "..."
+    max_content_length = 280 - len(f"📰 {codes_str} | ...") - 3
+    if max_content_length > 0:
+        clean_content = clean_content[:max_content_length].rstrip()
+        # Son kelimeyi tamamla
+        if clean_content and not clean_content.endswith(('.', '!', '?')):
+            clean_content = clean_content.rsplit(' ', 1)[0] + "..."
+        else:
+            clean_content = clean_content + "..."
     
-    tweet = f"📰 #{code} | {clean_content}"
-    return tweet[:280]
+    return f"📰 {codes_str} | {clean_content}"[:280]
 
-def is_valid_content(text: str) -> bool:
-    """Validate if content is worth tweeting"""
-    if not text or len(text) < 20:
+def is_valid_news_content(text: str) -> bool:
+    """Validate if content is a single complete news item"""
+    if not text or len(text) < 30:
         return False
     
     # Spam/legal içerik kontrolü
@@ -222,70 +265,96 @@ def is_valid_content(text: str) -> bool:
     if any(phrase in text_lower for phrase in spam_phrases):
         return False
     
+    # Birden fazla haber içeriyorsa geçersiz
+    if len(re.findall(r'Fintables\s*[•·\-\.]', text)) > 1:
+        return False
+    
     return True
 
 # ============== BROWSER & SCRAPING ==============
-JS_EXTRACTOR_HIGHLIGHTS = """
+JS_EXTRACTOR_CLEAN_HIGHLIGHTS = """
 () => {
     try {
-        console.log("Extracting highlights content...");
+        console.log("Extracting CLEAN highlights content...");
         const items = [];
         
-        // Öne çıkanlar bölümündeki tüm elementleri bul
-        const allElements = document.querySelectorAll('div, li, article, section');
+        // Her bir haber kartını bul
+        const selectors = [
+            'div[class*="card"]',
+            'div[class*="item"]', 
+            'div[class*="news"]',
+            'li',
+            'article'
+        ];
         
-        for (const el of allElements) {
-            try {
-                const text = el.innerText || el.textContent || '';
-                const cleanText = text.replace(/\\s+/g, ' ').trim();
-                
-                // KAP haberlerini bul ve minimum uzunluk kontrolü
-                if (cleanText.length > 40 && /KAP\\s*[•·\\-\\.]\\s*[A-Z]{3,5}/i.test(cleanText)) {
-                    console.log("Found KAP highlight:", cleanText.substring(0, 100));
+        for (const selector of selectors) {
+            const elements = document.querySelectorAll(selector);
+            for (const el of elements) {
+                try {
+                    const text = el.innerText || el.textContent || '';
+                    const cleanText = text.replace(/\\s+/g, ' ').trim();
                     
-                    // Spam/legal içerik filtreleme
-                    if (/yatırım tavsiyesi|yasal uyarı|kişisel veri|kvk|saygılarımızla/i.test(cleanText)) {
-                        continue;
-                    }
-                    
-                    // KAP kodunu çıkar
-                    const kapMatch = cleanText.match(/KAP\\s*[•·\\-\\.]\\s*([A-ZÇĞİÖŞÜ]{3,5})/i);
-                    if (kapMatch) {
-                        const code = kapMatch[1].toUpperCase();
+                    // SADECE KAP haberleri ve yeterli uzunluk
+                    if (cleanText.length > 50 && /KAP\\s*[•·\\-\\.]\\s*[A-Z]{3,5}/i.test(cleanText)) {
+                        console.log("Found potential KAP item:", cleanText.substring(0, 100));
                         
-                        // Geçersiz kodları filtrele
-                        const invalidCodes = ['ADET', 'TEK', 'MİLYON', 'TL', 'YÜZDE', 'PAY', 'HİSSE', 'ŞİRKET', 'BİST', 'KAP', 'ALTNY', 'YBTAS', 'RODRG', 'MAGEN', 'TERA'];
-                        if (invalidCodes.includes(code)) {
+                        // Spam/legal içerik filtreleme
+                        if (/yatırım tavsiyesi|yasal uyarı|kişisel veri|kvk|saygılarımızla/i.test(cleanText)) {
                             continue;
                         }
                         
-                        // Benzersiz ID oluştur
-                        const contentForHash = cleanText.replace(/\\s*\\d{1,2}:\\d{2}\\s*/, '');
-                        const hash = contentForHash.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) & 0xFFFFFFFF, 0);
-                        const id = `highlight-${code}-${hash}`;
+                        // Birden fazla haber içeriyorsa atla (Fintables• ile başlayan diğer haberler)
+                        const newsSections = cleanText.split(/Fintables\\s*[•·\\-\\.]/);
+                        if (newsSections.length > 2) {
+                            continue; // Çok fazla haber içeriyor
+                        }
                         
-                        // Duplicate kontrolü
-                        if (!items.find(item => item.id === id)) {
-                            items.push({
-                                id: id,
-                                code: code,
-                                content: cleanText,
-                                raw: cleanText
-                            });
-                            console.log(`Added highlight: ${code} - ${cleanText.substring(0, 80)}`);
+                        // İlk haber bölümünü al
+                        const firstNews = newsSections[0].trim();
+                        
+                        // KAP kodunu çıkar
+                        const kapMatch = firstNews.match(/KAP\\s*[•·\\-\\.]?\\s*([A-ZÇĞİÖŞÜ]{3,5})(?:[\\/\\s]([A-ZÇĞİÖŞÜ]{3,5}))?/i);
+                        if (kapMatch) {
+                            const codes = [];
+                            if (kapMatch[1]) codes.push(kapMatch[1].toUpperCase());
+                            if (kapMatch[2]) codes.push(kapMatch[2].toUpperCase());
+                            
+                            if (codes.length === 0) continue;
+                            
+                            // Geçersiz kodları filtrele
+                            const invalidCodes = ['ADET', 'TEK', 'MİLYON', 'TL', 'YÜZDE', 'PAY', 'HİSSE', 'ŞİRKET', 'BİST', 'KAP'];
+                            const validCodes = codes.filter(code => !invalidCodes.includes(code) && /^[A-ZÇĞİÖŞÜ]{3,5}$/.test(code));
+                            
+                            if (validCodes.length === 0) continue;
+                            
+                            // Benzersiz ID oluştur (sadece ilk haber için)
+                            const contentForHash = firstNews.replace(/\\s*\\d{1,2}:\\d{2}\\s*/, '');
+                            const hash = contentForHash.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) & 0xFFFFFFFF, 0);
+                            const id = `highlight-${validCodes.join('-')}-${hash}`;
+                            
+                            // Duplicate kontrolü
+                            if (!items.find(item => item.id === id)) {
+                                items.push({
+                                    id: id,
+                                    codes: validCodes,
+                                    content: firstNews,
+                                    raw: cleanText
+                                });
+                                console.log(`Added CLEAN highlight: ${validCodes.join('/')} - ${firstNews.substring(0, 80)}`);
+                            }
                         }
                     }
+                } catch (e) {
+                    console.log("Error processing element:", e);
+                    continue;
                 }
-            } catch (e) {
-                console.log("Error processing element:", e);
-                continue;
             }
         }
         
-        console.log(`Total highlights found: ${items.length}`);
+        console.log(`Total CLEAN highlights found: ${items.length}`);
         return items;
     } catch (e) {
-        console.error("Highlights extractor error:", e);
+        console.error("Clean highlights extractor error:", e);
         return [];
     }
 }
@@ -341,7 +410,6 @@ class BrowserManager:
                 self.page.goto(url, wait_until="networkidle")
                 self.page.wait_for_timeout(3000)
                 
-                # Sayfanın yüklendiğini kontrol et
                 if self.page.locator("body").is_visible():
                     log("Page loaded successfully")
                     return True
@@ -362,7 +430,6 @@ class BrowserManager:
         try:
             log("Looking for 'Öne Çıkanlar' tab...")
             
-            # Farklı selector'ları dene
             selectors = [
                 "button:has-text('Öne Çıkanlar')",
                 "a:has-text('Öne Çıkanlar')",
@@ -385,7 +452,6 @@ class BrowserManager:
                     log(f"Selector {selector} failed: {e}", "debug")
                     continue
             
-            # Eğer bulamazsa, tab'leri listeleyip bulmaya çalış (SYNC versiyonu)
             log("Trying to find tabs by listing all clickable elements...")
             all_buttons = self.page.locator("button, a, div[role='button']")
             count = all_buttons.count()
@@ -409,27 +475,26 @@ class BrowserManager:
             log(f"Error clicking highlights tab: {e}", "error")
             return False
     
-    def extract_highlight_items(self) -> List[dict]:
-        """Extract news items from highlights section"""
+    def extract_clean_highlight_items(self) -> List[dict]:
+        """Extract clean news items from highlights section"""
         try:
-            log("Evaluating highlights extractor...")
+            log("Evaluating CLEAN highlights extractor...")
             
-            # Sayfayı biraz scroll et
             self.page.evaluate("window.scrollTo(0, 500)")
             self.page.wait_for_timeout(2000)
             
-            raw_items = self.page.evaluate(JS_EXTRACTOR_HIGHLIGHTS)
+            raw_items = self.page.evaluate(JS_EXTRACTOR_CLEAN_HIGHLIGHTS)
             
-            log(f"Extracted {len(raw_items)} highlight items")
+            log(f"Extracted {len(raw_items)} CLEAN highlight items")
             
             # Debug için ilk birkaç item'ı göster
             for i, item in enumerate(raw_items[:5]):
-                log(f"HIGHLIGHT {i+1}: {item['code']} - {item['content'][:120]}...")
+                log(f"CLEAN HIGHLIGHT {i+1}: {item['codes']} - {item['content'][:100]}...")
                 
             return raw_items
             
         except Exception as e:
-            log(f"Highlights extraction failed: {e}", "error")
+            log(f"Clean highlights extraction failed: {e}", "error")
             return []
 
 # ============== TWITTER OPERATIONS ==============
@@ -466,16 +531,21 @@ def process_new_items(items: List[dict], state: StateManager, config: Config,
             break
         
         if state.is_posted(item["id"]):
-            log(f"Already posted: {item['code']}")
+            log(f"Already posted: {item['codes']}")
             continue
             
-        if not is_valid_content(item["content"]):
-            log(f"Invalid content: {item['code']} - {item['content'][:100]}...")
+        if not is_valid_news_content(item["content"]):
+            log(f"Invalid content: {item['codes']} - {item['content'][:100]}...")
             continue
         
         try:
-            # QUANTA STYLE TWEET - 📰 #KOD | içerik
-            tweet_text = build_tweet_quanta_style(item["code"], item["content"])
+            # QUANTA STYLE TWEET - 📰 #KOD1 #KOD2 | içerik
+            tweet_text = build_tweet_quanta_style(item["codes"], item["content"])
+            
+            if not tweet_text:
+                log(f"Empty tweet for: {item['codes']}")
+                continue
+                
             log(f"Attempting tweet: {tweet_text}")
             
             if send_tweet(twitter_client, tweet_text):
@@ -492,9 +562,9 @@ def process_new_items(items: List[dict], state: StateManager, config: Config,
                 log(f"Rate limit hit, cooldown activated for {config.cooldown_minutes} minutes")
                 break
             else:
-                log(f"Twitter error for {item['code']}: {e}", "warning")
+                log(f"Twitter error for {item['codes']}: {e}", "warning")
         except Exception as e:
-            log(f"Unexpected error processing {item['code']}: {e}", "error")
+            log(f"Unexpected error processing {item['codes']}: {e}", "error")
     
     return sent_count
 
@@ -522,16 +592,15 @@ def main():
             if not browser.click_highlights_tab():
                 log("Failed to click highlights tab, but continuing...")
             
-            # Daha uzun bekleme süresi
             browser.page.wait_for_timeout(5000)
             
-            # Extract items from highlights
-            all_items = browser.extract_highlight_items()
+            # Extract CLEAN items from highlights
+            all_items = browser.extract_clean_highlight_items()
             if not all_items:
-                log("No highlight items extracted")
+                log("No clean highlight items extracted")
                 return
             
-            log(f"Successfully extracted {len(all_items)} highlight items")
+            log(f"Successfully extracted {len(all_items)} clean highlight items")
             
             # Yeni item'ları filtrele
             new_items = []
@@ -540,10 +609,10 @@ def main():
                     new_items.append(item)
             
             if not new_items:
-                log("No new highlight items to process")
+                log("No new clean highlight items to process")
                 return
             
-            log(f"Found {len(new_items)} new highlight items to process")
+            log(f"Found {len(new_items)} new clean highlight items to process")
             
             # En yeni haberler önce gelsin
             new_items = new_items[:config.max_per_run]
@@ -558,7 +627,7 @@ def main():
             state_manager.cleanup_old_entries()
             state_manager.save()
             
-            log(f"Completed successfully. Sent {sent_count} highlight tweets")
+            log(f"Completed successfully. Sent {sent_count} clean highlight tweets")
             
     except Exception as e:
         log(f"Fatal error in main execution: {e}", "error")
