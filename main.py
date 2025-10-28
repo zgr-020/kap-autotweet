@@ -20,21 +20,19 @@ def twitter_client():
         access_token_secret=ACCESS_TOKEN_SECRET,
     )
 
-# ============== State (duplicate koruması) ==============
+# ============== State ==============
 STATE_PATH = Path("state.json")
-
 def load_state():
     if not STATE_PATH.exists():
         return {"last_id": None, "posted": []}
     try:
         data = json.loads(STATE_PATH.read_text())
-        # eski biçim liste ise dönüştür
         if isinstance(data, list):
             return {"last_id": None, "posted": data}
         data.setdefault("last_id", None)
         data.setdefault("posted", [])
         return data
-    except Exception:
+    except:
         return {"last_id": None, "posted": []}
 
 def save_state(state):
@@ -44,187 +42,133 @@ state = load_state()
 posted = set(state.get("posted", []))
 last_id = state.get("last_id")
 
-# ============== Parsing helpers ==============
+# ============== Constants ==============
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
 MAX_PER_RUN = 5
-SLEEP_BETWEEN_TWEETS = 15  # saniye
-
-UPPER_TR = "A-ZÇĞİÖŞÜ"
-TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}[0-9]?$")  # BIST kodu
-
-# şirket kodu olamayacak etiketler
+TICKER_RE = re.compile(r"^[A-ZÇĞİÖŞÜ]{3,6}[0-9]?$")
 BANNED_TAGS = {"KAP", "FINTABLES", "FİNTABLES", "GÜNLÜK", "BÜLTEN", "BULTEN", "GUNLUK", "HABER"}
-
-# bülten/günlük içerikleri ele
 NON_NEWS_PATTERNS = [
-    r"\bGünlük Bülten\b", r"\bBülten\b", r"\bPiyasa temkini\b", r"\bPiyasa değerlendirmesi\b"
+    r"Günlük Bülten", r"Bülten", r"Piyasa temkini", r"Piyasa değerlendirmesi"
 ]
-
 STOP_PHRASES = [
     r"işbu açıklama.*?amaçla", r"yatırım tavsiyesi değildir", r"kamunun bilgisine arz olunur",
     r"saygılarımızla", r"özel durum açıklaması", r"yatırımcılarımızın bilgisine",
 ]
-TIME_PATTERNS = [r"\b\d{1,2}:\d{2}\b", r"\bDün\s+\d{1,2}:\d{2}\b", r"\bBugün\b", r"\bAz önce\b"]
-
-# -------- Göreli tarih öneklerini temizle (Dün/Bugün/Yesterday/Today) --------
 REL_PREFIX = re.compile(r'^(?:dün|bugün|yesterday|today)\b[:\-–]?\s*', re.IGNORECASE)
-def strip_relative_prefix(text: str) -> str:
-    t = REL_PREFIX.sub('', text).lstrip('-–: ').strip()
-    return t
-# ---------------------------------------------------------------------------
 
+# ============== JS Extractor (EN HIZLI YOL) ==============
+JS_EXTRACTOR = """
+() => {
+    const rows = Array.from(document.querySelectorAll('main li, main div[role="listitem"], main div'))
+        .slice(0, 300);  // max 300 satır
+
+    const banned = new Set(['KAP', 'FINTABLES', 'FİNTABLES', 'GÜNLÜK', 'BÜLTEN', 'BULTEN', 'GUNLUK', 'HABER']);
+    const tickerRe = /^[A-ZÇĞİÖŞÜ]{3,6}[0-9]?$/;
+    const nonNewsRe = /(Günlük Bülten|Bülten|Piyasa temkini|Piyasa değerlendirmesi)/i;
+
+    return rows.map(row => {
+        const text = row.innerText || '';
+        const norm = text.replace(/\\s+/g, ' ').trim();
+        if (nonNewsRe.test(norm) || /Fintables/i.test(norm)) return null;
+
+        const words = norm.split(/\\s+/);
+        let code = '';
+        for (const w of words) {
+            const up = w.toUpperCase();
+            if (banned.has(up)) continue;
+            if (tickerRe.test(up)) { code = up; break; }
+        }
+        if (!code) return null;
+
+        const pos = norm.toUpperCase().indexOf(code);
+        let snippet = norm.slice(pos + code.length).trim();
+        if (snippet.length < 15) return null;
+
+        const id = `${code}-${norm.split('').reduce((a,b)=>a+(b.charCodeAt(0)<<5)+b.charCodeAt(0),0)}`;
+        return { id, code, snippet, raw: norm };
+    }).filter(Boolean);
+}
+"""
+
+# ============== Helpers ==============
 def clean_text(t: str) -> str:
-    t = re.sub(r"\s+", " ", (t or "")).strip()
+    t = re.sub(r"\s+", " ", t).strip()
     for p in STOP_PHRASES: t = re.sub(p, "", t, flags=re.I)
-    for p in TIME_PATTERNS: t = re.sub(p, "", t, flags=re.I)
-    t = re.sub(r"\b(Fintables|KAP)\b\s*[·\.]?\s*", "", t, flags=re.I)  # kaynak kırpıntısı
-    return t.strip(" -–—:|•·")
+    t = re.sub(r"\b(Fintables|KAP)\b\s*[·\.]?\s*", "", t, flags=re.I)
+    return REL_PREFIX.sub('', t).strip(" -–—:|•·")
 
-REWRITE_MAP = [
-    (r"\bbildirdi\b", "duyurdu"),
-    (r"\bbildirimi\b", "açıklaması"),
-    (r"\bilgisine\b", "paylaştı"),
-    (r"\bgerçekleştirdi\b", "tamamladı"),
-    (r"\bbaşladı\b", "başlattı"),
-    (r"\bdevam ediyor\b", "sürdürülüyor"),
-]
 def rewrite_tr_short(s: str) -> str:
     s = clean_text(s)
-    s = re.sub(r"[“”\"']", "", s)
-    s = re.sub(r"\(\s*\)", "", s)
-    for pat, rep in REWRITE_MAP: s = re.sub(pat, rep, s, flags=re.I)
-    s = re.sub(r"^\s*[-–—•·]\s*", "", s)
-    return s.strip()
-
-def summarize(text: str, limit: int) -> str:
-    text = clean_text(text)
-    if len(text) <= limit: return text
-    parts = re.split(r"(?<=[.!?])\s+", text)
-    out = ""
-    for s in parts:
-        if not s: continue
-        cand = (out + " " + s).strip()
-        if len(cand) > limit: break
-        out = cand
-    return out or text[:limit]
+    s = s.replace('bildirdi', 'duyurdu')\
+         .replace('bildirimi', 'açıklaması')\
+         .replace('bilgisine', 'paylaştı')\
+         .replace('gerçekleştirdi', 'tamamladı')\
+         .replace('başladı', 'başlattı')\
+         .replace('devam ediyor', 'sürdürülüyor')
+    return re.sub(r"^\s*[-–—•·]\s*", "", s).strip()
 
 def build_tweet(code: str, snippet: str) -> str:
     base = rewrite_tr_short(snippet)
-    base = summarize(base, 240)
-    base = strip_relative_prefix(base)
-    return (f"📰 #{code} | " + base)[:279]
+    base = base[:240] if len(base) > 240 else base
+    return (f"#{code} | " + base)[:279]
 
-def go_highlights(page):
-    for sel in [
-        "button:has-text('Öne çıkanlar')",
-        "[role='tab']:has-text('Öne çıkanlar')",
-        "a:has-text('Öne çıkanlar')",
-        "text=Öne çıkanlar",
-    ]:
-        loc = page.locator(sel)
-        if loc.count():
-            loc.first.click()
-            page.wait_for_load_state("networkidle")
-            page.wait_for_timeout(800)   # bir tık artırıldı
-            print(">> highlights ON")
-            return True
-    print(">> highlights button not found; staying on 'Tümü'")
-    return False
-
-def best_ticker_in_row(row) -> str:
-    anchors = row.locator("a, span, div")
-    for j in range(min(40, anchors.count())):
-        tt = (anchors.nth(j).inner_text() or "").strip().upper()
-        if tt in BANNED_TAGS:
-            continue
-        if TICKER_RE.fullmatch(tt):
-            return tt
-    return ""
-
-def extract_company_rows_list(page, max_scan=400):
-    rows = page.locator("main li, main div[role='listitem'], main div")
-    total = min(max_scan, rows.count())
-    print(">> raw rows:", total)
-
-    items = []
-    for i in range(total):  # en üstten aşağı = en yeni → eski
-        row = rows.nth(i)
-        code = best_ticker_in_row(row)
-        if not code:
-            continue
-
-        text = row.inner_text().strip()
-        text_norm = re.sub(r"\s+", " ", text)
-
-        if any(re.search(p, text_norm, flags=re.I) for p in NON_NEWS_PATTERNS):
-            continue
-        if re.search(r"\bFintables\b", text_norm, flags=re.I):
-            continue
-
-        pos = text_norm.upper().find(code)
-        snippet = text_norm[pos + len(code):].strip()
-        snippet = clean_text(snippet)
-        if len(snippet) < 15:
-            continue
-
-        rid = f"{code}-{hash(text_norm)}"
-        items.append({"id": rid, "code": code, "snippet": snippet})
-
-    print(">> eligible items:", len(items))
-    return items  # en yeni → eski
-
-# ============== MAIN ==============
+# ============== MAIN (HIZLANDIRILMIŞ) ==============
 def main():
-    print(">> start")
+    print(">> start (fast mode)")
     tw = twitter_client()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox","--disable-gpu","--disable-dev-shm-usage"],
-        )
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         ctx = browser.new_context(
-            user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
             locale="tr-TR", timezone_id="Europe/Istanbul"
         )
         page = ctx.new_page()
-        page.set_default_timeout(45000)               # bir tık artırıldı
-        page.set_default_navigation_timeout(90000)    # bir tık artırıldı
+        page.set_default_timeout(30000)
 
-        page.goto(AKIS_URL, wait_until="networkidle")
-        page.wait_for_timeout(800)
-        go_highlights(page)
+        # 1. Hızlı yükleme
+        page.goto(AKIS_URL, wait_until="domcontentloaded")
+        page.wait_for_selector("main", timeout=15000)
 
-        items = extract_company_rows_list(page)
-        if not items:
-            print(">> done (no items)")
+        # 2. Öne çıkanlar (opsiyonel, hızlı)
+        try:
+            page.click("text=Öne çıkanlar", timeout=3000)
+            page.wait_for_load_state("domcontentloaded")
+            print(">> highlights ON")
+        except:
+            print(">> highlights not found, using default")
+
+        # 3. JS ile tek seferde tüm veriyi çek
+        raw_items = page.evaluate(JS_EXTRACTOR)
+        print(f">> extracted {len(raw_items)} items in JS")
+
+        if not raw_items:
+            print(">> no items")
             browser.close(); return
 
-        # en yeni görülen
-        newest_seen_id = items[0]["id"]
+        # En yeni ID
+        newest_id = raw_items[0]["id"]
 
-        # önceki run'dan bu yana gelenler (last_id görünene kadar)
+        # Yeni olanlar
         to_tweet = []
-        for it in items:
+        for it in raw_items:
             if last_id and it["id"] == last_id:
                 break
             to_tweet.append(it)
+        to_tweet = to_tweet[:MAX_PER_RUN]
 
         if not to_tweet:
-            print(">> no new items since last run")
-            state["last_id"] = newest_seen_id
+            state["last_id"] = newest_id
             save_state(state)
-            browser.close(); print(">> done"); return
+            print(">> no new items")
+            browser.close(); return
 
-        # Run başına üst limit ve eski → yeni sırası
-        to_tweet = to_tweet[:MAX_PER_RUN]
+        # Eski → Yeni
         to_tweet.reverse()
 
         sent = 0
         for it in to_tweet:
             if it["id"] in posted:
-                print(">> already posted, skip and continue")
                 continue
 
             tweet = build_tweet(it["code"], it["snippet"])
@@ -235,56 +179,45 @@ def main():
                     tw.create_tweet(text=tweet)
                 posted.add(it["id"])
                 sent += 1
-                print(">> tweet sent ✓")
+                print(">> sent ✓")
 
-                # BAŞARILI GÖNDERİMDEN HEMEN SONRA STATE'İ KAYDET
+                # Hemen kaydet
                 state["posted"] = sorted(list(posted))
-                state["last_id"] = newest_seen_id
+                state["last_id"] = newest_id
                 save_state(state)
 
-                time.sleep(SLEEP_BETWEEN_TWEETS)
+                # Rate limit'e göre dinamik bekleme
+                if sent >= 4:  # 5. tweet'te biraz bekle
+                    time.sleep(3)
             except Exception as e:
-                print("!! tweet error:", e)
                 if "429" in str(e) or "Too Many Requests" in str(e):
+                    print(">> rate limit, waiting 65s...")
+                    time.sleep(65)
                     try:
-                        print(">> hit rate limit; waiting 60s then retry once…")
-                        time.sleep(60)
-                        if tw:
-                            tw.create_tweet(text=tweet)
+                        if tw: tw.create_tweet(text=tweet)
                         posted.add(it["id"])
-                        sent += 1
-                        print(">> tweet sent (after retry) ✓")
-
                         state["posted"] = sorted(list(posted))
-                        state["last_id"] = newest_seen_id
+                        state["last_id"] = newest_id
                         save_state(state)
+                        sent += 1
+                    except:
+                        pass
+                else:
+                    print("!! error:", e)
 
-                        time.sleep(SLEEP_BETWEEN_TWEETS)
-                    except Exception as e2:
-                        print("!! retry failed:", e2)
-                        continue
-
-        # son görüleni kaydet
-        state["posted"] = sorted(list(posted))
-        state["last_id"] = newest_seen_id
+        # Son kaydet
+        state["last_id"] = newest_id
         save_state(state)
-
         browser.close()
         print(f">> done (sent: {sent})")
 
 if __name__ == "__main__":
-    print(">> entry", flush=True)
     try:
         main()
-        print(">> main() finished", flush=True)
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
-        print("!! UNCAUGHT ERROR !!")
+        print("!! ERROR !!")
         print(tb)
-        try:
-            with open("debug.log", "a", encoding="utf-8") as f:
-                f.write(tb + "\n")
-        except Exception:
-            pass
-        raise
+        with open("debug.log", "a", encoding="utf-8") as f:
+            f.write(tb + "\n")
