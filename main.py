@@ -120,27 +120,32 @@ def clean_text(t: str) -> str:
     return t
 
 def build_tweet(code: str, snippet: str) -> str:
+    # 📰 #KOD | Haber
     base = clean_text(snippet)
-    
-    # İlk tam cümleyi al (nokta ile biten)
+
+    # İlk tam cümleyi yakala; yoksa 30 kelimeye kadar al
     sentences = [s.strip() for s in base.split('.') if s.strip()]
-    first_sentence = sentences[0] if sentences else base.split(' ', 25)[0]
-    
-    # Eğer çok kısaysa, kelime sayısını artır
+    first_sentence = sentences[0] if sentences else ' '.join(base.split()[:30])
+
+    # Çok kısaysa biraz uzat
     if len(first_sentence) < 30:
         words = base.split()
         first_sentence = ' '.join(words[:30])
-    
-    # 230 karakter sınırı + "..." ekle
+
+    # 230 char üstünü kibarca kısalt
     if len(first_sentence) > 230:
-        first_sentence = first_sentence[:227].rsplit(' ', 1)[0] + "..."
-    
-    # Sonunda nokta olsun
+        cut = first_sentence[:227]
+        first_sentence = (cut.rsplit(' ', 1)[0] if ' ' in cut else cut) + "..."
+
+    # Baştaki ayırıcı kırpıntıları temizle
+    first_sentence = first_sentence.lstrip('-–—:|•· ').strip()
+
+    # Nokta ile bitmiyorsa noktala
     if not first_sentence.endswith(('.', '!', '?')):
         first_sentence += "."
-    
-    tweet = f"#{code} | {first_sentence}"
-    return tweet[:280]  # Twitter sınırı
+
+    tweet = f"📰 #{code} | {first_sentence}"
+    return tweet[:279]  # X sınırımız (279)
 
 def is_valid_ticker(code: str, text: str) -> bool:
     if len(code) < 2 or len(code) > 6: return False
