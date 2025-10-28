@@ -21,7 +21,7 @@ def twitter_client():
         access_token_secret=ACCESS_TOKEN_SECRET,
     )
 
-# ============== Logging ==============
+# ============== Logging (SADECE KONSOLA) ==============
 def log(msg: str):
     timestamp = dt.now().strftime("%H:%M:%S")
     print(f"[{timestamp}] {msg}")
@@ -68,7 +68,7 @@ STOP_PHRASES = [
 ]
 REL_PREFIX = re.compile(r'^(?:dün|bugün|yesterday|today)\b[:\-–]?\s*', re.IGNORECASE)
 
-# ============== JS Extractor (SADECE KAP - XXXX FORMATI) ==============
+# ============== JS Extractor (SADECE KAP - XXXX) ==============
 JS_EXTRACTOR = """
 () => {
     try {
@@ -85,7 +85,6 @@ JS_EXTRACTOR = """
             const norm = text.replace(/\\s+/g, ' ').trim();
             if (nonNewsRe.test(norm) || /Fintables/i.test(norm)) return null;
 
-            // SADECE "KAP - XXXX" formatını al
             const kapMatch = norm.match(/\\bKAP\\s*[•·\\-\\.]\\s*([A-ZÇĞİÖŞÜ]{2,5})(?:[0-9]?\\b)/i);
             if (!kapMatch) return null;
 
@@ -122,12 +121,26 @@ def clean_text(t: str) -> str:
 
 def build_tweet(code: str, snippet: str) -> str:
     base = clean_text(snippet)
-    first_sentence = base.split('.')[0].strip()
-    if len(first_sentence) < 20:
-        first_sentence = ' '.join(base.split()[:25]).strip()
+    
+    # İlk tam cümleyi al (nokta ile biten)
+    sentences = [s.strip() for s in base.split('.') if s.strip()]
+    first_sentence = sentences[0] if sentences else base.split(' ', 25)[0]
+    
+    # Eğer çok kısaysa, kelime sayısını artır
+    if len(first_sentence) < 30:
+        words = base.split()
+        first_sentence = ' '.join(words[:30])
+    
+    # 230 karakter sınırı + "..." ekle
     if len(first_sentence) > 230:
-        first_sentence = first_sentence[:227] + "..."
-    return f"#{code} | {first_sentence}."
+        first_sentence = first_sentence[:227].rsplit(' ', 1)[0] + "..."
+    
+    # Sonunda nokta olsun
+    if not first_sentence.endswith(('.', '!', '?')):
+        first_sentence += "."
+    
+    tweet = f"#{code} | {first_sentence}"
+    return tweet[:280]  # Twitter sınırı
 
 def is_valid_ticker(code: str, text: str) -> bool:
     if len(code) < 2 or len(code) > 6: return False
