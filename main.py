@@ -12,7 +12,7 @@ ACCESS_TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET")
 
 def twitter_client():
     if not all([API_KEY, API_KEY_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET]):
-        log("!! Twitter secrets missing, tweeting disabled")
+        log("Twitter secrets missing, tweeting disabled")
         return None
     return tweepy.Client(
         consumer_key=API_KEY,
@@ -21,7 +21,7 @@ def twitter_client():
         access_token_secret=ACCESS_TOKEN_SECRET,
     )
 
-# ============== Logging (SADECE KONSOLA) ==============
+# ============== Logging ==============
 def log(msg: str):
     timestamp = dt.now().strftime("%H:%M:%S")
     print(f"[{timestamp}] {msg}")
@@ -34,45 +34,25 @@ def load_state():
         return {
             "last_id": None,
             "posted": [],
-            "posted_today": [],
-            "count_today": 0,
-            "day": None,
             "cooldown_until": None
         }
     try:
         data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
         if isinstance(data, list):
-            return {
-                "last_id": None,
-                "posted": data,
-                "posted_today": [],
-                "count_today": 0,
-                "day": None,
-                "cooldown_until": None
-            }
+            return {"last_id": None, "posted": data, "cooldown_until": None}
         data.setdefault("last_id", None)
         data.setdefault("posted", [])
-        data.setdefault("posted_today", [])
-        data.setdefault("count_today", 0)
-        data.setdefault("day", None)
         data.setdefault("cooldown_until", None)
         return data
     except Exception as e:
-        log(f"!! state.json bozuk: {e}, sıfırlanıyor")
-        return {
-            "last_id": None,
-            "posted": [],
-            "posted_today": [],
-            "count_today": 0,
-            "day": None,
-            "cooldown_until": None
-        }
+        log(f"state.json bozuk: {e}, sıfırlanıyor")
+        return {"last_id": None, "posted": [], "cooldown_until": None}
 
 def save_state(state):
     try:
         STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as e:
-        log(f"!! state.json kaydedilemedi: {e}")
+        log(f"state.json kaydedilemedi: {e}")
 
 state = load_state()
 posted = set(state.get("posted", []))
@@ -80,8 +60,7 @@ last_id = state.get("last_id")
 
 # ============== Constants ==============
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
-MAX_PER_RUN = 5
-MAX_TODAY = 10
+MAX_PER_RUN = 5  # Her çalıştırmada en fazla 5 haber
 
 STOP_PHRASES = [
     r"işbu açıklama.*?amaçla", r"yatırım tavsiyesi değildir", r"kamunun bilgisine arz olunur",
@@ -90,7 +69,7 @@ STOP_PHRASES = [
 ]
 REL_PREFIX = re.compile(r'^(?:dün|bugün|yesterday|today)\b[:\-–]?\s*', re.IGNORECASE)
 
-# ============== JS Extractor (SADECE GERÇEK KAP HABERLERİ) ==============
+# ============== JS Extractor ==============
 JS_EXTRACTOR = """
 () => {
     try {
@@ -98,7 +77,7 @@ JS_EXTRACTOR = """
             .slice(0, 300);
         if (!rows.length) return [];
 
-        const banned = new Set(['ADET','TEK','MİLYON','TL','YÜZDE','PAY','HİSSE','ŞİRKET','BİST','KAP','FİNTABLES','BÜLTEN','GÜNLÜK','BURADA','KVKK','POLİTİKASI','YASAL','UYARI','BİLGİLENDİRME','GUNLUK','HABER','ALTNY','YBTAS','RODRG','MAGEN']);
+        const banned = new Set(['ADET','TEK','MİLYON','TL','YÜZDE','PAY','HİSSE','ŞİRKET','BİST','KAP','FİNTABLES','BÜLTEN','GÜNLÜK','BURADA','KVKK','POLİTİKASI','YASAL','UYARI','BİLGİLENDİRME','GUNLUK','HABER','ALTNY','YBTAS','RODRG','MAGEN','TERA']);
         const nonNewsRe = /(Günlük Bülten|Bülten|Piyasa temkini|yatırım bilgi|yasal uyarı|kişisel veri|kvk)/i;
 
         return rows.map(row => {
@@ -170,70 +149,36 @@ def is_valid_ticker(code: str, text: str) -> bool:
     if any(phrase in text.upper() for phrase in forbidden): return False
     return True
 
-def get_live_tweet_count(tw_client, tweet_ids):
-    """X API ile canlı tweetleri say"""
-    if not tw_client or not tweet_ids:
-        return 0
-    try:
-        chunks = [tweet_ids[i:i+100] for i in range(0, len(tweet_ids), 100)]
-        live_count = 0
-        for chunk in chunks:
-            response = tw_client.get_tweets(ids=chunk, tweet_fields=["id"])
-            if response.data:
-                live_count += len(response.data)
-        return live_count
-    except Exception as e:
-        log(f"!! tweet kontrol hatası: {e}")
-        return len(tweet_ids)  # hata olursa eski sayımı koru
-
 def goto_with_retry(page, url, retries=3):
     for i in range(retries):
         try:
-            log(f">> goto attempt {i+1}/{retries}")
+            log(f"goto attempt {i+1}/{retries}")
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_selector("main", timeout=15000)
             page.wait_for_load_state("networkidle", timeout=30000)
             page.wait_for_timeout(2000)
             return True
         except Exception as e:
-            log(f">> goto retry {i+1}/{retries} failed: {e}")
+            log(f"goto retry {i+1}/{retries} failed: {e}")
             if i < retries - 1:
                 time.sleep(5)
     return False
 
 # ============== MAIN ==============
 def main():
-    log(">> start (GitHub Actions)")
+    log("start (GitHub Actions)")
 
-    # COOLDOWN
+    # COOLDOWN (X API rate limit)
     if state.get("cooldown_until"):
         try:
             cooldown_dt = dt.fromisoformat(state["cooldown_until"].replace("Z", "+00:00"))
             if dt.now(timezone.utc) < cooldown_dt:
-                log(f">> cooldown aktif: {cooldown_dt.isoformat()}")
+                log(f"cooldown aktif: {cooldown_dt.isoformat()}")
                 return
         except Exception as e:
-            log(f"!! cooldown parse hatası: {e}")
-
-    # GÜNLÜK LİMİT – SADECE CANLI TWEETLER
-    today = dt.now().strftime("%Y-%m-%d")
-    if state.get("day") != today:
-        state["count_today"] = 0
-        state["posted_today"] = []
-        state["day"] = today
+            log(f"cooldown parse hatası: {e}")
 
     tw = twitter_client()
-
-    # CANLI TWEET SAYISINI KONTROL ET
-    if tw and state.get("posted_today"):
-        live_count = get_live_tweet_count(tw, state["posted_today"])
-        state["count_today"] = live_count
-        save_state(state)
-        log(f">> canlı tweet sayısı: {live_count}/{MAX_TODAY}")
-
-    if state.get("count_today", 0) >= MAX_TODAY:
-        log(f">> günlük limit ({MAX_TODAY}) aşıldı (sadece canlılar sayılır)")
-        return
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -249,7 +194,7 @@ def main():
         page.set_default_timeout(30000)
 
         if not goto_with_retry(page, AKIS_URL):
-            log("!! Sayfa yüklenemedi")
+            log("Sayfa yüklenemedi")
             browser.close()
             return
 
@@ -258,22 +203,22 @@ def main():
                 page.click("text=Öne çıkanlar")
                 page.wait_for_load_state("networkidle", timeout=15000)
                 page.wait_for_timeout(2000)
-                log(">> highlights ON")
+                log("highlights ON")
         except:
-            log(">> highlights not available")
+            pass
 
         try:
-            log(">> evaluating JS extractor...")
+            log("evaluating JS extractor...")
             raw_items = page.evaluate(JS_EXTRACTOR)
-            log(f">> extracted {len(raw_items)} items in JS")
+            log(f"extracted {len(raw_items)} items in JS")
             for i, item in enumerate(raw_items[:3]):
-                log(f">> DEBUG ITEM {i+1}: {item['raw'][:120]}...")
+                log(f"DEBUG ITEM {i+1}: {item['raw'][:120]}...")
         except Exception as e:
-            log(f"!! JS evaluation failed: {e}")
+            log(f"JS evaluation failed: {e}")
             raw_items = []
 
         if not raw_items:
-            log(">> no items")
+            log("no items")
             browser.close()
             return
 
@@ -281,7 +226,6 @@ def main():
         to_tweet = []
         for it in raw_items:
             if last_id and it["id"].startswith(last_id.split('-')[0] + '-' + last_id.split('-')[1]):
-                log(f">> found last_id prefix, stopping")
                 break
             to_tweet.append(it)
         to_tweet = to_tweet[:MAX_PER_RUN]
@@ -289,66 +233,42 @@ def main():
         if not to_tweet:
             state["last_id"] = newest_id
             save_state(state)
-            log(">> no new items")
+            log("no new items")
             browser.close()
             return
 
         to_tweet.reverse()
         sent = 0
-        today_posted = state.get("posted_today", [])
         for it in to_tweet:
-            if it["id"] in posted:
-                continue
-            if not is_valid_ticker(it["code"], it["snippet"]):
-                log(f">> SKIP: #{it['code']} (geçersiz)")
+            if it["id"] in posted or not is_valid_ticker(it["code"], it["snippet"]):
                 continue
 
             tweet = build_tweet(it["code"], it["snippet"])
-            log(f">> TWEET: {tweet}")
+            log(f"TWEET: {tweet}")
 
             try:
                 if tw:
-                    response = tw.create_tweet(text=tweet)
-                    tweet_id = response.data["id"]
-                    posted.add(it["id"])
-                    today_posted.append(tweet_id)
-                    sent += 1
-                    state["count_today"] = state.get("count_today", 0) + 1
-                    state["posted_today"] = today_posted
-                    state["posted"] = sorted(list(posted))
-                    state["last_id"] = newest_id
-                    save_state(state)
-                    log(">> sent")
-                    if sent >= 4:
-                        time.sleep(3)
+                    tw.create_tweet(text=tweet)
+                posted.add(it["id"])
+                sent += 1
+                state["posted"] = sorted(list(posted))
+                state["last_id"] = newest_id
+                save_state(state)
+                log("sent")
+                if sent >= 4:
+                    time.sleep(3)
             except Exception as e:
                 if "429" in str(e) or "Too Many Requests" in str(e):
-                    log(">> rate limit → 15 dk cooldown")
+                    log("rate limit → 15 dk cooldown")
                     state["cooldown_until"] = (dt.now(timezone.utc) + timedelta(minutes=15)).isoformat()
                     save_state(state)
-                    time.sleep(65)
-                    try:
-                        if tw:
-                            response = tw.create_tweet(text=tweet)
-                            tweet_id = response.data["id"]
-                            posted.add(it["id"])
-                            today_posted.append(tweet_id)
-                            state["count_today"] = state.get("count_today", 0) + 1
-                            state["posted_today"] = today_posted
-                            state["posted"] = sorted(list(posted))
-                            state["last_id"] = newest_id
-                            save_state(state)
-                            sent += 1
-                            log(">> sent (retry)")
-                    except:
-                        log("!! retry failed")
                 else:
-                    log(f"!! error: {e}")
+                    log(f"error: {e}")
 
         state["last_id"] = newest_id
         save_state(state)
         browser.close()
-        log(f">> done (sent: {sent}, canlı: {state['count_today']})")
+        log(f"done (sent: {sent})")
 
 if __name__ == "__main__":
     try:
@@ -356,7 +276,7 @@ if __name__ == "__main__":
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
-        log("!! FATAL ERROR !!")
+        log("FATAL ERROR")
         log(tb)
         with open("debug.log", "a", encoding="utf-8") as f:
             f.write(f"\n--- {dt.now()} ---\n{tb}\n")
