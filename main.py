@@ -385,16 +385,17 @@ class BrowserManager:
                     log(f"Selector {selector} failed: {e}", "debug")
                     continue
             
-            # Eğer bulamazsa, tab'leri listeleyip bulmaya çalış
+            # Eğer bulamazsa, tab'leri listeleyip bulmaya çalış (SYNC versiyonu)
             log("Trying to find tabs by listing all clickable elements...")
             all_buttons = self.page.locator("button, a, div[role='button']")
-            count = await all_buttons.count()
+            count = all_buttons.count()
             
             for i in range(count):
                 try:
-                    text = await all_buttons.nth(i).text_content()
+                    button = all_buttons.nth(i)
+                    text = button.text_content()
                     if text and "Öne Çıkanlar" in text:
-                        await all_buttons.nth(i).click()
+                        button.click()
                         self.page.wait_for_timeout(3000)
                         log("Found and clicked 'Öne Çıkanlar' by text content")
                         return True
