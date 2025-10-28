@@ -193,14 +193,14 @@ def extract_clean_content(text: str) -> str:
     return text
 
 def build_tweet_quanta_style(code: str, content: str) -> str:
-    """Build tweet in Quanta Finance style - SADECE #KOD | içerik"""
+    """Build tweet in Quanta Finance style - 📰 #KOD | içerik"""
     clean_content = extract_clean_content(content)
     
     # Çok uzunsa kısalt
-    if len(clean_content) > 240:
-        clean_content = clean_content[:237] + "..."
+    if len(clean_content) > 235:  # Emoji ve kod için yer bırak
+        clean_content = clean_content[:232] + "..."
     
-    tweet = f"#{code} | {clean_content}"
+    tweet = f"📰 #{code} | {clean_content}"
     return tweet[:280]
 
 def is_valid_content(text: str) -> bool:
@@ -225,86 +225,23 @@ def is_valid_content(text: str) -> bool:
     return True
 
 # ============== BROWSER & SCRAPING ==============
-JS_EXTRACTOR_SIMPLE = """
+JS_EXTRACTOR_HIGHLIGHTS = """
 () => {
     try {
+        console.log("Extracting highlights content...");
         const items = [];
-        const selectors = [
-            'main div[class*="hover"]',
-            'main div[class*="card"]', 
-            'main div[class*="item"]',
-            'main div[class*="news"]',
-            'main li',
-            'main > div > div'
-        ];
         
-        for (const selector of selectors) {
-            const elements = document.querySelectorAll(selector);
-            for (const el of elements) {
+        // Öne çıkanlar bölümündeki tüm elementleri bul
+        const allElements = document.querySelectorAll('div, li, article, section');
+        
+        for (const el of allElements) {
+            try {
                 const text = el.innerText || el.textContent || '';
                 const cleanText = text.replace(/\\s+/g, ' ').trim();
                 
-                // KAP haberlerini bul
-                if (cleanText.length > 50 && /KAP\\s*[•·\\-\\.]\\s*[A-Z]{3,5}/i.test(cleanText)) {
-                    // Spam/legal içerik kontrolü
-                    if (/yatırım tavsiyesi|yasal uyarı|kişisel veri|kvk/i.test(cleanText)) {
-                        continue;
-                    }
-                    
-                    // KAP kodunu çıkar
-                    const kapMatch = cleanText.match(/KAP\\s*[•·\\-\\.]\\s*([A-ZÇĞİÖŞÜ]{3,5})/i);
-                    if (kapMatch) {
-                        const code = kapMatch[1].toUpperCase();
-                        
-                        // Geçersiz kodları filtrele
-                        const invalidCodes = ['ADET', 'TEK', 'MİLYON', 'TL', 'YÜZDE', 'PAY', 'HİSSE', 'ŞİRKET', 'BİST', 'KAP'];
-                        if (invalidCodes.includes(code)) {
-                            continue;
-                        }
-                        
-                        // ID oluştur
-                        const timestamp = Date.now();
-                        const hash = cleanText.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) & 0xFFFFFFFF, 0);
-                        const id = `${code}-${hash}-${timestamp}`;
-                        
-                        items.push({
-                            id: id,
-                            code: code,
-                            content: cleanText,
-                            raw: cleanText
-                        });
-                    }
-                }
-            }
-            if (items.length > 0) break;
-        }
-        
-        return items;
-    } catch (e) {
-        console.error("Extractor error:", e);
-        return [];
-    }
-}
-"""
-
-JS_EXTRACTOR_ADVANCED = """
-() => {
-    try {
-        console.log("Starting advanced extraction...");
-        const items = [];
-        
-        // Tüm div elementlerini tarama
-        const allDivs = document.querySelectorAll('div');
-        console.log(`Found ${allDivs.length} div elements`);
-        
-        for (const div of allDivs) {
-            try {
-                const text = div.innerText || div.textContent || '';
-                const cleanText = text.replace(/\\s+/g, ' ').trim();
-                
-                // Minimum uzunluk ve KAP pattern kontrolü
+                // KAP haberlerini bul ve minimum uzunluk kontrolü
                 if (cleanText.length > 40 && /KAP\\s*[•·\\-\\.]\\s*[A-Z]{3,5}/i.test(cleanText)) {
-                    console.log("Found KAP item:", cleanText.substring(0, 100));
+                    console.log("Found KAP highlight:", cleanText.substring(0, 100));
                     
                     // Spam/legal içerik filtreleme
                     if (/yatırım tavsiyesi|yasal uyarı|kişisel veri|kvk|saygılarımızla/i.test(cleanText)) {
@@ -323,10 +260,9 @@ JS_EXTRACTOR_ADVANCED = """
                         }
                         
                         // Benzersiz ID oluştur
-                        const timestamp = Date.now();
-                        const contentForHash = cleanText.replace(/\\s*\\d{1,2}:\\d{2}\\s*/, ''); // Saat bilgisini çıkar
+                        const contentForHash = cleanText.replace(/\\s*\\d{1,2}:\\d{2}\\s*/, '');
                         const hash = contentForHash.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) & 0xFFFFFFFF, 0);
-                        const id = `${code}-${hash}`;
+                        const id = `highlight-${code}-${hash}`;
                         
                         // Duplicate kontrolü
                         if (!items.find(item => item.id === id)) {
@@ -336,20 +272,20 @@ JS_EXTRACTOR_ADVANCED = """
                                 content: cleanText,
                                 raw: cleanText
                             });
-                            console.log(`Added item: ${code} - ${cleanText.substring(0, 80)}`);
+                            console.log(`Added highlight: ${code} - ${cleanText.substring(0, 80)}`);
                         }
                     }
                 }
             } catch (e) {
-                console.log("Error processing div:", e);
+                console.log("Error processing element:", e);
                 continue;
             }
         }
         
-        console.log(`Total items found: ${items.length}`);
+        console.log(`Total highlights found: ${items.length}`);
         return items;
     } catch (e) {
-        console.error("Advanced extractor error:", e);
+        console.error("Highlights extractor error:", e);
         return [];
     }
 }
@@ -403,7 +339,7 @@ class BrowserManager:
             try:
                 log(f"Navigation attempt {attempt + 1}/{retries}")
                 self.page.goto(url, wait_until="networkidle")
-                self.page.wait_for_timeout(3000)  # Sayfanın tam yüklenmesi için bekle
+                self.page.wait_for_timeout(3000)
                 
                 # Sayfanın yüklendiğini kontrol et
                 if self.page.locator("body").is_visible():
@@ -421,34 +357,78 @@ class BrowserManager:
         
         return False
     
-    def extract_items(self) -> List[dict]:
-        """Extract news items using advanced JavaScript"""
+    def click_highlights_tab(self) -> bool:
+        """Click on 'Öne Çıkanlar' tab to show highlights"""
         try:
-            log("Evaluating advanced JS extractor...")
+            log("Looking for 'Öne Çıkanlar' tab...")
             
-            # Sayfanın daha iyi yüklenmesi için scroll yap
-            self.page.evaluate("window.scrollTo(0, document.body.scrollHeight / 3)")
+            # Farklı selector'ları dene
+            selectors = [
+                "button:has-text('Öne Çıkanlar')",
+                "a:has-text('Öne Çıkanlar')",
+                "div:has-text('Öne Çıkanlar')",
+                "[class*='highlight']:has-text('Öne Çıkanlar')",
+                "[class*='tab']:has-text('Öne Çıkanlar')",
+                "text=Öne Çıkanlar"
+            ]
+            
+            for selector in selectors:
+                try:
+                    if self.page.locator(selector).is_visible(timeout=5000):
+                        log(f"Found highlights tab with selector: {selector}")
+                        self.page.click(selector)
+                        self.page.wait_for_timeout(3000)
+                        self.page.wait_for_load_state("networkidle")
+                        log("Successfully clicked 'Öne Çıkanlar' tab")
+                        return True
+                except Exception as e:
+                    log(f"Selector {selector} failed: {e}", "debug")
+                    continue
+            
+            # Eğer bulamazsa, tab'leri listeleyip bulmaya çalış
+            log("Trying to find tabs by listing all clickable elements...")
+            all_buttons = self.page.locator("button, a, div[role='button']")
+            count = await all_buttons.count()
+            
+            for i in range(count):
+                try:
+                    text = await all_buttons.nth(i).text_content()
+                    if text and "Öne Çıkanlar" in text:
+                        await all_buttons.nth(i).click()
+                        self.page.wait_for_timeout(3000)
+                        log("Found and clicked 'Öne Çıkanlar' by text content")
+                        return True
+                except:
+                    continue
+            
+            log("Could not find 'Öne Çıkanlar' tab", "warning")
+            return False
+            
+        except Exception as e:
+            log(f"Error clicking highlights tab: {e}", "error")
+            return False
+    
+    def extract_highlight_items(self) -> List[dict]:
+        """Extract news items from highlights section"""
+        try:
+            log("Evaluating highlights extractor...")
+            
+            # Sayfayı biraz scroll et
+            self.page.evaluate("window.scrollTo(0, 500)")
             self.page.wait_for_timeout(2000)
-            self.page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)") 
-            self.page.wait_for_timeout(2000)
             
-            # Advanced extractor'ü dene
-            raw_items = self.page.evaluate(JS_EXTRACTOR_ADVANCED)
+            raw_items = self.page.evaluate(JS_EXTRACTOR_HIGHLIGHTS)
             
-            if not raw_items:
-                log("Advanced extractor failed, trying simple extractor...")
-                raw_items = self.page.evaluate(JS_EXTRACTOR_SIMPLE)
-            
-            log(f"Extracted {len(raw_items)} items")
+            log(f"Extracted {len(raw_items)} highlight items")
             
             # Debug için ilk birkaç item'ı göster
             for i, item in enumerate(raw_items[:5]):
-                log(f"ITEM {i+1}: {item['code']} - {item['content'][:120]}...")
+                log(f"HIGHLIGHT {i+1}: {item['code']} - {item['content'][:120]}...")
                 
             return raw_items
             
         except Exception as e:
-            log(f"JS evaluation failed: {e}", "error")
+            log(f"Highlights extraction failed: {e}", "error")
             return []
 
 # ============== TWITTER OPERATIONS ==============
@@ -493,7 +473,7 @@ def process_new_items(items: List[dict], state: StateManager, config: Config,
             continue
         
         try:
-            # QUANTA STYLE TWEET - sadece #KOD | içerik
+            # QUANTA STYLE TWEET - 📰 #KOD | içerik
             tweet_text = build_tweet_quanta_style(item["code"], item["content"])
             log(f"Attempting tweet: {tweet_text}")
             
@@ -537,20 +517,20 @@ def main():
                 log("Failed to load page after retries", "error")
                 return
             
+            # Öne Çıkanlar tab'ına tıkla
+            if not browser.click_highlights_tab():
+                log("Failed to click highlights tab, but continuing...")
+            
             # Daha uzun bekleme süresi
             browser.page.wait_for_timeout(5000)
             
-            # Extract items
-            all_items = browser.extract_items()
+            # Extract items from highlights
+            all_items = browser.extract_highlight_items()
             if not all_items:
-                log("No items extracted - trying alternative approach")
-                # Alternatif yaklaşım: sayfa kaynağını kontrol et
-                page_content = browser.page.content()
-                if "KAP" in page_content:
-                    log("KAP content found in page source but not extracted")
+                log("No highlight items extracted")
                 return
             
-            log(f"Successfully extracted {len(all_items)} items")
+            log(f"Successfully extracted {len(all_items)} highlight items")
             
             # Yeni item'ları filtrele
             new_items = []
@@ -559,12 +539,12 @@ def main():
                     new_items.append(item)
             
             if not new_items:
-                log("No new items to process")
+                log("No new highlight items to process")
                 return
             
-            log(f"Found {len(new_items)} new items to process")
+            log(f"Found {len(new_items)} new highlight items to process")
             
-            # En yeni haberler önce gelsin (ters sıra)
+            # En yeni haberler önce gelsin
             new_items = new_items[:config.max_per_run]
             
             # Send tweets
@@ -577,7 +557,7 @@ def main():
             state_manager.cleanup_old_entries()
             state_manager.save()
             
-            log(f"Completed successfully. Sent {sent_count} tweets")
+            log(f"Completed successfully. Sent {sent_count} highlight tweets")
             
     except Exception as e:
         log(f"Fatal error in main execution: {e}", "error")
