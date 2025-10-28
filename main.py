@@ -31,20 +31,42 @@ STATE_PATH = Path("state.json")
 
 def load_state():
     if not STATE_PATH.exists():
-        return {"last_id": None, "posted": [], "cooldown_until": None, "count_today": 0, "day": None}
+        return {
+            "last_id": None,
+            "posted": [],
+            "posted_today": [],
+            "count_today": 0,
+            "day": None,
+            "cooldown_until": None
+        }
     try:
         data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
         if isinstance(data, list):
-            return {"last_id": None, "posted": data, "cooldown_until": None, "count_today": 0, "day": None}
+            return {
+                "last_id": None,
+                "posted": data,
+                "posted_today": [],
+                "count_today": 0,
+                "day": None,
+                "cooldown_until": None
+            }
         data.setdefault("last_id", None)
         data.setdefault("posted", [])
-        data.setdefault("cooldown_until", None)
+        data.setdefault("posted_today", [])
         data.setdefault("count_today", 0)
         data.setdefault("day", None)
+        data.setdefault("cooldown_until", None)
         return data
     except Exception as e:
         log(f"!! state.json bozuk: {e}, sıfırlanıyor")
-        return {"last_id": None, "posted": [], "cooldown_until": None, "count_today": 0, "day": None}
+        return {
+            "last_id": None,
+            "posted": [],
+            "posted_today": [],
+            "count_today": 0,
+            "day": None,
+            "cooldown_until": None
+        }
 
 def save_state(state):
     try:
@@ -85,7 +107,6 @@ JS_EXTRACTOR = """
             const norm = text.replace(/\\s+/g, ' ').trim();
             if (nonNewsRe.test(norm) || /Fintables/i.test(norm)) return null;
 
-            // SADECE "KAP - XXXX" formatı
             const kapMatch = norm.match(/\\bKAP\\s*[•·\\-\\.]\\s*([A-ZÇĞİÖŞÜ]{3,5})(?:[0-9]?\\b)/i);
             if (!kapMatch) return null;
 
@@ -123,15 +144,9 @@ def clean_text(t: str) -> str:
 
 def build_tweet(code: str, snippet: str) -> str:
     base = clean_text(snippet)
-    
-    # İlk tam cümleyi al (nokta ile biten)
     sentences = [s.strip() for s in base.split('.') if s.strip() and len(s.strip()) > 20]
-    if not sentences:
-        first_sentence = ' '.join(base.split()[:30])
-    else:
-        first_sentence = sentences[0]
+    first_sentence = sentences[0] if sentences else ' '.join(base.split()[:30])
     
-    # Kelime kesmeden kısalt
     max_len = 230
     if len(first_sentence) > max_len:
         words = first_sentence.split()
@@ -143,13 +158,10 @@ def build_tweet(code: str, snippet: str) -> str:
                 break
         first_sentence = temp.strip() + "..."
     
-    # Nokta ile bitir
     if not first_sentence.endswith(('.', '!', '?')):
         first_sentence += "."
     
-    # ŞABLON: Megafon #KOD | Haber
-    tweet = f"Megafon #{code} | {first_sentence}"
-    return tweet[:280]
+    return f"Megafon #{code} | {first_sentence}"[:280]
 
 def is_valid_ticker(code: str, text: str) -> bool:
     if len(code) < 3 or len(code) > 5: return False
@@ -157,6 +169,22 @@ def is_valid_ticker(code: str, text: str) -> bool:
     forbidden = ["YATIRIM", "TAVSİYE", "UYARI", "KİŞİSEL", "POLİTİKASI", "KVK"]
     if any(phrase in text.upper() for phrase in forbidden): return False
     return True
+
+def get_live_tweet_count(tw_client, tweet_ids):
+    """X API ile canlı tweetleri say"""
+    if not tw_client or not tweet_ids:
+        return 0
+    try:
+        chunks = [tweet_ids[i:i+100] for i in range(0, len(tweet_ids), 100)]
+        live_count = 0
+        for chunk in chunks:
+            response = tw_client.get_tweets(ids=chunk, tweet_fields=["id"])
+            if response.data:
+                live_count += len(response.data)
+        return live_count
+    except Exception as e:
+        log(f"!! tweet kontrol hatası: {e}")
+        return len(tweet_ids)  # hata olursa eski sayımı koru
 
 def goto_with_retry(page, url, retries=3):
     for i in range(retries):
@@ -187,16 +215,25 @@ def main():
         except Exception as e:
             log(f"!! cooldown parse hatası: {e}")
 
-    # GÜNLÜK LİMİT
+    # GÜNLÜK LİMİT – SADECE CANLI TWEETLER
     today = dt.now().strftime("%Y-%m-%d")
     if state.get("day") != today:
         state["count_today"] = 0
+        state["posted_today"] = []
         state["day"] = today
-    if state.get("count_today", 0) >= MAX_TODAY:
-        log(f">> günlük limit ({MAX_TODAY}) aşıldı")
-        return
 
     tw = twitter_client()
+
+    # CANLI TWEET SAYISINI KONTROL ET
+    if tw and state.get("posted_today"):
+        live_count = get_live_tweet_count(tw, state["posted_today"])
+        state["count_today"] = live_count
+        save_state(state)
+        log(f">> canlı tweet sayısı: {live_count}/{MAX_TODAY}")
+
+    if state.get("count_today", 0) >= MAX_TODAY:
+        log(f">> günlük limit ({MAX_TODAY}) aşıldı (sadece canlılar sayılır)")
+        return
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -258,6 +295,7 @@ def main():
 
         to_tweet.reverse()
         sent = 0
+        today_posted = state.get("posted_today", [])
         for it in to_tweet:
             if it["id"] in posted:
                 continue
@@ -270,16 +308,19 @@ def main():
 
             try:
                 if tw:
-                    tw.create_tweet(text=tweet)
-                posted.add(it["id"])
-                sent += 1
-                state["count_today"] = state.get("count_today", 0) + 1
-                state["posted"] = sorted(list(posted))
-                state["last_id"] = newest_id
-                save_state(state)
-                log(">> sent")
-                if sent >= 4:
-                    time.sleep(3)
+                    response = tw.create_tweet(text=tweet)
+                    tweet_id = response.data["id"]
+                    posted.add(it["id"])
+                    today_posted.append(tweet_id)
+                    sent += 1
+                    state["count_today"] = state.get("count_today", 0) + 1
+                    state["posted_today"] = today_posted
+                    state["posted"] = sorted(list(posted))
+                    state["last_id"] = newest_id
+                    save_state(state)
+                    log(">> sent")
+                    if sent >= 4:
+                        time.sleep(3)
             except Exception as e:
                 if "429" in str(e) or "Too Many Requests" in str(e):
                     log(">> rate limit → 15 dk cooldown")
@@ -287,14 +328,18 @@ def main():
                     save_state(state)
                     time.sleep(65)
                     try:
-                        if tw: tw.create_tweet(text=tweet)
-                        posted.add(it["id"])
-                        state["count_today"] = state.get("count_today", 0) + 1
-                        state["posted"] = sorted(list(posted))
-                        state["last_id"] = newest_id
-                        save_state(state)
-                        sent += 1
-                        log(">> sent (retry)")
+                        if tw:
+                            response = tw.create_tweet(text=tweet)
+                            tweet_id = response.data["id"]
+                            posted.add(it["id"])
+                            today_posted.append(tweet_id)
+                            state["count_today"] = state.get("count_today", 0) + 1
+                            state["posted_today"] = today_posted
+                            state["posted"] = sorted(list(posted))
+                            state["last_id"] = newest_id
+                            save_state(state)
+                            sent += 1
+                            log(">> sent (retry)")
                     except:
                         log("!! retry failed")
                 else:
@@ -303,7 +348,7 @@ def main():
         state["last_id"] = newest_id
         save_state(state)
         browser.close()
-        log(f">> done (sent: {sent})")
+        log(f">> done (sent: {sent}, canlı: {state['count_today']})")
 
 if __name__ == "__main__":
     try:
