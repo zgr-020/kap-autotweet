@@ -32,6 +32,11 @@ AKIS_URL = "https://fintables.com/borsa-haber-akisi?tab=featured"
 UPPER_TR = "A-ZÇĞİÖŞÜ"
 TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}[0-9]?$")
 NON_NEWS = re.compile(r"(Fintables|G[üu]nl[üu]k\s*B[üu]lten|Bültenler?)", re.I)
+DEBUG = os.getenv("DEBUG", "1") == "1"
+
+TEXT_FIELDS = {"title","text","body","content","description","subtitle","summary","snippet","message","detail","headline"}
+KAP_FIELDS  = {"source","label","labels","tag","tags","topics","category","categories","section","sections"}
+SYM_FIELDS  = {"symbol","symbolCode","symbol_code","ticker","code","abbr","shortCode","short_code"}
 
 def clean_text(t: str) -> str:
     if not t: return ""
@@ -46,92 +51,108 @@ def build_tweet(code: str, detail: str) -> str:
     if len(base) > 240: base = base[:240].rstrip() + "…"
     return (f"📰 #{code} | {base}")[:279]
 
-def infinite_scroll(page, steps=5, pause_ms=250):
+def infinite_scroll(page, steps=6, pause_ms=250):
     for _ in range(steps):
         page.mouse.wheel(0, 1800)
         page.wait_for_timeout(pause_ms)
 
-# ---- JSON içinden ITEM bazlı güvenli çıkarım ----
-TEXT_FIELDS = {"title","text","body","content","description","subtitle","summary","snippet","message","detail"}
-
-def _collect_strings(x):
-    """dict/list içindeki TÜM string alanları düz bir listede döndür (debug/regex için)."""
-    out = []
+# ----- JSON yardımcıları -----
+def _iter_scalars(x):
     if isinstance(x, dict):
-        for v in x.values(): out.extend(_collect_strings(v))
+        for v in x.values(): yield from _iter_scalars(v)
     elif isinstance(x, list):
-        for v in x: out.extend(_collect_strings(v))
-    elif isinstance(x, str):
-        out.append(x)
-    return out
+        for v in x: yield from _iter_scalars(v)
+    else:
+        yield x
 
-def _best_text_from_item(d):
-    """Item dict'inde anlamlı metni veren alan(lar)ı seç."""
-    # 1) isimli alanlar
-    for k, v in d.items():
-        if k.lower() in TEXT_FIELDS and isinstance(v, str) and len(v) > 6:
-            return v
-    # 2) alt sözlüklerde aynı adlara bakalım
-    for k, v in d.items():
-        if isinstance(v, dict):
-            for kk, vv in v.items():
-                if kk.lower() in TEXT_FIELDS and isinstance(vv, str) and len(vv) > 6:
-                    return vv
-    # 3) fallback: toplanmış stringlerden en uzunu
-    strings = [s for s in _collect_strings(d) if len(s) > 6]
-    strings.sort(key=len, reverse=True)
-    return strings[0] if strings else ""
+def _strings_in(x):
+    return [s for s in _iter_scalars(x) if isinstance(s, str)]
 
-def parse_item_if_kap(item):
-    """
-    Bir JSON 'item' nesnesi içinde aynı anda:
-      - 'KAP' etiketine dair bir string
-      - Geçerli TICKER
-      - Anlamlı bir metin (detay)
-    varsa {"code", "snippet"} döndürür.
-    """
-    strings = _collect_strings(item)
-    big = " ".join(strings)
+def _any_kap(x) -> bool:
+    # Önce semantik alanlarda bak
+    if isinstance(x, dict):
+        for k, v in x.items():
+            lk = k.lower()
+            if lk in KAP_FIELDS:
+                if isinstance(v, str) and "kap" in v.lower(): return True
+                if isinstance(v, list) and any(isinstance(i,str) and "kap" in i.lower() for i in v): return True
+        # yoksa stringlerde ara
+    return any("kap" in s.lower() for s in _strings_in(x))
 
-    if "KAP" not in big and "Kap" not in big and "kap" not in big:
-        return None  # item KAP değil
+def _best_symbol(x):
+    # Önce semantik alanlarda
+    if isinstance(x, dict):
+        for k, v in x.items():
+            lk = k.lower()
+            if lk in SYM_FIELDS:
+                if isinstance(v, str) and TICKER_RE.fullmatch(v.upper()): return v.upper()
+        for k, v in x.items():
+            if isinstance(v, dict):
+                s = _best_symbol(v)
+                if s: return s
+            if isinstance(v, list):
+                for i in v:
+                    s = _best_symbol(i)
+                    if s: return s
+    # Fallback: tüm stringlerde ara
+    for s in _strings_in(x):
+        m = re.findall(rf"\b([{UPPER_TR}]{{3,6}}[0-9]?)\b", s.upper())
+        for c in m:
+            if TICKER_RE.fullmatch(c) and c not in {"KAP","BULTEN","BÜLTEN"}:
+                return c
+    return None
 
-    # Ticker adaylarını item içindeki stringlerden çıkar
-    codes = []
-    for s in strings:
-        # "KOD", "KAP - KOD", "[KOD]" vb. yakalar
-        m_all = re.findall(rf"\b([{UPPER_TR}]{{3,6}}[0-9]?)\b", s.upper())
-        for c in m_all:
-            if TICKER_RE.fullmatch(c) and c not in ("KAP", "BULTEN", "BÜLTEN"):
-                codes.append(c)
-    codes = [c for c in codes if c != "KAP"]
-    if not codes:
+def _best_detail(x):
+    # Anlamsal alanlardan biri
+    if isinstance(x, dict):
+        for k, v in x.items():
+            if k.lower() in TEXT_FIELDS and isinstance(v, str) and len(v) > 6:
+                return v
+        for k, v in x.items():
+            if isinstance(v, dict):
+                d = _best_detail(v)
+                if d: return d
+            if isinstance(v, list):
+                for i in v:
+                    d = _best_detail(i)
+                    if d: return d
+    # Fallback: en uzun anlamlı string
+    cand = [s for s in _strings_in(x) if len(s) > 12]
+    cand.sort(key=len, reverse=True)
+    return cand[0] if cand else ""
+
+def parse_item(item):
+    if not _any_kap(item): 
         return None
-    # Aynı item içinde en çok tekrar eden/ilk görüneni al
-    code = codes[0]
-
-    # Detay
-    detail = _best_text_from_item(item)
-    if not detail or NON_NEWS.search(detail):
+    code = _best_symbol(item)
+    if not code: 
         return None
-
+    detail = _best_detail(item)
+    if not detail or NON_NEWS.search(detail): 
+        return None
     detail = clean_text(detail)
-    if len(detail) < 8:
+    if len(detail) < 8: 
         return None
+    return {"id": f"{code}-{hash(code+'|'+detail)}", "code": code, "snippet": detail}
 
-    rid = f"{code}-{hash(code+'|'+detail)}"
-    return {"id": rid, "code": code, "snippet": detail}
+def walk_items(x, sink):
+    if isinstance(x, dict):
+        # dene: tekil item olabilir
+        it = parse_item(x)
+        if it: sink.append(it)
+        for v in x.values(): walk_items(v, sink)
+    elif isinstance(x, list):
+        for v in x: walk_items(v, sink)
 
+# ----- Featured feed dinleyici + debug dump -----
 def fetch_featured_via_network(page):
-    """
-    Sadece featured topic-feed çağrılarını dinler, her JSON item'ını
-    AYRI AYRI parse eder (string “flatteing” yok → karışma yok).
-    """
     collected = []
+    dump_count = 0
 
     def on_response(resp):
+        nonlocal dump_count
         url = (resp.url or "").lower()
-        if "topic-feed" not in url: 
+        if "topic-feed" not in url:
             return
         if "featured" not in url and "topic_tab=featured" not in url and "tab=featured" not in url:
             return
@@ -143,30 +164,17 @@ def fetch_featured_via_network(page):
         except Exception:
             return
 
-        # Item dizisi farklı anahtarlarla gelebilir; tüm dict/list içinde dolaş
-        stack = [data]
-        while stack:
-            cur = stack.pop()
-            if isinstance(cur, dict):
-                # "items", "data", "entries", "results" vb.
-                for k, v in cur.items():
-                    if isinstance(v, list) and v and all(isinstance(x, (dict, list)) for x in v):
-                        stack.append(v)
-                # Tekil item gibi görünen dict'leri de deneyelim
-                maybe = parse_item_if_kap(cur)
-                if maybe:
-                    collected.append(maybe)
-            elif isinstance(cur, list):
-                for v in cur:
-                    if isinstance(v, (dict, list)):
-                        stack.append(v)
-                    else:
-                        # basit tipleri atla
-                        pass
+        # DEBUG: ham cevabı kaydet
+        if DEBUG and dump_count < 3:
+            Path(f"debug_featured_{dump_count+1}.json").write_text(json.dumps(data, ensure_ascii=False, indent=2))
+            dump_count += 1
+            print(f"[debug] saved debug_featured_{dump_count}.json from {resp.url}")
+
+        tmp = []
+        walk_items(data, tmp)
+        collected.extend(tmp)
 
     page.on("response", on_response)
-
-    # sayfayı aç + network tetikle
     page.goto(AKIS_URL, wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
     infinite_scroll(page, 6, 250)
@@ -177,11 +185,12 @@ def fetch_featured_via_network(page):
         k = (it["code"], it["snippet"])
         if k in seen: continue
         seen.add(k); uniq.append(it)
+    print(f"[debug] featured parsed items: {len(uniq)}")
     return uniq
 
 # ===== MAIN =====
 def main():
-    print(">> start (featured network-only, item-safe)")
+    print(">> start (featured network – field-based + debug)")
     tw = twitter_client()
 
     with sync_playwright() as p:
@@ -202,13 +211,11 @@ def main():
         if not items:
             print(">> no eligible rows"); browser.close(); return
 
-        # state filtresi
         new_items = [it for it in items if it["id"] not in posted]
         if not new_items:
             print(">> nothing new to post"); browser.close(); return
 
-        # Eskiden → yeniye (timeline tutarlı)
-        new_items.reverse()
+        new_items.reverse()  # eskiden → yeniye
 
         sent = 0
         for it in new_items:
