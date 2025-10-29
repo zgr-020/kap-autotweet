@@ -7,7 +7,7 @@ STATE_PATH = Path("state.json")
 MAX_TWEET_LEN = 279
 URL = "https://fintables.com/borsa-haber-akisi"
 
-# --- Twitter auth: (senin secret isimlerin) ---
+# --- Twitter auth (secret adların) ---
 API_KEY = os.environ["API_KEY"]
 API_SECRET = os.environ["API_KEY_SECRET"]
 ACCESS_TOKEN = os.environ["ACCESS_TOKEN"]
@@ -38,13 +38,9 @@ def format_tweet(code: str, text: str) -> str:
     return prefix + body
 
 # ------------ Scrape helpers ------------
-TIME_TRASH_RE = re.compile(
-    r"(?:\s+("
-    r"(?:Dün|Bugün|Az önce|Saat)\b"
-    r"|(?:\d{1,2}\s[A-Za-zÇĞİÖŞÜçğıöşü]+)"  # 27 Ekim
-    r")?\s*\d{1,2}[:.]\d{2}\b.*$",
-    re.I,
-)
+# Sadeltilmiş zaman/tarih temizleyici desenler
+TIME_AT_END_RE = re.compile(r"\s*(?:Dün|Bugün|Az önce|Saat)?\s*\d{1,2}[:.]\d{2}\s*$", re.I)
+DATE_TIME_AT_END_RE = re.compile(r"\s*\d{1,2}\s+[A-Za-zÇĞİÖŞÜçğıöşü]+\s+\d{1,2}[:.]\d{2}\s*$", re.I)
 
 def is_kap_row_text(txt: str) -> bool:
     t = txt.strip()
@@ -52,11 +48,9 @@ def is_kap_row_text(txt: str) -> bool:
         return False
     if re.search(r"Fintables|G[üu]nl[üu]k B[üu]lten|Bültenler", t, re.I):
         return False
-    # satırın başında veya erken kısmında "KAP -"
     return bool(re.search(r"\bKAP\s*-\s*", t))
 
 def extract_code_from_html(row):
-    # 1) Hisse linkinden
     try:
         for a in row.query_selector_all("a[href*='/borsa/hisse/']"):
             t = a.inner_text().strip().upper()
@@ -64,14 +58,11 @@ def extract_code_from_html(row):
                 return t
     except Exception:
         pass
-    # 2) Satır metninden (mavi kod genelde link ama fallback bırakıyoruz)
     try:
         raw = row.inner_text().upper()
-        # KAP - KOD … pattern
         m = re.search(r"KAP\s*-\s*([A-Z]{3,5})\b", raw)
         if m:
             return m.group(1)
-        # genel 3–5 harf fallback
         m2 = re.search(r"\b([A-Z]{3,5})\b", raw)
         if m2:
             return m2.group(1)
@@ -79,21 +70,21 @@ def extract_code_from_html(row):
         pass
     return None
 
+def strip_time_parts(s: str) -> str:
+    s = TIME_AT_END_RE.sub("", s)
+    s = DATE_TIME_AT_END_RE.sub("", s)
+    return s
+
 def extract_detail_from_text(raw: str) -> str:
-    # Tarih/saat çöplerini uçur
-    s = TIME_TRASH_RE.sub("", raw)
-    # "KAP - XXX " den sonrası
+    s = strip_time_parts(raw)
     parts = re.split(r"KAP\s*-\s*[A-Z]{3,5}\s*", s, flags=re.I, maxsplit=1)
     if len(parts) == 2:
         s = parts[1]
-    # Tek satıra indir
     s = re.sub(r"\s+", " ", s).strip()
-    # baştaki tire/dikey çizgi artıkları
     s = re.sub(r"^[\-\|–—\s]+", "", s)
     return s
 
 def click_featured(page):
-    # “Öne çıkanlar” butonu farklı etiketlerde olabilir; hepsini dene
     candidates = [
         "role=button[name=/Öne ?çıkanlar/i]",
         "text=Öne çıkanlar",
@@ -115,15 +106,11 @@ def scrape_featured_kap_items():
         page = ctx.new_page()
 
         page.goto(URL, wait_until="domcontentloaded")
-        # İçerik yüklenmesi için kısa bekleme (SSR + CSR hibrit olabilir)
         page.wait_for_timeout(2500)
 
-        # “Öne çıkanlar” tıkla (başarısız olursa tüm akıştan yine de ayıklarız)
         click_featured(page)
         page.wait_for_timeout(800)
 
-        # Satır adayları: önce li, sonra div/article fallback
-        rows = []
         try:
             rows = page.locator("li").all()
             if len(rows) < 5:
@@ -133,7 +120,6 @@ def scrape_featured_kap_items():
 
         items = []
         for row in rows:
-            # Her satırın metni
             try:
                 txt = row.inner_text().strip()
             except Exception:
@@ -141,14 +127,11 @@ def scrape_featured_kap_items():
             if not txt or not is_kap_row_text(txt):
                 continue
 
-            # Hisse kodu
             code = extract_code_from_html(row)
             if not code:
                 continue
 
-            # Detay metni
             detail = extract_detail_from_text(txt)
-            # Güvenlik: “KAP - …” kalmadı mı, Fintables vb. var mı
             if not detail or re.search(r"Fintables|G[üu]nl[üu]k B[üu]lten|Bültenler", detail, re.I):
                 continue
 
@@ -156,9 +139,8 @@ def scrape_featured_kap_items():
 
         browser.close()
 
-        # Aynı tetiklemede duplikeleri temizle, en eskiden yeniye sırala
         uniq, seen = [], set()
-        for it in reversed(items):
+        for it in reversed(items):  # en eskiden yeniye
             k = (it["code"], it["detail"])
             if k in seen:
                 continue
@@ -191,7 +173,7 @@ def main():
         post_to_twitter(tweet)
         state["hashes"].append(h)
         posted += 1
-        time.sleep(2)  # hız limiti tamponu
+        time.sleep(2)
 
     save_state(state)
     print(f"Scanned {len(items)}, posted {posted}")
