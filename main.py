@@ -4,17 +4,33 @@ import requests
 from bs4 import BeautifulSoup
 import tweepy
 
+# Playwright
+from playwright.sync_api import sync_playwright
+
 BASE_URL = "https://www.foreks.com/analizler/piyasa-analizleri/sirket"
 AMP_URL = BASE_URL.rstrip("/") + "/amp"
 
 STATE_PATH = Path("data/posted.json")
-UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36"
-)
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36")
 
-# 3–5 harfli, TR büyük harfleri de kapsayan hisse kodu
 TICKER_RE = re.compile(r"\b[A-ZÇĞİÖŞÜ]{3,5}\b", re.UNICODE)
+
+def load_state():
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if STATE_PATH.exists():
+        try:
+            return set(json.loads(STATE_PATH.read_text()))
+        except Exception:
+            return set()
+    return set()
+
+def save_state(ids):
+    STATE_PATH.write_text(json.dumps(sorted(list(ids)), ensure_ascii=False, indent=2))
+
+def sha24(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:24]
 
 def http_get(url):
     r = requests.get(
@@ -31,48 +47,22 @@ def http_get(url):
     r.raise_for_status()
     return r.text
 
-def load_state():
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if STATE_PATH.exists():
-        try:
-            return set(json.loads(STATE_PATH.read_text()))
-        except Exception:
-            return set()
-    return set()
-
-def save_state(ids):
-    STATE_PATH.write_text(json.dumps(sorted(list(ids)), ensure_ascii=False, indent=2))
-
-def sha24(text: str) -> str:
-    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:24]
-
 def normalize_ticker(m: str) -> str:
     return (m.replace("Ç","C").replace("Ğ","G").replace("İ","I")
               .replace("Ö","O").replace("Ş","S").replace("Ü","U"))
 
 def compose_tweet(ticker: str, title: str) -> str:
     base = f"📰 #{ticker} | {title}"
-    if len(base) <= 279:
-        return base
-    return base[:276] + "…"
+    return base if len(base) <= 279 else base[:276] + "…"
 
-# ---------- PARSERS ----------
-
-def parse_amp(html: str):
-    """
-    AMP sayfası statik olur. AMP’de genelde haber kartları <article>, <li> ya da
-    <a class="..."> ile gelir; sağdaki etiketler küçük 'chip/tag' linkleridir.
-    """
+# ---------- Parsers ----------
+def extract_rows_from_html(html: str):
     soup = BeautifulSoup(html, "lxml")
     rows = []
 
-    # AMP’de ana içerik çoğunlukla <main> altında
-    container = soup.find("main") or soup
-
-    # Kart benzeri bloklar
-    for blk in container.find_all(["article", "li", "div", "section"], recursive=True):
-        # Başlık adayı: en uzun metinli <a> veya <h*> içindeki <a>
-        a_tags = [a for a in blk.find_all("a", recursive=True) if a.get_text(strip=True)]
+    # Sayfadaki listeleri kaba tarama – etiket (kod) + başlık aynı blokta
+    for blk in soup.find_all(["li", "article", "div", "section"]):
+        a_tags = [a for a in blk.find_all("a") if a.get_text(strip=True)]
         if not a_tags:
             continue
         title_link = max(a_tags, key=lambda a: len(a.get_text(strip=True)))
@@ -80,15 +70,15 @@ def parse_amp(html: str):
         if not title or "ŞİRKET HABERLERİ" in title.upper():
             continue
 
-        # Etiket/kod adayı: kısa metinli <a>/<span>’larda 3–5 harf
+        # Etiket/kod: kısa ve TAM büyük harfli link/etiket
         codes = []
-        for el in blk.find_all(["a", "span", "div"], recursive=True):
+        for el in blk.find_all(["a", "span", "div"]):
             text = el.get_text(strip=True)
-            if not text or len(text) > 8:  # etiketler kısa olur
+            if not text or len(text) > 8:  # sağdaki chip kısadır
                 continue
             for m in TICKER_RE.findall(text):
                 n = normalize_ticker(m)
-                if 3 <= len(n) <= 5 and n.isupper():
+                if 3 <= len(n) <= 5 and n.isupper() and n not in {"TCMB","CEO","BIST"}:
                     codes.append(n)
         codes = list(dict.fromkeys(codes))
         if not codes:
@@ -96,105 +86,37 @@ def parse_amp(html: str):
 
         rows.append({"title": title, "ticker": codes[0]})
 
+    # Çok kısa başlıkları ele
+    rows = [r for r in rows if len(r["title"]) >= 20]
     return rows
 
-def parse_nuxt_json(html: str):
-    """
-    Foreks Vue/Nuxt tabanlı olabilir. HTML içinde window.__NUXT__ veya benzeri
-    bir JSON’da liste olur. Buradan title ve ticker çıkarırız.
-    """
-    rows = []
-    # __NUXT__ gömülü JSON’u çek
-    m = re.search(r"window\.__NUXT__\s*=\s*(\{.*?\});", html, re.DOTALL)
-    if not m:
-        return rows
-    try:
-        nuxt = json.loads(m.group(1))
-    except Exception:
-        return rows
+def fetch_rendered_with_playwright(url: str) -> str:
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(user_agent=UA, locale="tr-TR")
+        page = context.new_page()
+        page.set_default_timeout(25000)
 
-    # JSON yapısı olası: nuxt['state'] / ['data'] içinde liste
-    def walk(x):
-        if isinstance(x, dict):
-            for k, v in x.items():
-                yield k, v
-                yield from walk(v)
-        elif isinstance(x, list):
-            for i in x:
-                yield from walk(i)
+        # Bazı siteler cookie banner koyar; önce direkt git
+        page.goto(url, wait_until="networkidle")
+        # İçerik akışı yüklensin diye az beklet
+        page.wait_for_timeout(2000)
 
-    candidates = []
-    for k, v in walk(nuxt):
-        if isinstance(v, list) and v and isinstance(v[0], dict) and ("title" in v[0] or "name" in v[0]):
-            candidates.append(v)
+        # "BIST Şirketleri" filtresi otomatik aktif ama garanti olsun:
+        # Eğer bir filtre sekmesi görünüyorsa, metin içeren butonu tıkla
+        try:
+            tab = page.get_by_role("button", name=re.compile("BIST Şirketleri", re.I))
+            if tab.is_visible():
+                tab.click()
+                page.wait_for_timeout(500)
+        except Exception:
+            pass
 
-    for arr in candidates:
-        for item in arr:
-            title = (item.get("title") or item.get("name") or "").strip()
-            if not title:
-                continue
-            text_blob = json.dumps(item, ensure_ascii=False)
-            codes = []
-            for m2 in TICKER_RE.findall(text_blob):
-                n = normalize_ticker(m2)
-                if 3 <= len(n) <= 5 and n.isupper():
-                    codes.append(n)
-            codes = list(dict.fromkeys(codes))
-            if not codes:
-                continue
-            if "ŞİRKET HABERLERİ" in title.upper():
-                continue
-            rows.append({"title": title, "ticker": codes[0]})
+        html = page.content()
+        browser.close()
+        return html
 
-    return rows
-
-def extract_rows_resilient():
-    # 1) AMP dene
-    try:
-        html = http_get(AMP_URL)
-        print(f">> fetched AMP html: {len(html)} bytes")
-        rows = parse_amp(html)
-        if rows:
-            print(f">> amp rows: {len(rows)}")
-            return rows
-        else:
-            print(">> amp parse yielded 0 rows, falling back to normal page JSON…")
-    except Exception as e:
-        print("!! amp fetch error:", e)
-
-    # 2) Normal sayfa + NUXT JSON dene
-    html = http_get(BASE_URL)
-    print(f">> fetched normal html: {len(html)} bytes")
-    rows = parse_nuxt_json(html)
-    if rows:
-        print(f">> nuxt rows: {len(rows)}")
-        return rows
-
-    # 3) Son çare: normal DOM’dan kaba ayrıştırma (bazı durumlar yine işe yarar)
-    soup = BeautifulSoup(html, "lxml")
-    fallback = []
-    for li in soup.find_all(["li", "article", "div"]):
-        a_tags = [a for a in li.find_all("a") if a.get_text(strip=True)]
-        if not a_tags:
-            continue
-        title_link = max(a_tags, key=lambda a: len(a.get_text(strip=True)))
-        title = " ".join(title_link.get_text(" ", strip=True).split())
-        if not title or "ŞİRKET HABERLERİ" in title.upper():
-            continue
-        codes = []
-        for el in li.find_all(["a", "span", "div"]):
-            for m in TICKER_RE.findall(el.get_text(strip=True)):
-                n = normalize_ticker(m)
-                if 3 <= len(n) <= 5 and n.isupper():
-                    codes.append(n)
-        codes = list(dict.fromkeys(codes))
-        if codes:
-            fallback.append({"title": title, "ticker": codes[0]})
-    print(f">> fallback rows: {len(fallback)}")
-    return fallback
-
-# ---------- TWITTER ----------
-
+# ---------- Twitter ----------
 def twitter_client():
     api_key = os.getenv("API_KEY")
     api_secret = os.getenv("API_KEY_SECRET")
@@ -208,9 +130,44 @@ def twitter_client():
 
 def main():
     print(">> start (Foreks BIST Şirketleri)")
-    rows = extract_rows_resilient()
-    print(f">> parsed rows: {len(rows)}")
 
+    # 1) AMP dene
+    try:
+        amp_html = http_get(AMP_URL)
+        print(f">> fetched AMP html: {len(amp_html)} bytes")
+        rows = extract_rows_from_html(amp_html)
+        if rows:
+            print(f">> amp rows: {len(rows)}")
+        else:
+            print(">> amp gave 0 rows")
+    except Exception as e:
+        print("!! amp error:", e)
+        rows = []
+
+    # 2) Normal sayfa
+    if not rows:
+        try:
+            norm_html = http_get(BASE_URL)
+            print(f">> fetched normal html: {len(norm_html)} bytes")
+            rows = extract_rows_from_html(norm_html)
+            print(f">> normal rows: {len(rows)}")
+        except Exception as e:
+            print("!! normal error:", e)
+            rows = []
+
+    # 3) Render (Playwright)
+    if not rows:
+        print(">> trying Playwright rendered DOM…")
+        try:
+            rend_html = fetch_rendered_with_playwright(BASE_URL)
+            print(f">> fetched rendered html: {len(rend_html)} bytes")
+            rows = extract_rows_from_html(rend_html)
+            print(f">> rendered rows: {len(rows)}")
+        except Exception as e:
+            print("!! render error:", e)
+            rows = []
+
+    print(f">> parsed rows: {len(rows)}")
     if not rows:
         print(">> no eligible rows")
         return
@@ -219,7 +176,6 @@ def main():
     api = twitter_client()
     posted_any = False
 
-    # Eski → yeni sırasıyla atmak istersen: rows = rows[::-1]
     for r in rows:
         tweet = compose_tweet(r["ticker"], r["title"])
         uid = sha24(tweet)
