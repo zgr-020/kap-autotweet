@@ -31,106 +31,83 @@ def save_state():
 AKIS_URL = "https://fintables.com/borsa-haber-akisi?tab=featured"
 UPPER_TR = "A-ZÇĞİÖŞÜ"
 TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}[0-9]?$")
+
 NON_NEWS = re.compile(r"(Fintables|G[üu]nl[üu]k\s*B[üu]lten|Bültenler?)", re.I)
 
 def clean_text(t: str) -> str:
     if not t: return ""
     t = re.sub(r"\s+", " ", t).strip()
+    # kaynak kırpıntıları ve zaman kırp
     t = re.sub(r"\b(Fintables|KAP)\b\s*[·\.]?\s*", "", t, flags=re.I)
     t = re.sub(r"\b(Dün\s+\d{1,2}:\d{2}|\d{1,2}:\d{2}|Bugün|Az önce)\b", "", t, flags=re.I)
-    t = re.sub(r"\s+", " ", t).strip(" -–—:|•·")
-    return t
+    return t.strip(" -–—:|•·")
 
 def build_tweet(code: str, detail: str) -> str:
     base = clean_text(detail)
     if len(base) > 240: base = base[:240].rstrip() + "…"
     return (f"📰 #{code} | {base}")[:279]
 
-def infinite_scroll(page, steps=6, pause_ms=300):
+def infinite_scroll(page, steps=6, pause_ms=250):
     for _ in range(steps):
-        page.mouse.wheel(0, 1800)
+        page.mouse.wheel(0, 1600)
         page.wait_for_timeout(pause_ms)
 
-# ---------- 1) Network (yalnızca featured) ----------
-def extract_from_string(s: str):
-    if NON_NEWS.search(s): return None
-    m = re.search(r"\bKAP\s*[-–]\s*([A-ZÇĞİÖŞÜ]{3,6}[0-9]?)\b", s)
-    if not m: return None
-    code = m.group(1).upper()
-    if not TICKER_RE.fullmatch(code): return None
-    after = re.split(rf"KAP\s*[-–]\s*{re.escape(code)}\s*", s, flags=re.I, maxsplit=1)
-    detail = clean_text(after[1] if len(after) == 2 else s)
-    if len(detail) < 8: return None
-    return {"id": f"{code}-{hash(s)}", "code": code, "snippet": detail}
-
-def walk_json(x, bag):
-    if isinstance(x, dict):
-        for v in x.values(): walk_json(v, bag)
-    elif isinstance(x, list):
-        for v in x: walk_json(v, bag)
-    elif isinstance(x, str):
-        if "KAP" in x: bag.append(re.sub(r"\s+", " ", x).strip())
-
-def fetch_via_network(page):
-    captured = []
-    def on_response(resp):
-        url = (resp.url or "").lower()
-        # <<< SADECE ÖNE ÇIKANLAR >>>
-        if "topic-feed" not in url: 
-            return
-        if "featured" not in url and "topic_tab=featured" not in url and "tab=featured" not in url:
-            return
-
-        try:
-            ctype = resp.headers.get("content-type","").lower()
-            if "json" in ctype:
-                data = resp.json(); tmp = []; walk_json(data, tmp); captured.extend(tmp)
-            else:
-                txt = resp.text(); 
-                if txt: captured.extend(txt.splitlines())
-        except Exception:
-            pass
-    page.on("response", on_response)
-
+def ensure_featured(page):
+    """
+    ?tab=featured ile açıyoruz; yine de seçilmezse 'Öne çıkanlar' butonuna tıkla.
+    """
     page.goto(AKIS_URL, wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
-    infinite_scroll(page, 6, 300)
+    # zaten featured ise buton aria-selected/aria-pressed olabilir; yine de tıklayıp garantile
+    for sel in [
+        "button:has-text('Öne çıkanlar')",
+        "role=button[name='Öne çıkanlar']",
+        "xpath=//button[contains(normalize-space(.),'Öne çıkanlar')]",
+    ]:
+        try:
+            loc = page.locator(sel).first
+            if loc and loc.count() > 0:
+                loc.click(timeout=1500)
+                page.wait_for_load_state("networkidle")
+                page.wait_for_timeout(200)
+                break
+        except Exception:
+            pass
 
-    items = []
-    for s in captured:
-        it = extract_from_string(s)
-        if it: items.append(it)
-
-    uniq, seen = [], set()
-    for it in items:
-        k = (it["code"], it["snippet"])
-        if k in seen: continue
-        seen.add(k); uniq.append(it)
-    return uniq
-
-# ---------- 2) DOM fallback (featured sayfada) ----------
+# ---------- YALNIZ DOM: Aynı satırda KAP + Kod + Detay ----------
 DOM_JS = r"""
 (() => {
   const norm = s => (s||"").replace(/\u00A0/g,' ').replace(/\s+/g,' ').trim();
-  const rows = Array.from(document.querySelectorAll("li, div"));
-  const out = [];
-  for (const r of rows) {
-    const kap = r.querySelector("div.text-utility-02.text-fg-03");
-    const codeEl = r.querySelector("span.text-shared-brand-01");
-    if (!kap || !codeEl) continue;
-    if (norm(kap.textContent) !== "KAP") continue;
 
+  // Bir node için kapsayıcı satırı bul (li yoksa en yakın div)
+  const containerOf = el => el.closest("li") || el.closest("div");
+
+  const kapTags = Array.from(document.querySelectorAll("div.text-utility-02.text-fg-03"))
+                        .filter(el => norm(el.textContent) === "KAP");
+
+  const out = [];
+  for (const kap of kapTags) {
+    const row = containerOf(kap);
+    if (!row) continue;
+
+    const codeEl = row.querySelector("span.text-shared-brand-01");
+    if (!codeEl) continue;
     const code = norm(codeEl.textContent).toUpperCase();
     if (!/^[A-ZÇĞİÖŞÜ]{3,6}[0-9]?$/.test(code)) continue;
 
-    const d = r.querySelector("div.font-medium.text-body-sm");
+    const d = row.querySelector("div.font-medium.text-body-sm");
     if (!d) continue;
+    // sadece text node'ları al (button/svg hariç)
     const detail = norm(Array.from(d.childNodes)
       .filter(n => n.nodeType === Node.TEXT_NODE)
       .map(n => n.textContent).join(" "));
+
     if (!detail || /Fintables|G[üu]nl[üu]k\s*B[üu]lten|Bültenler?/i.test(detail)) continue;
-    out.push({ code, detail });
+
+    out.push({ code, detail, rowIndex: out.length }); // görünüm sırasını koru
   }
+
+  // uniq (code|detail) ve orijinal sıra
   const seen = new Set();
   return out.filter(it => {
     const k = it.code + "|" + it.detail;
@@ -140,10 +117,9 @@ DOM_JS = r"""
 })()
 """
 
-def fetch_via_dom(page):
-    page.goto(AKIS_URL, wait_until="domcontentloaded")
-    page.wait_for_load_state("networkidle")
-    infinite_scroll(page, 6, 300)
+def fetch_featured_dom(page):
+    ensure_featured(page)
+    infinite_scroll(page, 6, 250)
     try:
         raw = page.evaluate(DOM_JS)
     except Exception:
@@ -154,12 +130,13 @@ def fetch_via_dom(page):
         if not TICKER_RE.fullmatch(code): continue
         detail = clean_text(it["detail"])
         if len(detail) < 8: continue
-        items.append({"id": f"{code}-{hash(code+'|'+detail)}", "code": code, "snippet": detail})
-    return items
+        rid = f"{code}-{hash(code+'|'+detail)}"
+        items.append({"id": rid, "code": code, "snippet": detail})
+    return items  # ekrandaki yeni→eski sıra
 
 # ===== MAIN =====
 def main():
-    print(">> start (featured-only)")
+    print(">> start (featured DOM only)")
     tw = twitter_client()
 
     with sync_playwright() as p:
@@ -176,18 +153,17 @@ def main():
         ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
         page = ctx.new_page(); page.set_default_timeout(30000)
 
-        items = fetch_via_network(page)
-        if not items:
-            items = fetch_via_dom(page)
-
+        items = fetch_featured_dom(page)
         if not items:
             print(">> no eligible rows"); browser.close(); return
 
+        # state filtresi
         new_items = [it for it in items if it["id"] not in posted]
         if not new_items:
             print(">> nothing new to post"); browser.close(); return
 
-        new_items.reverse()  # eskiden → yeniye
+        # Eskiden → yeniye (ekranda üstteki en yeni; eskileri önce atalım)
+        new_items.reverse()
 
         sent = 0
         for it in new_items:
