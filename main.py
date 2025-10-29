@@ -1,322 +1,407 @@
 # main.py
-import os, re, json, time, hashlib
+import os
+import re
+import json
+import time
+import logging
 from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional, List
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Optional, Set
 
 from playwright.sync_api import sync_playwright
 import tweepy
+from tweepy import TooManyRequests, TweepyException
 
 # ===================== CONFIG =====================
+@dataclass
+class Config:
+    api_key: Optional[str] = None
+    api_key_secret: Optional[str] = None
+    access_token: Optional[str] = None
+    access_token_secret: Optional[str] = None
+    max_per_run: int = 5
+    cooldown_minutes: int = 15
+    request_timeout: int = 30000
+    browser_headless: bool = True
+
+    @classmethod
+    def from_env(cls):
+        return cls(
+            api_key=os.getenv("API_KEY"),
+            api_key_secret=os.getenv("API_KEY_SECRET"),
+            access_token=os.getenv("ACCESS_TOKEN"),
+            access_token_secret=os.getenv("ACCESS_TOKEN_SECRET"),
+        )
+
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
-MAX_PER_RUN = 5
-REQUEST_TIMEOUT = 30000  # ms
-COOLDOWN_MIN = 15        # 429 sonrası bekleme
-STATE_PATH = Path("state.json")
 
-# X (Twitter) secrets (repo secrets)
-API_KEY = os.getenv("API_KEY")
-API_KEY_SECRET = os.getenv("API_KEY_SECRET")
-ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
-ACCESS_TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET")
-
-# ===================== LOG =====================
-def log(msg: str):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+# Kodu olmayan/olmaması gereken kelimeler
+BANNED_CODES = {
+    "AKIS","ILE","DUN","BUGUN","YER","SAHIP","ORTAKLARINDAN",
+    "FINTABLES","BULTEN","GUNLUK","ANALIST","NOTLARI","YAYINDA",
+    "DAYANIKLI","TUKETIM","URUNLERI","PIYASA","RAPOR","SEKTOR","HABERLER",
+    "INFO"
+}
 
 # ===================== STATE =====================
-def load_state() -> Dict:
-    if not STATE_PATH.exists():
-        return {"last_id": None, "posted": [], "cooldown_until": None}
-    try:
-        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        if isinstance(data, list):  # eski biçim
-            data = {"last_id": None, "posted": data, "cooldown_until": None}
-        data.setdefault("last_id", None)
-        data.setdefault("posted", [])
-        data.setdefault("cooldown_until", None)
-        return data
-    except Exception:
-        return {"last_id": None, "posted": [], "cooldown_until": None}
+class StateManager:
+    def __init__(self, path: Path = Path("state.json")):
+        self.path = path
+        self._state = self._load_initial_state()
 
-def save_state(st: Dict):
-    STATE_PATH.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
+    def _load_initial_state(self) -> dict:
+        default_state = {
+            "last_id": None,
+            "posted": [],
+            "cooldown_until": None,
+            "last_run": None,
+        }
+        if not self.path.exists():
+            return default_state
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return {"last_id": None, "posted": data, "cooldown_until": None}
+            return {**default_state, **data}
+        except Exception:
+            return default_state
 
-state = load_state()
-posted: Set[str] = set(state.get("posted", []))
-last_id: Optional[str] = state.get("last_id")
+    def save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(self._state, f, ensure_ascii=False, indent=2)
+
+    def is_posted(self, item_id: str) -> bool:
+        return item_id in self._state["posted"]
+
+    def mark_posted(self, item_id: str):
+        if not self.is_posted(item_id):
+            self._state["posted"].append(item_id)
+
+    def set_cooldown(self, minutes: int):
+        self._state["cooldown_until"] = (
+            datetime.now(timezone.utc) + timedelta(minutes=minutes)
+        ).isoformat()
+
+    def is_in_cooldown(self) -> bool:
+        cu = self._state.get("cooldown_until")
+        if not cu:
+            return False
+        try:
+            dt_ = datetime.fromisoformat(cu.replace("Z", "+00:00"))
+            return datetime.now(timezone.utc) < dt_
+        except Exception:
+            self._state["cooldown_until"] = None
+            return False
+
+    @property
+    def last_id(self) -> Optional[str]:
+        return self._state["last_id"]
+
+    @last_id.setter
+    def last_id(self, v: Optional[str]):
+        self._state["last_id"] = v
+
+# ===================== LOG =====================
+def setup_logging():
+    logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
+
+def log(msg: str, level: str = "info"):
+    getattr(logging, level.lower())(msg)
 
 # ===================== TWITTER =====================
-def twitter_client() -> Optional[tweepy.Client]:
-    if not all([API_KEY, API_KEY_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET]):
-        log("!! Twitter secrets missing → simulation mode (tweet atılmaz)")
+def twitter_client(config: Config) -> Optional[tweepy.Client]:
+    if not all([config.api_key, config.api_key_secret, config.access_token, config.access_token_secret]):
+        log("Twitter secrets missing, tweeting disabled", "warning")
         return None
     try:
         return tweepy.Client(
-            consumer_key=API_KEY,
-            consumer_secret=API_KEY_SECRET,
-            access_token=ACCESS_TOKEN,
-            access_token_secret=ACCESS_TOKEN_SECRET,
+            consumer_key=config.api_key,
+            consumer_secret=config.api_key_secret,
+            access_token=config.access_token,
+            access_token_secret=config.access_token_secret,
         )
     except Exception as e:
-        log(f"!! Twitter client init failed: {e} → simulation mode")
+        log(f"Twitter client init failed: {e}", "error")
         return None
 
-# ===================== UTIL =====================
-TR_UPPER = "A-ZÇĞİÖŞÜ"
-CODE_RE = re.compile(rf"^[{TR_UPPER}]{{3,5}}[0-9]?$")
-BAN_WORDS = {
-    # kod değil, sık gelen kelimeler
-    "KAP","FINTABLES","FINtables","BULTEN","GUNLUK","GÜNLÜK","BÜLTEN",
-    "ADET","TL","MİLYON","MILYON","YUZDE","YÜZDE","PAY","HISSE","ŞIRKET","ŞİRKET",
-    "YER","YURT","DUN","BUGUN","BUGÜN","YARIN","GUN","GÜN","SAAT","UYESI","ÜYESI","ÜYESİ",
-    # ay/gün
-    "OCAK","SUBAT","ŞUBAT","MART","NISAN","NİSAN","MAYIS","HAZIRAN","TEMMUZ",
-    "AGUSTOS","AĞUSTOS","EYLUL","EYLÜL","EKIM","EKİM","KASIM","ARALIK",
-}
+def send_tweet(client: Optional[tweepy.Client], tweet_text: str) -> bool:
+    if not client:
+        log(f"SIMULATION: {tweet_text}")
+        return True
+    try:
+        client.create_tweet(text=tweet_text)
+        log("Tweet sent")
+        return True
+    except TooManyRequests:
+        log("Rate limit exceeded", "warning")
+        raise
+    except TweepyException as e:
+        log(f"Twitter error: {e}", "error")
+        return False
+    except Exception as e:
+        log(f"Tweet error: {e}", "error")
+        return False
 
-def normalize_code(s: str) -> str:
-    return (s or "").upper().replace("İ","I").replace("Ş","S").replace("Ğ","G").replace("Ç","C").replace("Ö","O").replace("Ü","U")
-
-def build_tweet(codes: List[str], content: str) -> str:
-    codes_str = " ".join([f"#{c}" for c in codes])
-    t = re.sub(r"\s+", " ", content or "").strip()
-
-    # gereksiz önek/ekleri temizle
-    t = re.sub(r"^\s*(Şirket|Sirket)\s*", "", t, flags=re.I)
-    # saat/tarih, 'Dün', 'Bugün' vb. temizle
-    t = re.sub(r"\b(?:Dün|Bugün|Yesterday|Today)\b.*?$", "", t, flags=re.I)
-    t = re.sub(r"\b\d{1,2}:\d{2}\b", "", t)
-
-    # ilk cümleyi al, çok kısaysa genişlet
-    parts = re.split(r"(?<=[\.\!\?])\s+", t)
-    sentence = parts[0].strip() if parts and parts[0].strip() else t
-    if len(sentence) < 40 and len(parts) > 1:
-        sentence = (sentence + " " + parts[1]).strip()
-    if not sentence.endswith((".", "!", "?")):
-        sentence += "."
-
-    # 279 sınırı
-    base = f"📰 {codes_str} | {sentence}"
-    if len(base) <= 279:
-        return base
-    cut = 279 - len(f"📰 {codes_str} | ...")
-    sentence = sentence[:cut].rsplit(" ", 1)[0] + "..."
-    return f"📰 {codes_str} | {sentence}"
-
-# ===================== JS EXTRACTOR =====================
-JS = """
+# ===================== EXTRACTOR (DOM) =====================
+JS_EXTRACTOR_DOM = """
 () => {
-  // 'Öne çıkanlar' tabındaki satırlardan KAP haberlerini döndür.
-  const isVisible = el => !!(el && el.offsetParent !== null);
-  const rows = Array.from(document.querySelectorAll('main li, main [role="listitem"], main article, main div'))
-    .filter(isVisible)
-    .slice(0, 400);
+  try {
+    const items = [];
+    const rows = Array.from(document.querySelectorAll('main li, main article, main div'))
+      .filter(el => /\\bKAP\\b\\s*[•·\\-\\.]/i.test(el.innerText || ''));
 
-  const items = [];
-  for (const row of rows) {
-    const text = (row.innerText || '').replace(/\\s+/g, ' ').trim();
-    if (!text) continue;
+    const banned = new Set([
+      "AKIS","ILE","DUN","BUGUN","YER","SAHIP","ORTAKLARINDAN",
+      "FINTABLES","BULTEN","GUNLUK","ANALIST","NOTLARI","YAYINDA",
+      "DAYANIKLI","TUKETIM","URUNLERI","PIYASA","RAPOR","SEKTOR","HABERLER","INFO"
+    ]);
+    const isCodeLike = (t) => /^[A-ZÇĞİÖŞÜ]{3,5}$/.test(t) && !banned.has(t);
 
-    // Fintables analizi vs. hariç
-    if (/^\\s*Fintables\\b/i.test(text)) continue;
+    for (const row of rows) {
+      const text = (row.innerText || '').replace(/\\s+/g,' ').trim();
 
-    // 'KAP' içermeyenler hariç
-    if (!/\\bKAP\\b/i.test(text)) continue;
+      let codes = Array.from(row.querySelectorAll('a'))
+        .map(a => (a.textContent || '').trim().toUpperCase())
+        .filter(isCodeLike);
 
-    // satırdaki muhtemel "rozet" / tag alanlarından kod topla
-    const tags = Array.from(row.querySelectorAll('a, span, div, button'))
-      .map(el => (el.innerText || '').trim())
-      .filter(Boolean);
+      if (codes.length === 0) {
+        const head = text.split(/[|–—-]/)[0];
+        const toks = head.replace(/.*\\bKAP\\b\\s*[•·\\-\\.]/i,'')
+                         .trim()
+                         .split(/[\\s\\/]+/)
+                         .map(t => t.toUpperCase());
+        codes = toks.filter(isCodeLike).slice(0, 2);
+      }
+      if (!codes.length) continue;
 
-    let codes = [];
-    for (const tag of tags) {
-      const t = tag.toUpperCase().replace('İ','I').replace('Ş','S').replace('Ğ','G').replace('Ç','C').replace('Ö','O').replace('Ü','U');
-      // TERA/BVSAN gibi ikili yazımlar
-      const parts = t.split(/[\\/\\s]+/).filter(Boolean);
-      for (const p of parts) {
-        if (/^[A-Z]{3,5}[0-9]?$/.test(p)) codes.push(p);
+      const last = codes[codes.length - 1];
+      const start = text.toUpperCase().indexOf(last) + last.length;
+      let content = text.slice(start).trim();
+      content = content
+        .replace(/^[:\\-–—\\|\\.]\\s*/,'')
+        .replace(/\\b(Dün|Bugün)\\b.*$/i,'')
+        .replace(/\\b\\d{1,2}:\\d{2}\\b.*$/,'')
+        .trim();
+
+      if (!content || content.length < 30) continue;
+      if (/yatırım tavsiyesi|yasal uyarı|kişisel veri|kvk/i.test(content)) continue;
+
+      const hash = (text.split('').reduce((a,c)=>(a*31 + c.charCodeAt(0))>>>0,0)).toString(16);
+      const id = `kap-${codes.join('-')}-${hash}`;
+
+      if (!items.find(x => x.id === id)) {
+        items.push({ id, codes, content, raw: text });
       }
     }
-    // benzersiz sırayla
-    const uniq = [];
-    for (const c of codes) if (!uniq.includes(c)) uniq.push(c);
-
-    // içerik: satır metni, ama baştaki KAP ve kod rozetleri atılacak
-    let content = text;
-    content = content.replace(/^\\s*KAP\\b\\s*[•·\\-\\.]?\\s*/i, '');
-    for (const c of uniq) {
-      const r = new RegExp('^\\s*' + c + '\\b\\s*', 'i');
-      content = content.replace(r, '');
-    }
-    content = content.trim();
-
-    // sağdaki saat/tarih ID için kullanılabilir
-    let timeMatch = text.match(/\\b(?:Dün|Bugün)\\s*\\d{1,2}:\\d{2}\\b|\\b\\d{1,2}:\\d{2}\\b/);
-    const timeStr = timeMatch ? timeMatch[0] : '';
-
-    // benzersiz id
-    const h = (s) => {
-      let x = 0; for (let i=0;i<s.length;i++) x = (x*31 + s.charCodeAt(i)) >>> 0; return x.toString(16);
-    };
-    const id = (uniq[0] || 'KAP') + '-' + h(text + timeStr);
-
-    if (content && uniq.length > 0) {
-      items.push({ id, codes: uniq.slice(0,2), content });
-    }
-  }
-  return items;
+    return items;
+  } catch(e) { console.error(e); return []; }
 }
 """
 
-# ===================== SCRAPE & TWEET =====================
-def scrape_items() -> List[Dict]:
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-gpu"]
+# ===================== CONTENT =====================
+def extract_clean_content(text: str) -> str:
+    if not text:
+        return ""
+    sentences = re.split(r"[.!?]+", text)
+    if sentences and sentences[0].strip():
+        s0 = sentences[0].strip()
+        if len(s0) < 40 and len(sentences) > 1:
+            combined = (s0 + ". " + sentences[1].strip()).strip()
+            if not combined.endswith("."):
+                combined += "."
+            return combined
+        if not s0.endswith("."):
+            s0 += "."
+        return s0
+    return text.strip()
+
+def build_tweet_quanta_style(codes: List[str], content: str) -> str:
+    if not codes:
+        return ""
+    codes_str = " ".join([f"#{c}" for c in codes])
+    clean = extract_clean_content(content)
+    if not clean:
+        return ""
+    base = f"📰 {codes_str} | {clean}"
+    if len(base) <= 280:
+        return base
+    max_len = 280 - len(f"📰 {codes_str} | ") - 3
+    shortened = clean[:max_len]
+    sp = shortened.rfind(" ")
+    if sp > max_len * 0.7:
+        shortened = shortened[:sp]
+    return f"📰 {codes_str} | {shortened}..."
+
+def is_valid_news_content(text: str) -> bool:
+    if not text or len(text) < 30:
+        return False
+    tl = text.lower()
+    for p in ["yatırım tavsiyesi değildir", "yasal uyarı", "kişisel veri", "kvk", "saygılarımızla", "kamunun bilgisine"]:
+        if p in tl:
+            return False
+    return True
+
+# ===================== BROWSER =====================
+class BrowserManager:
+    def __init__(self, config: Config):
+        self.config = config
+
+    def __enter__(self):
+        self.pw = sync_playwright().start()
+        self.browser = self.pw.chromium.launch(
+            headless=self.config.browser_headless,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
         )
-        ctx = browser.new_context(
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/118.0.0.0 Safari/537.36"),
+        self.ctx = self.browser.new_context(
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"),
             locale="tr-TR",
             timezone_id="Europe/Istanbul",
-            viewport={"width": 1440, "height": 900}
+            viewport={"width": 1920, "height": 1080},
         )
-        page = ctx.new_page()
-        page.set_default_timeout(REQUEST_TIMEOUT)
+        self.page = self.ctx.new_page()
+        self.page.set_default_timeout(self.config.request_timeout)
+        return self
 
-        log("goto…")
-        page.goto(AKIS_URL, wait_until="domcontentloaded")
-        page.wait_for_selector("main", timeout=REQUEST_TIMEOUT)
-        # 'Öne çıkanlar'
-        for sel in [
-            "button:has-text('Öne çıkanlar')",
-            "[role='tab']:has-text('Öne çıkanlar')",
-            "a:has-text('Öne çıkanlar')",
-            "text=Öne çıkanlar",
-        ]:
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self.ctx.close()
+        finally:
             try:
-                if page.locator(sel).first.is_visible():
-                    page.click(sel)
-                    page.wait_for_timeout(800)
-                    log("highlights ON")
-                    break
-            except:
-                pass
+                self.browser.close()
+            finally:
+                self.pw.stop()
 
-        page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(800)
+    def goto_with_retry(self, url: str, retries: int = 3) -> bool:
+        for i in range(retries):
+            try:
+                log(f"Navigation attempt {i+1}/{retries}")
+                self.page.goto(url, wait_until="networkidle")
+                self.page.wait_for_timeout(1200)
+                return True
+            except Exception as e:
+                log(f"Attempt {i+1} failed: {e}", "warning")
+                if i < retries - 1:
+                    time.sleep(5)
+        return False
 
+    def click_highlights_tab(self) -> bool:
+        sels = [
+            "button:has-text('Öne Çıkanlar')",
+            "a:has-text('Öne Çıkanlar')",
+            "div:has-text('Öne Çıkanlar')",
+            "text=Öne Çıkanlar",
+        ]
+        for s in sels:
+            try:
+                if self.page.locator(s).is_visible(timeout=2000):
+                    self.page.click(s)
+                    self.page.wait_for_timeout(1000)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def extract_simple_items(self) -> List[dict]:
         try:
-            items = page.evaluate(JS)
+            log("Using DOM extractor (KAP + blue codes)…")
+            self.page.evaluate("window.scrollTo(0, 400)")
+            self.page.wait_for_timeout(1200)
+            items = self.page.evaluate(JS_EXTRACTOR_DOM)
+            log(f"DOM extractor found {len(items)} items")
+            return items
         except Exception as e:
-            log(f"!! JS eval failed: {e}")
-            items = []
+            log(f"DOM extraction failed: {e}", "error")
+            return []
 
-        browser.close()
-        return items
-
-def filter_codes(codes: List[str]) -> List[str]:
-    out = []
-    for c in codes:
-        cc = normalize_code(c)
-        if cc in BAN_WORDS: 
-            continue
-        if CODE_RE.fullmatch(cc):
-            out.append(cc)
-    # benzersiz ve en fazla 2
-    seen = set()
-    res = []
-    for c in out:
-        if c not in seen:
-            seen.add(c); res.append(c)
-    return res[:2]
-
-def main():
-    log("start")
-
-    # cooldown kontrol
-    if state.get("cooldown_until"):
-        try:
-            cd = datetime.fromisoformat(state["cooldown_until"].replace("Z", "+00:00"))
-            if datetime.now(timezone.utc) < cd:
-                log(f"cooldown active → exits until {cd.isoformat()}")
-                return
-        except Exception:
-            state["cooldown_until"] = None
-
-    items = scrape_items()
-    log(f"extracted: {len(items)}")
-
-    if not items:
-        log("no items")
-        return
-
-    # en yeni ilk olsun
-    newest_id = items[0]["id"]
-
-    # son çalışma sonrası yeni gelenleri sırala
-    to_tweet = []
-    for it in items:
-        if last_id and it["id"] == last_id:
-            break
-        to_tweet.append(it)
-
-    if not to_tweet:
-        state["last_id"] = newest_id
-        save_state(state)
-        log("no new items")
-        return
-
-    # en eskiden yeniye
-    to_tweet = to_tweet[:MAX_PER_RUN]
-    to_tweet.reverse()
-
-    tw = twitter_client()
+# ===================== PROCESS =====================
+def process_new_items(items: List[dict], state: StateManager, config: Config,
+                      tw_client: Optional[tweepy.Client]) -> int:
     sent = 0
-
-    for it in to_tweet:
-        if it["id"] in posted:
+    for it in items:
+        if sent >= config.max_per_run:
+            break
+        if state.is_posted(it["id"]):
+            continue
+        if not is_valid_news_content(it["content"]):
             continue
 
-        codes = filter_codes(it.get("codes", []))
-        if not codes:
-            log("skip: no valid codes")
+        tweet = build_tweet_quanta_style(it["codes"], it["content"])
+        if not tweet:
             continue
 
-        tweet = build_tweet(codes, it.get("content",""))
-        log(f"TWEET → {tweet}")
-
+        log(f"Tweeting: {tweet}")
         try:
-            if tw:
-                tw.create_tweet(text=tweet)
-            posted.add(it["id"]); sent += 1
-            state["posted"] = sorted(list(posted))
-            state["last_id"] = newest_id
-            save_state(state)
-            time.sleep(3)  # güvenli aralık
+            ok = send_tweet(tw_client, tweet)
+            if ok:
+                state.mark_posted(it["id"])
+                sent += 1
+                if sent < config.max_per_run and tw_client:
+                    time.sleep(2)
+        except TooManyRequests:
+            state.set_cooldown(config.cooldown_minutes)
+            log(f"Cooldown activated for {config.cooldown_minutes} minutes")
+            break
         except Exception as e:
-            msg = str(e)
-            log(f"tweet error: {msg}")
-            if "429" in msg or "Too Many Requests" in msg:
-                cd = (datetime.now(timezone.utc) + timedelta(minutes=COOLDOWN_MIN)).isoformat()
-                state["cooldown_until"] = cd
-                save_state(state)
-                log(f"cooldown set for {COOLDOWN_MIN} minutes")
-                break
+            log(f"Error while tweeting: {e}", "warning")
+            continue
+    return sent
 
-    # son görülen id’yi güncelle
-    state["last_id"] = newest_id
-    save_state(state)
-    log(f"done (sent: {sent})")
+# ===================== MAIN =====================
+def main():
+    setup_logging()
+    log("Starting...")
+
+    config = Config.from_env()
+    state = StateManager()
+    twitter = twitter_client(config)
+
+    if state.is_in_cooldown():
+        log("In cooldown, exiting")
+        return
+
+    try:
+        with BrowserManager(config) as br:
+            if not br.goto_with_retry(AKIS_URL):
+                log("Page load failed")
+                return
+
+            br.click_highlights_tab()
+            br.page.wait_for_timeout(1200)
+
+            items = br.extract_simple_items()
+            if not items:
+                log("No items found")
+                return
+
+            # last_id mantığı: en üstteki en yeni
+            if state.last_id:
+                # state.last_id görülene kadar al
+                new_items = []
+                for it in items:
+                    if it["id"] == state.last_id:
+                        break
+                    new_items.append(it)
+            else:
+                new_items = items
+
+            if not new_items:
+                log("No new items")
+                return
+
+            # Eskiden yeniye
+            new_items = new_items[::-1]
+            sent_count = process_new_items(new_items[:config.max_per_run], state, config, twitter)
+
+            # son çalıştırmada gördüğümüz en yeni id
+            state.last_id = items[0]["id"]
+            state.save()
+            log(f"Done. Sent {sent_count} tweets")
+    except Exception as e:
+        log(f"Fatal error: {e}", "error")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        import traceback
-        log("!! FATAL ERROR")
-        log(traceback.format_exc())
-        raise
+    main()
