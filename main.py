@@ -31,13 +31,13 @@ def save_state():
 AKIS_URL = "https://fintables.com/borsa-haber-akisi?tab=featured"
 UPPER_TR = "A-ZÇĞİÖŞÜ"
 TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}[0-9]?$")
-
 NON_NEWS = re.compile(r"(Fintables|G[üu]nl[üu]k\s*B[üu]lten|Bültenler?)", re.I)
 
 def clean_text(t: str) -> str:
     if not t: return ""
+    t = re.sub(r"\u00A0", " ", t)  # nbsp
     t = re.sub(r"\s+", " ", t).strip()
-    # kaynak kırpıntıları ve zaman kırp
+    # kaynak ve zaman kırp
     t = re.sub(r"\b(Fintables|KAP)\b\s*[·\.]?\s*", "", t, flags=re.I)
     t = re.sub(r"\b(Dün\s+\d{1,2}:\d{2}|\d{1,2}:\d{2}|Bugün|Az önce)\b", "", t, flags=re.I)
     return t.strip(" -–—:|•·")
@@ -53,12 +53,9 @@ def infinite_scroll(page, steps=6, pause_ms=250):
         page.wait_for_timeout(pause_ms)
 
 def ensure_featured(page):
-    """
-    ?tab=featured ile açıyoruz; yine de seçilmezse 'Öne çıkanlar' butonuna tıkla.
-    """
     page.goto(AKIS_URL, wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
-    # zaten featured ise buton aria-selected/aria-pressed olabilir; yine de tıklayıp garantile
+    # tıkla (aktif değilse de aktifleşsin)
     for sel in [
         "button:has-text('Öne çıkanlar')",
         "role=button[name='Öne çıkanlar']",
@@ -73,41 +70,54 @@ def ensure_featured(page):
                 break
         except Exception:
             pass
+    # içerik gelene kadar KAP etiketini bekle
+    try:
+        page.wait_for_selector("div.text-utility-02.text-fg-03", timeout=15000)
+    except Exception:
+        pass
 
-# ---------- YALNIZ DOM: Aynı satırda KAP + Kod + Detay ----------
+# ---------- DOM: Aynı blokta KAP + Kod + Detay (yukarı doğru arama) ----------
 DOM_JS = r"""
 (() => {
   const norm = s => (s||"").replace(/\u00A0/g,' ').replace(/\s+/g,' ').trim();
 
-  // Bir node için kapsayıcı satırı bul (li yoksa en yakın div)
-  const containerOf = el => el.closest("li") || el.closest("div");
+  // detaydan sadece text node'ları topla
+  const textOnly = el =>
+    Array.from(el.childNodes).filter(n => n.nodeType === Node.TEXT_NODE)
+      .map(n => n.textContent).join(' ');
 
-  const kapTags = Array.from(document.querySelectorAll("div.text-utility-02.text-fg-03"))
-                        .filter(el => norm(el.textContent) === "KAP");
+  // KAP etiketinden yukarı doğru çıkıp aynı blokta kod+detay arayan yardımcı
+  const findContainer = (el) => {
+    let node = el;
+    for (let i=0; i<6 && node; i++) {        // en fazla 6 seviye yukarı
+      const codeEl = node.querySelector("span.text-shared-brand-01");
+      const detailEl = node.querySelector("div.font-medium.text-body-sm");
+      if (codeEl && detailEl) return { node, codeEl, detailEl };
+      node = node.parentElement;
+    }
+    return null;
+  };
+
+  const kapTags = Array
+    .from(document.querySelectorAll("div.text-utility-02.text-fg-03"))
+    .filter(el => norm(el.textContent) === "KAP");
 
   const out = [];
   for (const kap of kapTags) {
-    const row = containerOf(kap);
-    if (!row) continue;
+    const pack = findContainer(kap);
+    if (!pack) continue;
 
-    const codeEl = row.querySelector("span.text-shared-brand-01");
-    if (!codeEl) continue;
-    const code = norm(codeEl.textContent).toUpperCase();
+    const code = norm(pack.codeEl.textContent).toUpperCase();
     if (!/^[A-ZÇĞİÖŞÜ]{3,6}[0-9]?$/.test(code)) continue;
 
-    const d = row.querySelector("div.font-medium.text-body-sm");
-    if (!d) continue;
-    // sadece text node'ları al (button/svg hariç)
-    const detail = norm(Array.from(d.childNodes)
-      .filter(n => n.nodeType === Node.TEXT_NODE)
-      .map(n => n.textContent).join(" "));
-
+    const rawDetail = textOnly(pack.detailEl);
+    const detail = norm(rawDetail);
     if (!detail || /Fintables|G[üu]nl[üu]k\s*B[üu]lten|Bültenler?/i.test(detail)) continue;
 
-    out.push({ code, detail, rowIndex: out.length }); // görünüm sırasını koru
+    out.push({ code, detail });
   }
 
-  // uniq (code|detail) ve orijinal sıra
+  // uniq ve görünüm sırasını koru
   const seen = new Set();
   return out.filter(it => {
     const k = it.code + "|" + it.detail;
@@ -136,7 +146,7 @@ def fetch_featured_dom(page):
 
 # ===== MAIN =====
 def main():
-    print(">> start (featured DOM only)")
+    print(">> start (featured DOM robust)")
     tw = twitter_client()
 
     with sync_playwright() as p:
@@ -157,12 +167,11 @@ def main():
         if not items:
             print(">> no eligible rows"); browser.close(); return
 
-        # state filtresi
         new_items = [it for it in items if it["id"] not in posted]
         if not new_items:
             print(">> nothing new to post"); browser.close(); return
 
-        # Eskiden → yeniye (ekranda üstteki en yeni; eskileri önce atalım)
+        # Eskiden → yeniye
         new_items.reverse()
 
         sent = 0
