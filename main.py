@@ -3,7 +3,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 import tweepy
 
-# ====== X (Twitter) anahtarları ======
+# -------- X (Twitter) secrets --------
 API_KEY = os.getenv("API_KEY")
 API_KEY_SECRET = os.getenv("API_KEY_SECRET")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
@@ -20,21 +20,20 @@ def twitter_client():
         access_token_secret=ACCESS_TOKEN_SECRET,
     )
 
-# ====== STATE (tekrar engelle) ======
+# -------- State (avoid duplicates) --------
 STATE_FILE = Path("state.json")
 posted = set(json.loads(STATE_FILE.read_text())) if STATE_FILE.exists() else set()
 def save_state():
-    keep = sorted(list(posted))[-5000:]
-    STATE_FILE.write_text(json.dumps(keep, ensure_ascii=False))
+    STATE_FILE.write_text(json.dumps(sorted(list(posted))[-5000:], ensure_ascii=False))
 
-# ====== Kaynak & yardımcılar ======
+# -------- Source & helpers --------
 FOREKS_URL = "https://www.foreks.com/analizler/piyasa-analizleri/sirket"
 UPPER_TR = "A-ZÇĞİÖŞÜ"
-TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}$")  # BIST kodu: 3–6 büyük harf
+TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}$")  # 3–6 harfli BIST kodu
 
 def clean_text(t: str) -> str:
     if not t: return ""
-    t = re.sub(r"\u00A0", " ", t)          # nbsp
+    t = re.sub(r"\u00A0", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t.strip(" -–—:|•·")
 
@@ -48,33 +47,49 @@ def infinite_scroll(page, steps=4, pause_ms=250):
         page.mouse.wheel(0, 1400)
         page.wait_for_timeout(pause_ms)
 
-# ====== DOM çıkarımı (aynı satırda SAĞDA kod + başlık) ======
+def dismiss_popups(page):
+    # Cookie / bildirim / reklam kapat
+    selectors = [
+        "button:has-text('Kabul')",
+        "button:has-text('Kabul Et')",
+        "button:has-text('Tamam')",
+        "button:has-text('Kapat')",
+        "text=Anladım"
+    ]
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            if el.count():
+                el.click(timeout=800)
+                page.wait_for_timeout(200)
+        except Exception:
+            pass
+
+# ---- DOM extraction: same row → rightmost ticker + headline ----
 DOM_JS = r"""
 (() => {
   const norm = s => (s||"").replace(/\u00A0/g,' ').replace(/\s+/g,' ').trim();
   const isTicker = s => /^[A-ZÇĞİÖŞÜ]{3,6}$/.test(s);
-  const rows = new Set();
 
-  // Satırlardaki başlık linklerini bul → satır konteynerını belirle
-  const links = Array.from(document.querySelectorAll('a[href*="/analizler/piyasa-analizleri/"]'));
-  for (const a of links) {
+  // Satırları topla (liste öğeleri / kartlar)
+  const rows = new Set();
+  for (const a of document.querySelectorAll('a[href*="/analizler/piyasa-analizleri/"]')) {
     const row = a.closest("li") || a.closest("article") || a.closest("div");
     if (row) rows.add(row);
   }
 
   const items = [];
   for (const row of rows) {
-    // Başlık metni (öncelik: link’in kendisi; değilse satır içindeki ilk anlamlı text)
+    // Başlık
     let titleEl = row.querySelector('a[href*="/analizler/piyasa-analizleri/"]');
     let detail = titleEl ? norm(titleEl.textContent) : "";
-
     if (!detail || detail.length < 6) {
       const candidate = Array.from(row.querySelectorAll("h1,h2,h3,div,span"))
         .map(el => norm(el.textContent)).find(t => t && t.length > 6);
       if (candidate) detail = candidate;
     }
 
-    // Kod adaylarını topla → en sağdaki kısa büyük harf etiketi
+    // Kod: satırdaki en SAĞDA görünen kısa büyük harf etiketi
     const cands = [];
     for (const el of row.querySelectorAll("a,span,div")) {
       const txt = norm(el.textContent).toUpperCase();
@@ -84,30 +99,28 @@ DOM_JS = r"""
       cands.push({ txt, x: r.right });
     }
     if (!cands.length) continue;
-    cands.sort((a,b) => b.x - a.x); // sağdaki ilk
+    cands.sort((a,b) => b.x - a.x);
     const code = cands[0].txt;
 
     if (!detail || detail.length < 6) continue;
     items.push({ code, detail });
   }
 
-  // uniq (code|detail) ve görünüm sırasını koru (üstten alta yeni→eski)
-  const seen = new Set();
-  const out = [];
+  // benzersiz
+  const seen = new Set(), out = [];
   for (const it of items) {
     const k = it.code + "|" + it.detail;
     if (seen.has(k)) continue;
-    seen.add(k);
-    out.push(it);
+    seen.add(k); out.push(it);
   }
-  return out;
+  return out; // sayfadaki görünüm sırası (yeni→eski)
 })()
 """
 
 def fetch_foreks_rows(page):
     page.goto(FOREKS_URL, wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
-    # Sekme zaten 'BIST Şirketleri', yine de bir miktar kaydır
+    dismiss_popups(page)
     infinite_scroll(page, 5, 250)
     try:
         raw = page.evaluate(DOM_JS)
@@ -123,9 +136,9 @@ def fetch_foreks_rows(page):
             continue
         rid = f"{code}-{hash(code+'|'+detail)}"
         items.append({"id": rid, "code": code, "snippet": detail})
-    return items  # ekrandaki yeni→eski
+    return items
 
-# ====== MAIN ======
+# -------- Main --------
 def main():
     print(">> start (Foreks BIST Şirketleri)")
     tw = twitter_client()
@@ -148,21 +161,21 @@ def main():
         if not items:
             print(">> no eligible rows"); browser.close(); return
 
-        # state filtresi (yeni düşenleri at)
+        # yeni olanları seç
         new_items = [it for it in items if it["id"] not in posted]
         if not new_items:
             print(">> nothing new to post"); browser.close(); return
 
-        # Eskiden → yeniye (timeline tutarlılığı için)
+        # Eskiden → yeniye gönder
         new_items.reverse()
 
         sent = 0
         for it in new_items:
-            text = build_tweet(it["code"], it["snippet"])
-            print(">> TWEET:", text)
+            tweet = build_tweet(it["code"], it["snippet"])
+            print(">> TWEET:", tweet)
             if tw:
                 try:
-                    tw.create_tweet(text=text)
+                    tw.create_tweet(text=tweet)
                     print(">> tweet sent ✓")
                 except Exception as e:
                     print("!! tweet error:", e); continue
