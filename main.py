@@ -3,7 +3,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 import tweepy
 
-# ===== X (Twitter) =====
+# ====== X (Twitter) anahtarları ======
 API_KEY = os.getenv("API_KEY")
 API_KEY_SECRET = os.getenv("API_KEY_SECRET")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
@@ -20,30 +20,22 @@ def twitter_client():
         access_token_secret=ACCESS_TOKEN_SECRET,
     )
 
-# ===== STATE =====
+# ====== STATE (tekrar engelle) ======
 STATE_FILE = Path("state.json")
 posted = set(json.loads(STATE_FILE.read_text())) if STATE_FILE.exists() else set()
 def save_state():
     keep = sorted(list(posted))[-5000:]
     STATE_FILE.write_text(json.dumps(keep, ensure_ascii=False))
 
-# ===== HELPERS =====
-AKIS_URL = "https://fintables.com/borsa-haber-akisi?tab=featured"
+# ====== Kaynak & yardımcılar ======
+FOREKS_URL = "https://www.foreks.com/analizler/piyasa-analizleri/sirket"
 UPPER_TR = "A-ZÇĞİÖŞÜ"
-TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}[0-9]?$")
-NON_NEWS = re.compile(r"(Fintables|G[üu]nl[üu]k\s*B[üu]lten|Bültenler?)", re.I)
-DEBUG = os.getenv("DEBUG", "1") == "1"
-
-TEXT_FIELDS = {"title","text","body","content","description","subtitle","summary","snippet","message","detail","headline"}
-KAP_FIELDS  = {"source","label","labels","tag","tags","topics","category","categories","section","sections"}
-SYM_FIELDS  = {"symbol","symbolCode","symbol_code","ticker","code","abbr","shortCode","short_code"}
+TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}$")  # BIST kodu: 3–6 büyük harf
 
 def clean_text(t: str) -> str:
     if not t: return ""
-    t = re.sub(r"\u00A0", " ", t)
+    t = re.sub(r"\u00A0", " ", t)          # nbsp
     t = re.sub(r"\s+", " ", t).strip()
-    t = re.sub(r"\b(Fintables|KAP)\b\s*[·\.]?\s*", "", t, flags=re.I)
-    t = re.sub(r"\b(Dün\s+\d{1,2}:\d{2}|\d{1,2}:\d{2}|Bugün|Az önce)\b", "", t, flags=re.I)
     return t.strip(" -–—:|•·")
 
 def build_tweet(code: str, detail: str) -> str:
@@ -51,146 +43,91 @@ def build_tweet(code: str, detail: str) -> str:
     if len(base) > 240: base = base[:240].rstrip() + "…"
     return (f"📰 #{code} | {base}")[:279]
 
-def infinite_scroll(page, steps=6, pause_ms=250):
+def infinite_scroll(page, steps=4, pause_ms=250):
     for _ in range(steps):
-        page.mouse.wheel(0, 1800)
+        page.mouse.wheel(0, 1400)
         page.wait_for_timeout(pause_ms)
 
-# ----- JSON yardımcıları -----
-def _iter_scalars(x):
-    if isinstance(x, dict):
-        for v in x.values(): yield from _iter_scalars(v)
-    elif isinstance(x, list):
-        for v in x: yield from _iter_scalars(v)
-    else:
-        yield x
+# ====== DOM çıkarımı (aynı satırda SAĞDA kod + başlık) ======
+DOM_JS = r"""
+(() => {
+  const norm = s => (s||"").replace(/\u00A0/g,' ').replace(/\s+/g,' ').trim();
+  const isTicker = s => /^[A-ZÇĞİÖŞÜ]{3,6}$/.test(s);
+  const rows = new Set();
 
-def _strings_in(x):
-    return [s for s in _iter_scalars(x) if isinstance(s, str)]
+  // Satırlardaki başlık linklerini bul → satır konteynerını belirle
+  const links = Array.from(document.querySelectorAll('a[href*="/analizler/piyasa-analizleri/"]'));
+  for (const a of links) {
+    const row = a.closest("li") || a.closest("article") || a.closest("div");
+    if (row) rows.add(row);
+  }
 
-def _any_kap(x) -> bool:
-    # Önce semantik alanlarda bak
-    if isinstance(x, dict):
-        for k, v in x.items():
-            lk = k.lower()
-            if lk in KAP_FIELDS:
-                if isinstance(v, str) and "kap" in v.lower(): return True
-                if isinstance(v, list) and any(isinstance(i,str) and "kap" in i.lower() for i in v): return True
-        # yoksa stringlerde ara
-    return any("kap" in s.lower() for s in _strings_in(x))
+  const items = [];
+  for (const row of rows) {
+    // Başlık metni (öncelik: link’in kendisi; değilse satır içindeki ilk anlamlı text)
+    let titleEl = row.querySelector('a[href*="/analizler/piyasa-analizleri/"]');
+    let detail = titleEl ? norm(titleEl.textContent) : "";
 
-def _best_symbol(x):
-    # Önce semantik alanlarda
-    if isinstance(x, dict):
-        for k, v in x.items():
-            lk = k.lower()
-            if lk in SYM_FIELDS:
-                if isinstance(v, str) and TICKER_RE.fullmatch(v.upper()): return v.upper()
-        for k, v in x.items():
-            if isinstance(v, dict):
-                s = _best_symbol(v)
-                if s: return s
-            if isinstance(v, list):
-                for i in v:
-                    s = _best_symbol(i)
-                    if s: return s
-    # Fallback: tüm stringlerde ara
-    for s in _strings_in(x):
-        m = re.findall(rf"\b([{UPPER_TR}]{{3,6}}[0-9]?)\b", s.upper())
-        for c in m:
-            if TICKER_RE.fullmatch(c) and c not in {"KAP","BULTEN","BÜLTEN"}:
-                return c
-    return None
+    if (!detail || detail.length < 6) {
+      const candidate = Array.from(row.querySelectorAll("h1,h2,h3,div,span"))
+        .map(el => norm(el.textContent)).find(t => t && t.length > 6);
+      if (candidate) detail = candidate;
+    }
 
-def _best_detail(x):
-    # Anlamsal alanlardan biri
-    if isinstance(x, dict):
-        for k, v in x.items():
-            if k.lower() in TEXT_FIELDS and isinstance(v, str) and len(v) > 6:
-                return v
-        for k, v in x.items():
-            if isinstance(v, dict):
-                d = _best_detail(v)
-                if d: return d
-            if isinstance(v, list):
-                for i in v:
-                    d = _best_detail(i)
-                    if d: return d
-    # Fallback: en uzun anlamlı string
-    cand = [s for s in _strings_in(x) if len(s) > 12]
-    cand.sort(key=len, reverse=True)
-    return cand[0] if cand else ""
+    // Kod adaylarını topla → en sağdaki kısa büyük harf etiketi
+    const cands = [];
+    for (const el of row.querySelectorAll("a,span,div")) {
+      const txt = norm(el.textContent).toUpperCase();
+      if (!txt || txt.length > 8) continue;
+      if (!isTicker(txt)) continue;
+      const r = el.getBoundingClientRect();
+      cands.push({ txt, x: r.right });
+    }
+    if (!cands.length) continue;
+    cands.sort((a,b) => b.x - a.x); // sağdaki ilk
+    const code = cands[0].txt;
 
-def parse_item(item):
-    if not _any_kap(item): 
-        return None
-    code = _best_symbol(item)
-    if not code: 
-        return None
-    detail = _best_detail(item)
-    if not detail or NON_NEWS.search(detail): 
-        return None
-    detail = clean_text(detail)
-    if len(detail) < 8: 
-        return None
-    return {"id": f"{code}-{hash(code+'|'+detail)}", "code": code, "snippet": detail}
+    if (!detail || detail.length < 6) continue;
+    items.push({ code, detail });
+  }
 
-def walk_items(x, sink):
-    if isinstance(x, dict):
-        # dene: tekil item olabilir
-        it = parse_item(x)
-        if it: sink.append(it)
-        for v in x.values(): walk_items(v, sink)
-    elif isinstance(x, list):
-        for v in x: walk_items(v, sink)
+  // uniq (code|detail) ve görünüm sırasını koru (üstten alta yeni→eski)
+  const seen = new Set();
+  const out = [];
+  for (const it of items) {
+    const k = it.code + "|" + it.detail;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(it);
+  }
+  return out;
+})()
+"""
 
-# ----- Featured feed dinleyici + debug dump -----
-def fetch_featured_via_network(page):
-    collected = []
-    dump_count = 0
-
-    def on_response(resp):
-        nonlocal dump_count
-        url = (resp.url or "").lower()
-        if "topic-feed" not in url:
-            return
-        if "featured" not in url and "topic_tab=featured" not in url and "tab=featured" not in url:
-            return
-        try:
-            ctype = (resp.headers or {}).get("content-type","").lower()
-            if "json" not in ctype:
-                return
-            data = resp.json()
-        except Exception:
-            return
-
-        # DEBUG: ham cevabı kaydet
-        if DEBUG and dump_count < 3:
-            Path(f"debug_featured_{dump_count+1}.json").write_text(json.dumps(data, ensure_ascii=False, indent=2))
-            dump_count += 1
-            print(f"[debug] saved debug_featured_{dump_count}.json from {resp.url}")
-
-        tmp = []
-        walk_items(data, tmp)
-        collected.extend(tmp)
-
-    page.on("response", on_response)
-    page.goto(AKIS_URL, wait_until="domcontentloaded")
+def fetch_foreks_rows(page):
+    page.goto(FOREKS_URL, wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
-    infinite_scroll(page, 6, 250)
+    # Sekme zaten 'BIST Şirketleri', yine de bir miktar kaydır
+    infinite_scroll(page, 5, 250)
+    try:
+        raw = page.evaluate(DOM_JS)
+    except Exception:
+        raw = []
+    items = []
+    for it in raw:
+        code = it["code"].upper()
+        if not TICKER_RE.fullmatch(code): 
+            continue
+        detail = clean_text(it["detail"])
+        if len(detail) < 8:
+            continue
+        rid = f"{code}-{hash(code+'|'+detail)}"
+        items.append({"id": rid, "code": code, "snippet": detail})
+    return items  # ekrandaki yeni→eski
 
-    # uniq yeni→eski
-    uniq, seen = [], set()
-    for it in collected:
-        k = (it["code"], it["snippet"])
-        if k in seen: continue
-        seen.add(k); uniq.append(it)
-    print(f"[debug] featured parsed items: {len(uniq)}")
-    return uniq
-
-# ===== MAIN =====
+# ====== MAIN ======
 def main():
-    print(">> start (featured network – field-based + debug)")
+    print(">> start (Foreks BIST Şirketleri)")
     tw = twitter_client()
 
     with sync_playwright() as p:
@@ -207,15 +144,17 @@ def main():
         ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
         page = ctx.new_page(); page.set_default_timeout(30000)
 
-        items = fetch_featured_via_network(page)
+        items = fetch_foreks_rows(page)
         if not items:
             print(">> no eligible rows"); browser.close(); return
 
+        # state filtresi (yeni düşenleri at)
         new_items = [it for it in items if it["id"] not in posted]
         if not new_items:
             print(">> nothing new to post"); browser.close(); return
 
-        new_items.reverse()  # eskiden → yeniye
+        # Eskiden → yeniye (timeline tutarlılığı için)
+        new_items.reverse()
 
         sent = 0
         for it in new_items:
