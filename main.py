@@ -51,14 +51,13 @@ def infinite_scroll(page, steps=6, pause_ms=300):
         page.mouse.wheel(0, 1800)
         page.wait_for_timeout(pause_ms)
 
-# ---------- 1) Network üzerinden yakala ----------
+# ---------- 1) Network (yalnızca featured) ----------
 def extract_from_string(s: str):
     if NON_NEWS.search(s): return None
     m = re.search(r"\bKAP\s*[-–]\s*([A-ZÇĞİÖŞÜ]{3,6}[0-9]?)\b", s)
     if not m: return None
     code = m.group(1).upper()
     if not TICKER_RE.fullmatch(code): return None
-    # 'KAP - KOD' sonrası
     after = re.split(rf"KAP\s*[-–]\s*{re.escape(code)}\s*", s, flags=re.I, maxsplit=1)
     detail = clean_text(after[1] if len(after) == 2 else s)
     if len(detail) < 8: return None
@@ -76,7 +75,12 @@ def fetch_via_network(page):
     captured = []
     def on_response(resp):
         url = (resp.url or "").lower()
-        if "topic-feed" not in url: return
+        # <<< SADECE ÖNE ÇIKANLAR >>>
+        if "topic-feed" not in url: 
+            return
+        if "featured" not in url and "topic_tab=featured" not in url and "tab=featured" not in url:
+            return
+
         try:
             ctype = resp.headers.get("content-type","").lower()
             if "json" in ctype:
@@ -97,7 +101,6 @@ def fetch_via_network(page):
         it = extract_from_string(s)
         if it: items.append(it)
 
-    # uniq yeni→eski
     uniq, seen = [], set()
     for it in items:
         k = (it["code"], it["snippet"])
@@ -105,12 +108,11 @@ def fetch_via_network(page):
         seen.add(k); uniq.append(it)
     return uniq
 
-# ---------- 2) DOM üzerinden (senin sınıflarla) ----------
+# ---------- 2) DOM fallback (featured sayfada) ----------
 DOM_JS = r"""
 (() => {
   const norm = s => (s||"").replace(/\u00A0/g,' ').replace(/\s+/g,' ').trim();
   const rows = Array.from(document.querySelectorAll("li, div"));
-
   const out = [];
   for (const r of rows) {
     const kap = r.querySelector("div.text-utility-02.text-fg-03");
@@ -123,16 +125,12 @@ DOM_JS = r"""
 
     const d = r.querySelector("div.font-medium.text-body-sm");
     if (!d) continue;
-    // sadece text node'ları al (button/svg hariç)
     const detail = norm(Array.from(d.childNodes)
       .filter(n => n.nodeType === Node.TEXT_NODE)
       .map(n => n.textContent).join(" "));
     if (!detail || /Fintables|G[üu]nl[üu]k\s*B[üu]lten|Bültenler?/i.test(detail)) continue;
-
     out.push({ code, detail });
   }
-
-  // uniq yeni→eski
   const seen = new Set();
   return out.filter(it => {
     const k = it.code + "|" + it.detail;
@@ -161,7 +159,7 @@ def fetch_via_dom(page):
 
 # ===== MAIN =====
 def main():
-    print(">> start (hybrid featured)")
+    print(">> start (featured-only)")
     tw = twitter_client()
 
     with sync_playwright() as p:
