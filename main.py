@@ -1,204 +1,167 @@
-import os, re, json, time
+import os, re, json, hashlib, time
 from pathlib import Path
-from playwright.sync_api import sync_playwright
+import requests
+from bs4 import BeautifulSoup
 import tweepy
 
-# ================== X (Twitter) ==================
-API_KEY = os.getenv("API_KEY")
-API_KEY_SECRET = os.getenv("API_KEY_SECRET")
-ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
-ACCESS_TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET")
+FOREKS_URL = "https://www.foreks.com/analizler/piyasa-analizleri/sirket"
+STATE_PATH = Path("data/posted.json")
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36"
+)
+
+TICKER_RE = re.compile(r"\b[A-ZÇĞİÖŞÜ]{3,5}\b")
+
+def load_state():
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if STATE_PATH.exists():
+        try:
+            return set(json.loads(STATE_PATH.read_text()))
+        except Exception:
+            return set()
+    return set()
+
+def save_state(ids):
+    STATE_PATH.write_text(json.dumps(sorted(list(ids)), ensure_ascii=False, indent=2))
+
+def sha(text: str) -> str:
+    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:24]
+
+def fetch_html():
+    r = requests.get(
+        FOREKS_URL,
+        headers={"User-Agent": USER_AGENT, "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8"},
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.text
+
+def extract_rows(html: str):
+    """
+    Foreks sayfasındaki kutudaki satırları mümkün olduğunca dayanıklı şekilde ayrıştırır.
+    - Her satırda sağda 'etiket' gibi görünen bir A etiketi (ticker) var.
+    - Satır başlığını aynı satırın ilk linkinden/strong/span'ından alıyoruz.
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    # Ana liste kartını bul (başlık 'Piyasa Analizleri' sayfasındaki tek büyük liste)
+    # Satırlar genelde <li> veya <div class="list-item"> benzeri; iki yöntemi de deneriz.
+    container = None
+    for candidate in soup.find_all(["div", "section"]):
+        if candidate.get_text(strip=True).startswith("ŞİRKET HABERLERİ") or "Şirket Haberleri" in candidate.get_text():
+            container = candidate.parent  # satırların olduğu üst kapsayıcı
+            break
+    if container is None:
+        # Alternatif: sayfadaki tüm olası satır bloklarını tara
+        container = soup
+
+    rows = []
+    # 1) <li> tabanlı liste
+    for li in container.find_all(["li", "div"], recursive=True):
+        # Satırın içinde başlık olabilecek ilk link/strong/span
+        # ve sağda kod olabilecek link (tam büyük harf 3-5 harf)
+        # Başlık linki
+        title = None
+        title_link = None
+        # başlığı tutarlı almak için en uzun metinli <a>’yı seç
+        a_tags = [a for a in li.find_all("a", recursive=True) if a.get_text(strip=True)]
+        if not a_tags:
+            continue
+        title_link = max(a_tags, key=lambda a: len(a.get_text(strip=True)))
+        title = " ".join(title_link.get_text(" ", strip=True).split())
+
+        # Hisse kodu adayları: satır içindeki tüm <a> ve <span> metinlerinde regex araması
+        codes = []
+        for el in li.find_all(["a", "span", "div"], recursive=True):
+            text = el.get_text(strip=True)
+            # sağdaki etiketler genelde kısa ve TAM BÜYÜK HARF; yabancı kelimeleri elemeye çalış
+            for m in TICKER_RE.findall(text):
+                # Sık çıkan ama kod olmayan kısaltmaları ele
+                if m in {"TCMB", "CEO", "NVIDIA", "NVDIA", "BIST", "FOREKS"}:
+                    continue
+                # Türkçe büyük harfleri normalize edip sadece A-Z yapalım
+                norm = (m
+                        .replace("Ç","C").replace("Ğ","G").replace("İ","I")
+                        .replace("Ö","O").replace("Ş","S").replace("Ü","U"))
+                if 3 <= len(norm) <= 5 and norm.isupper():
+                    codes.append(norm)
+        codes = list(dict.fromkeys(codes))  # uniq, sıra koru
+
+        # Bu satır bir haber kartı mı? Başlıkta 'Şirket Haberleri' yazıyorsa atla
+        if not title or "ŞİRKET HABERLERİ" in title.upper():
+            continue
+
+        # Eğer hiç kod yoksa bu haberi tweetlemeyeceğiz
+        if not codes:
+            continue
+
+        # İlk kodu seç
+        ticker = codes[0]
+        rows.append({"title": title, "ticker": ticker})
+
+    # Düşük kaliteli gürültüyü ele: çok kısa başlıklar, duyuru olmayanlar
+    cleaned = []
+    for r in rows:
+        if len(r["title"]) >= 20:  # çok kısa başlıkları at
+            cleaned.append(r)
+    return cleaned
+
+def compose_tweet(ticker: str, title: str) -> str:
+    base = f"📰 #{ticker} | {title}"
+    # Kullanıcının 279 karakter sınırı
+    if len(base) <= 279:
+        return base
+    # Gerekirse akıllı kes: önce parantez/alt açıklamaları kısalt
+    trimmed = base[:276] + "…"
+    return trimmed
 
 def twitter_client():
-    if not all([API_KEY, API_KEY_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET]):
-        print("!! Twitter secrets missing; tweets will be skipped")
-        return None
-    return tweepy.Client(
-        consumer_key=API_KEY,
-        consumer_secret=API_KEY_SECRET,
-        access_token=ACCESS_TOKEN,
-        access_token_secret=ACCESS_TOKEN_SECRET,
-    )
+    api_key = os.getenv("API_KEY")
+    api_secret = os.getenv("API_KEY_SECRET")
+    access_token = os.getenv("ACCESS_TOKEN")
+    access_secret = os.getenv("ACCESS_TOKEN_SECRET")
 
-# ================== STATE ==================
-STATE_FILE = Path("state.json")
-posted = set(json.loads(STATE_FILE.read_text())) if STATE_FILE.exists() else set()
+    auth = tweepy.OAuth1UserHandler(api_key, api_secret, access_token, access_secret)
+    api = tweepy.API(auth)
+    # basit doğrulama
+    api.verify_credentials()
+    return api
 
-def save_state():
-    STATE_FILE.write_text(json.dumps(sorted(list(posted))[-5000:], ensure_ascii=False))
-
-# ================== HELPERS ==================
-FOREKS_URL = "https://www.foreks.com/analizler/piyasa-analizleri/sirket"
-UPPER_TR = "A-ZÇĞİÖŞÜ"
-TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}$")  # 3–6 harfli BIST kodu
-
-def clean_text(t: str) -> str:
-    if not t: return ""
-    t = re.sub(r"\u00A0", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t.strip(" -–—:|•·")
-
-def build_tweet(code: str, detail: str) -> str:
-    base = clean_text(detail)
-    if len(base) > 240: base = base[:240].rstrip() + "…"
-    return (f"📰 #{code} | {base}")[:279]
-
-def infinite_scroll(page, steps=5, pause_ms=300):
-    for _ in range(steps):
-        page.mouse.wheel(0, 1400)
-        page.wait_for_timeout(pause_ms)
-
-def dismiss_popups(page):
-    # Çerez/uyarı kapatmaları; varsa tıkla geç
-    for sel in [
-        "button:has-text('Kabul')",
-        "button:has-text('Kabul Et')",
-        "button:has-text('Tamam')",
-        "button:has-text('Kapat')",
-        "text=Anladım",
-    ]:
-        try:
-            el = page.locator(sel).first
-            if el and el.count():
-                el.click(timeout=800)
-                page.wait_for_timeout(200)
-        except Exception:
-            pass
-
-# ===== DOM: aynı satırdaki başlık + en sağdaki kod =====
-DOM_JS = r"""
-(() => {
-  const norm = s => (s||"").replace(/\u00A0/g,' ').replace(/\s+/g,' ').trim();
-  const isTicker = s => /^[A-ZÇĞİÖŞÜ]{3,6}$/.test(s);
-
-  // Liste satırlarını yakala
-  const rows = new Set();
-  for (const a of document.querySelectorAll('a[href*="/analizler/piyasa-analizleri/"]')) {
-    const row = a.closest("li") || a.closest("article") || a.closest("div");
-    if (row) rows.add(row);
-  }
-
-  const items = [];
-  for (const row of rows) {
-    // Başlık
-    let link = row.querySelector('a[href*="/analizler/piyasa-analizleri/"]');
-    let detail = link ? norm(link.textContent) : "";
-    if (!detail || detail.length < 6) {
-      const alt = Array.from(row.querySelectorAll("h1,h2,h3,div,span"))
-        .map(el => norm(el.textContent))
-        .find(t => t && t.length > 6);
-      if (alt) detail = alt;
-    }
-
-    // Kod: satırdaki en SAĞDA görünen kısa büyük-harf etiketi
-    const cands = [];
-    for (const el of row.querySelectorAll("a,span,div")) {
-      const txt = norm(el.textContent).toUpperCase();
-      if (!txt || txt.length > 8) continue;
-      if (!isTicker(txt)) continue;
-      const r = el.getBoundingClientRect();
-      cands.push({ txt, x: r.right });
-    }
-    if (!cands.length) continue;
-    cands.sort((a,b) => b.x - a.x);      // sağdaki en büyük x
-    const code = cands[0].txt;
-
-    if (!detail || detail.length < 6) continue;
-    items.push({ code, detail });
-  }
-
-  // benzersiz
-  const seen = new Set(), out = [];
-  for (const it of items) {
-    const k = it.code + "|" + it.detail;
-    if (seen.has(k)) continue;
-    seen.add(k);
-    out.push(it);
-  }
-  return out; // sayfadaki görünüm sırası (yeni→eski)
-})()
-"""
-
-def fetch_foreks_rows(page):
-    page.goto(FOREKS_URL, wait_until="domcontentloaded")
-    dismiss_popups(page)
-
-    # Haber linkleri görünene kadar bekle (networkidle değil)
-    try:
-        page.wait_for_selector("a[href*='/analizler/piyasa-analizleri/']", timeout=45000)
-    except Exception:
-        # bir kez kaydırıp tekrar dene
-        page.mouse.wheel(0, 1200)
-        page.wait_for_timeout(600)
-        page.wait_for_selector("a[href*='/analizler/piyasa-analizleri/']", timeout=20000)
-
-    infinite_scroll(page, 6, 300)
-
-    try:
-        raw = page.evaluate(DOM_JS)
-    except Exception:
-        raw = []
-
-    items = []
-    for it in raw:
-        code = it["code"].upper()
-        if not TICKER_RE.fullmatch(code):
-            continue
-        detail = clean_text(it["detail"])
-        if len(detail) < 8:
-            continue
-        rid = f"{code}-{hash(code+'|'+detail)}"
-        items.append({"id": rid, "code": code, "snippet": detail})
-    print(f">> parsed rows: {len(items)}")
-    return items
-
-# ================== MAIN ==================
 def main():
     print(">> start (Foreks BIST Şirketleri)")
-    tw = twitter_client()
+    html = fetch_html()
+    rows = extract_rows(html)
+    print(f">> parsed rows: {len(rows)}")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox","--disable-gpu","--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
-        ctx = browser.new_context(
-            user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
-            locale="tr-TR", timezone_id="Europe/Istanbul",
-        )
-        page = ctx.new_page()
-        page.set_default_timeout(60000)
+    if not rows:
+        print(">> no eligible rows")
+        return
 
-        items = fetch_foreks_rows(page)
-        if not items:
-            print(">> no eligible rows"); browser.close(); return
+    seen = load_state()
+    api = twitter_client()
 
-        # yeni olanlar
-        new_items = [it for it in items if it["id"] not in posted]
-        if not new_items:
-            print(">> nothing new to post"); browser.close(); return
+    posted_any = False
+    # En yeni en üste geliyor; sondan başa gidip eskinin önce atılmasını isteyebilirsin.
+    for r in rows:
+        tweet = compose_tweet(r["ticker"], r["title"])
+        uid = sha(tweet)  # aynı tweet bir daha atılmasın
+        if uid in seen:
+            continue
+        try:
+            api.update_status(status=tweet)
+            print(">> tweeted:", tweet)
+            seen.add(uid)
+            posted_any = True
+            time.sleep(3)  # hız limiti için küçük bekleme
+        except Exception as e:
+            print("!! tweet error:", e)
 
-        # Eskiden → yeniye sırayla at
-        new_items.reverse()
-
-        sent = 0
-        for it in new_items:
-            text = build_tweet(it["code"], it["snippet"])
-            print(">> TWEET:", text)
-            try:
-                if tw: tw.create_tweet(text=text)
-                posted.add(it["id"]); save_state()
-                sent += 1
-                time.sleep(2)
-            except Exception as e:
-                print("!! tweet error:", e)
-
-        browser.close()
-        print(f">> done (posted: {sent})")
+    if posted_any:
+        save_state(seen)
+        print(">> state saved")
+    else:
+        print(">> nothing new to tweet")
 
 if __name__ == "__main__":
     main()
