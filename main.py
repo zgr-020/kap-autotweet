@@ -1,9 +1,9 @@
-import os, re, json, time
+import os, re, json, time, hashlib
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 import tweepy
 
-# ================== X (Twitter) anahtarları (SECRETS) ==================
+# ================== X (Twitter) SECRETS ==================
 API_KEY = os.getenv("API_KEY")
 API_KEY_SECRET = os.getenv("API_KEY_SECRET")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
@@ -20,31 +20,25 @@ def twitter_client():
         access_token_secret=ACCESS_TOKEN_SECRET,
     )
 
-# ================== Durum (aynı şeyi iki kez atma) =====================
+# ================== STATE ==================
 STATE_FILE = Path("state.json")
 posted = set(json.loads(STATE_FILE.read_text())) if STATE_FILE.exists() else set()
 def save_state():
-    STATE_FILE.write_text(json.dumps(sorted(list(posted)), ensure_ascii=False))
+    # şişmeyi önlemek için son 5000
+    keep = sorted(list(posted))[-5000:]
+    STATE_FILE.write_text(json.dumps(keep, ensure_ascii=False))
 
-# ================== Yardımcılar =======================================
+# ================== HELPERS ==================
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
 
-# BIST kodu: 3–6 Türkçe büyük harf + opsiyonel 1 rakam (örn. ISCTR, HEKTS, TUPRS, SISE, VESTL, KCHOL, KONTR, ALARK, BERA, etc.)
 UPPER_TR = "A-ZÇĞİÖŞÜ"
+# 3–6 TR büyük harf + opsiyonel 1 rakam (ISCTR, HEKTS, KONTR, VESTL, SISE, ALARK, KCHOL, TUPRS, BERA, vs.)
 TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}[0-9]?$")
 
-# Kod OLAMAYACAK sabit etiketler
-BANNED_TAGS = {
-    "KAP", "FINTABLES", "FİNTABLES", "GÜNLÜK", "BÜLTEN", "BULTEN", "GUNLUK",
-    "HABER"
-}
-
-# Haber dışı satırları ele
+BANNED_TAGS = {"KAP", "FINTABLES", "FİNTABLES", "GÜNLÜK", "BÜLTEN", "BULTEN", "GUNLUK", "HABER"}
 NON_NEWS_PATTERNS = [
     r"\bGünlük Bülten\b", r"\bBülten\b", r"\bPiyasa temkini\b", r"\bPiyasa değerlendirmesi\b"
 ]
-
-# snippet temizliği
 STOP_PHRASES = [
     r"işbu açıklama.*?amaçla", r"yatırım tavsiyesi değildir", r"kamunun bilgisine arz olunur",
     r"saygılarımızla", r"özel durum açıklaması", r"yatırımcılarımızın bilgisine",
@@ -59,7 +53,6 @@ def clean_text(t: str) -> str:
     t = re.sub(r"\s+", " ", (t or "")).strip()
     for p in STOP_PHRASES: t = re.sub(p, "", t, flags=re.I)
     for p in TIME_PATTERNS: t = re.sub(p, "", t, flags=re.I)
-    # kaynak kırpıntıları
     t = re.sub(r"\b(Fintables|KAP)\b\s*[·\.]?\s*", "", t, flags=re.I)
     return t.strip(" -–—:|•·")
 
@@ -94,7 +87,8 @@ def rewrite_tr_short(s: str) -> str:
 def build_tweet(code: str, snippet: str) -> str:
     base = rewrite_tr_short(snippet)
     base = summarize(base, 240)   # buffer
-    return (f"📰 #{code} | " + base)[:279]
+    out = f"📰 #{code} | {base}"
+    return out[:279]
 
 def go_highlights(page):
     for sel in [
@@ -114,7 +108,6 @@ def go_highlights(page):
     return False
 
 def infinite_scroll_a_bit(page, steps=3, pause_ms=400):
-    # Yeterince satır gelsin diye az kaydırıyoruz (çok kaydırırsan eskileri de getirir)
     for _ in range(steps):
         page.mouse.wheel(0, 1600)
         page.wait_for_timeout(pause_ms)
@@ -123,43 +116,45 @@ def best_ticker_in_row(row) -> str:
     """Satırdaki etiketlerden gerçek hisse kodunu seç (KAP vb. hariç)."""
     code = ""
     anchors = row.locator("a, span, div")
-    for j in range(min(30, anchors.count())):
+    for j in range(min(40, anchors.count())):
         tt = (anchors.nth(j).inner_text() or "").strip()
         tt_up = tt.upper()
-        if tt_up in BANNED_TAGS:    # KAP / Fintables / Bülten vs. değil
+        if tt_up in BANNED_TAGS:
             continue
-        # yalnızca düz kodu al (örn. ALARK, TUPRS, ISCTR, SISE gibi)
         if TICKER_RE.fullmatch(tt_up):
             code = tt_up
             break
     return code
 
-def extract_company_rows(page):
+def extract_company_rows(page, max_collect=30):
     """
-    Modal açmadan, listede şirket etiketi (hisse kodu) olan satırlardan
-    EN YENİ (ilk görünen) haberi döndür.
+    Listede KAP içerikli, şirket etiketi (hisse kodu) olan satırlardan
+    üstten aşağı topla (ekrana düşen son ~30 eleman yeterli).
+    DÖNÜŞ: [{id, code, snippet}] yeni→eski sırada (ekranda görünen sırayla).
     """
     rows = page.locator("main li, main div[role='listitem'], main div")
-    total = min(300, rows.count())
+    total = min(500, rows.count())
     print(">> raw rows:", total)
 
-    for i in range(total):  # üstten aşağı — ilk uygun satır yeter
+    items = []
+    for i in range(total):
+        if len(items) >= max_collect: break
         row = rows.nth(i)
 
         code = best_ticker_in_row(row)
-        if not code:
+        if not code: 
             continue
 
         text = row.inner_text().strip()
         text_norm = re.sub(r"\s+", " ", text)
 
-        # 🚫 Haber dışı & Fintables içeriği ele
+        # Haber dışı / Fintables içeriklerini ele
         if any(re.search(p, text_norm, flags=re.I) for p in NON_NEWS_PATTERNS):
             continue
         if re.search(r"\bFintables\b", text_norm, flags=re.I):
             continue
 
-        # ✅ Sadece KAP içerikleri
+        # Sadece KAP içerikleri
         if not re.search(r"\bKAP\b", text_norm, flags=re.I):
             continue
 
@@ -167,16 +162,15 @@ def extract_company_rows(page):
         pos = text_norm.upper().find(code)
         snippet = text_norm[pos + len(code):].strip()
         snippet = clean_text(snippet)
-
         if len(snippet) < 15:
             continue
 
         rid = f"{code}-{hash(text_norm)}"
-        return {"id": rid, "code": code, "snippet": snippet}
+        items.append({"id": rid, "code": code, "snippet": snippet})
 
-    return None
+    return items  # yeni→eski
 
-# ================== ANA AKIŞ ==================================
+# ================== ANA AKIŞ ==================
 def main():
     print(">> start")
     tw = twitter_client()
@@ -198,26 +192,37 @@ def main():
         go_highlights(page)
         infinite_scroll_a_bit(page, steps=2, pause_ms=350)
 
-        item = extract_company_rows(page)
-        if not item:
-            print(">> no eligible row"); browser.close(); return
+        # 1) Ekrandaki uygun tüm KAP satırlarını topla (yeni→eski)
+        items = extract_company_rows(page, max_collect=40)
 
-        if item["id"] in posted:
-            print(">> newest is already posted"); browser.close(); return
+        if not items:
+            print(">> no eligible rows"); browser.close(); return
 
-        tweet = build_tweet(item["code"], item["snippet"])
-        print(">> TWEET:", tweet)
+        # 2) STATE ile filtrele
+        new_items = [it for it in items if it["id"] not in posted]
+        if not new_items:
+            print(">> nothing new to post"); browser.close(); return
 
-        try:
+        # 3) Eskiden→yeniye sıraya çevir (tweet sırası)
+        new_items.reverse()
+
+        # 4) Tweetle
+        for it in new_items:
+            tweet = build_tweet(it["code"], it["snippet"])
+            print(">> TWEET:", tweet)
             if tw:
-                tw.create_tweet(text=tweet)
-            posted.add(item["id"]); save_state()
-            print(">> tweet sent ✓")
-        except Exception as e:
-            print("!! tweet error:", e)
+                try:
+                    tw.create_tweet(text=tweet)
+                    print(">> tweet sent ✓")
+                except Exception as e:
+                    print("!! tweet error:", e)
+                    # hata olsa bile state'e eklemeyelim ki tekrar denesin
+                    continue
+            posted.add(it["id"]); save_state()
+            time.sleep(2)
 
         browser.close()
-        print(">> done")
+        print(">> done (posted:", len(new_items), ")")
 
 if __name__ == "__main__":
     main()
