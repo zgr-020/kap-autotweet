@@ -4,14 +4,32 @@ import requests
 from bs4 import BeautifulSoup
 import tweepy
 
-FOREKS_URL = "https://www.foreks.com/analizler/piyasa-analizleri/sirket"
+BASE_URL = "https://www.foreks.com/analizler/piyasa-analizleri/sirket"
+AMP_URL = BASE_URL.rstrip("/") + "/amp"
+
 STATE_PATH = Path("data/posted.json")
-USER_AGENT = (
+UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36"
 )
 
-TICKER_RE = re.compile(r"\b[A-ZÇĞİÖŞÜ]{3,5}\b")
+# 3–5 harfli, TR büyük harfleri de kapsayan hisse kodu
+TICKER_RE = re.compile(r"\b[A-ZÇĞİÖŞÜ]{3,5}\b", re.UNICODE)
+
+def http_get(url):
+    r = requests.get(
+        url,
+        headers={
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+        timeout=25,
+    )
+    r.raise_for_status()
+    return r.text
 
 def load_state():
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -25,96 +43,157 @@ def load_state():
 def save_state(ids):
     STATE_PATH.write_text(json.dumps(sorted(list(ids)), ensure_ascii=False, indent=2))
 
-def sha(text: str) -> str:
+def sha24(text: str) -> str:
     return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:24]
 
-def fetch_html():
-    r = requests.get(
-        FOREKS_URL,
-        headers={"User-Agent": USER_AGENT, "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8"},
-        timeout=20,
-    )
-    r.raise_for_status()
-    return r.text
+def normalize_ticker(m: str) -> str:
+    return (m.replace("Ç","C").replace("Ğ","G").replace("İ","I")
+              .replace("Ö","O").replace("Ş","S").replace("Ü","U"))
 
-def extract_rows(html: str):
+def compose_tweet(ticker: str, title: str) -> str:
+    base = f"📰 #{ticker} | {title}"
+    if len(base) <= 279:
+        return base
+    return base[:276] + "…"
+
+# ---------- PARSERS ----------
+
+def parse_amp(html: str):
     """
-    Foreks sayfasındaki kutudaki satırları mümkün olduğunca dayanıklı şekilde ayrıştırır.
-    - Her satırda sağda 'etiket' gibi görünen bir A etiketi (ticker) var.
-    - Satır başlığını aynı satırın ilk linkinden/strong/span'ından alıyoruz.
+    AMP sayfası statik olur. AMP’de genelde haber kartları <article>, <li> ya da
+    <a class="..."> ile gelir; sağdaki etiketler küçük 'chip/tag' linkleridir.
     """
     soup = BeautifulSoup(html, "lxml")
-
-    # Ana liste kartını bul (başlık 'Piyasa Analizleri' sayfasındaki tek büyük liste)
-    # Satırlar genelde <li> veya <div class="list-item"> benzeri; iki yöntemi de deneriz.
-    container = None
-    for candidate in soup.find_all(["div", "section"]):
-        if candidate.get_text(strip=True).startswith("ŞİRKET HABERLERİ") or "Şirket Haberleri" in candidate.get_text():
-            container = candidate.parent  # satırların olduğu üst kapsayıcı
-            break
-    if container is None:
-        # Alternatif: sayfadaki tüm olası satır bloklarını tara
-        container = soup
-
     rows = []
-    # 1) <li> tabanlı liste
-    for li in container.find_all(["li", "div"], recursive=True):
-        # Satırın içinde başlık olabilecek ilk link/strong/span
-        # ve sağda kod olabilecek link (tam büyük harf 3-5 harf)
-        # Başlık linki
-        title = None
-        title_link = None
-        # başlığı tutarlı almak için en uzun metinli <a>’yı seç
-        a_tags = [a for a in li.find_all("a", recursive=True) if a.get_text(strip=True)]
+
+    # AMP’de ana içerik çoğunlukla <main> altında
+    container = soup.find("main") or soup
+
+    # Kart benzeri bloklar
+    for blk in container.find_all(["article", "li", "div", "section"], recursive=True):
+        # Başlık adayı: en uzun metinli <a> veya <h*> içindeki <a>
+        a_tags = [a for a in blk.find_all("a", recursive=True) if a.get_text(strip=True)]
         if not a_tags:
             continue
         title_link = max(a_tags, key=lambda a: len(a.get_text(strip=True)))
         title = " ".join(title_link.get_text(" ", strip=True).split())
-
-        # Hisse kodu adayları: satır içindeki tüm <a> ve <span> metinlerinde regex araması
-        codes = []
-        for el in li.find_all(["a", "span", "div"], recursive=True):
-            text = el.get_text(strip=True)
-            # sağdaki etiketler genelde kısa ve TAM BÜYÜK HARF; yabancı kelimeleri elemeye çalış
-            for m in TICKER_RE.findall(text):
-                # Sık çıkan ama kod olmayan kısaltmaları ele
-                if m in {"TCMB", "CEO", "NVIDIA", "NVDIA", "BIST", "FOREKS"}:
-                    continue
-                # Türkçe büyük harfleri normalize edip sadece A-Z yapalım
-                norm = (m
-                        .replace("Ç","C").replace("Ğ","G").replace("İ","I")
-                        .replace("Ö","O").replace("Ş","S").replace("Ü","U"))
-                if 3 <= len(norm) <= 5 and norm.isupper():
-                    codes.append(norm)
-        codes = list(dict.fromkeys(codes))  # uniq, sıra koru
-
-        # Bu satır bir haber kartı mı? Başlıkta 'Şirket Haberleri' yazıyorsa atla
         if not title or "ŞİRKET HABERLERİ" in title.upper():
             continue
 
-        # Eğer hiç kod yoksa bu haberi tweetlemeyeceğiz
+        # Etiket/kod adayı: kısa metinli <a>/<span>’larda 3–5 harf
+        codes = []
+        for el in blk.find_all(["a", "span", "div"], recursive=True):
+            text = el.get_text(strip=True)
+            if not text or len(text) > 8:  # etiketler kısa olur
+                continue
+            for m in TICKER_RE.findall(text):
+                n = normalize_ticker(m)
+                if 3 <= len(n) <= 5 and n.isupper():
+                    codes.append(n)
+        codes = list(dict.fromkeys(codes))
         if not codes:
             continue
 
-        # İlk kodu seç
-        ticker = codes[0]
-        rows.append({"title": title, "ticker": ticker})
+        rows.append({"title": title, "ticker": codes[0]})
 
-    # Düşük kaliteli gürültüyü ele: çok kısa başlıklar, duyuru olmayanlar
-    cleaned = []
-    for r in rows:
-        if len(r["title"]) >= 20:  # çok kısa başlıkları at
-            cleaned.append(r)
-    return cleaned
+    return rows
 
-def compose_tweet(ticker: str, title: str) -> str:
-    base = f"📰 #{ticker} | {title}"
-    # Kullanıcının 279 karakter sınırı
-    if len(base) <= 279:
-        return base
-    # Gerekirse akıllı kes: önce parantez/alt açıklamaları kısalt
-    trimmed = base[:276] + "…"
-    return trimmed
+def parse_nuxt_json(html: str):
+    """
+    Foreks Vue/Nuxt tabanlı olabilir. HTML içinde window.__NUXT__ veya benzeri
+    bir JSON’da liste olur. Buradan title ve ticker çıkarırız.
+    """
+    rows = []
+    # __NUXT__ gömülü JSON’u çek
+    m = re.search(r"window\.__NUXT__\s*=\s*(\{.*?\});", html, re.DOTALL)
+    if not m:
+        return rows
+    try:
+        nuxt = json.loads(m.group(1))
+    except Exception:
+        return rows
+
+    # JSON yapısı olası: nuxt['state'] / ['data'] içinde liste
+    def walk(x):
+        if isinstance(x, dict):
+            for k, v in x.items():
+                yield k, v
+                yield from walk(v)
+        elif isinstance(x, list):
+            for i in x:
+                yield from walk(i)
+
+    candidates = []
+    for k, v in walk(nuxt):
+        if isinstance(v, list) and v and isinstance(v[0], dict) and ("title" in v[0] or "name" in v[0]):
+            candidates.append(v)
+
+    for arr in candidates:
+        for item in arr:
+            title = (item.get("title") or item.get("name") or "").strip()
+            if not title:
+                continue
+            text_blob = json.dumps(item, ensure_ascii=False)
+            codes = []
+            for m2 in TICKER_RE.findall(text_blob):
+                n = normalize_ticker(m2)
+                if 3 <= len(n) <= 5 and n.isupper():
+                    codes.append(n)
+            codes = list(dict.fromkeys(codes))
+            if not codes:
+                continue
+            if "ŞİRKET HABERLERİ" in title.upper():
+                continue
+            rows.append({"title": title, "ticker": codes[0]})
+
+    return rows
+
+def extract_rows_resilient():
+    # 1) AMP dene
+    try:
+        html = http_get(AMP_URL)
+        print(f">> fetched AMP html: {len(html)} bytes")
+        rows = parse_amp(html)
+        if rows:
+            print(f">> amp rows: {len(rows)}")
+            return rows
+        else:
+            print(">> amp parse yielded 0 rows, falling back to normal page JSON…")
+    except Exception as e:
+        print("!! amp fetch error:", e)
+
+    # 2) Normal sayfa + NUXT JSON dene
+    html = http_get(BASE_URL)
+    print(f">> fetched normal html: {len(html)} bytes")
+    rows = parse_nuxt_json(html)
+    if rows:
+        print(f">> nuxt rows: {len(rows)}")
+        return rows
+
+    # 3) Son çare: normal DOM’dan kaba ayrıştırma (bazı durumlar yine işe yarar)
+    soup = BeautifulSoup(html, "lxml")
+    fallback = []
+    for li in soup.find_all(["li", "article", "div"]):
+        a_tags = [a for a in li.find_all("a") if a.get_text(strip=True)]
+        if not a_tags:
+            continue
+        title_link = max(a_tags, key=lambda a: len(a.get_text(strip=True)))
+        title = " ".join(title_link.get_text(" ", strip=True).split())
+        if not title or "ŞİRKET HABERLERİ" in title.upper():
+            continue
+        codes = []
+        for el in li.find_all(["a", "span", "div"]):
+            for m in TICKER_RE.findall(el.get_text(strip=True)):
+                n = normalize_ticker(m)
+                if 3 <= len(n) <= 5 and n.isupper():
+                    codes.append(n)
+        codes = list(dict.fromkeys(codes))
+        if codes:
+            fallback.append({"title": title, "ticker": codes[0]})
+    print(f">> fallback rows: {len(fallback)}")
+    return fallback
+
+# ---------- TWITTER ----------
 
 def twitter_client():
     api_key = os.getenv("API_KEY")
@@ -124,14 +203,12 @@ def twitter_client():
 
     auth = tweepy.OAuth1UserHandler(api_key, api_secret, access_token, access_secret)
     api = tweepy.API(auth)
-    # basit doğrulama
     api.verify_credentials()
     return api
 
 def main():
     print(">> start (Foreks BIST Şirketleri)")
-    html = fetch_html()
-    rows = extract_rows(html)
+    rows = extract_rows_resilient()
     print(f">> parsed rows: {len(rows)}")
 
     if not rows:
@@ -140,12 +217,12 @@ def main():
 
     seen = load_state()
     api = twitter_client()
-
     posted_any = False
-    # En yeni en üste geliyor; sondan başa gidip eskinin önce atılmasını isteyebilirsin.
+
+    # Eski → yeni sırasıyla atmak istersen: rows = rows[::-1]
     for r in rows:
         tweet = compose_tweet(r["ticker"], r["title"])
-        uid = sha(tweet)  # aynı tweet bir daha atılmasın
+        uid = sha24(tweet)
         if uid in seen:
             continue
         try:
@@ -153,7 +230,7 @@ def main():
             print(">> tweeted:", tweet)
             seen.add(uid)
             posted_any = True
-            time.sleep(3)  # hız limiti için küçük bekleme
+            time.sleep(3)
         except Exception as e:
             print("!! tweet error:", e)
 
