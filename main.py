@@ -7,13 +7,13 @@ URL = "https://fintables.com/borsa-haber-akisi?tab=featured"
 STATE_PATH = Path("state.json")
 MAX_TWEET_LEN = 279
 
-# --- X (Twitter) Secrets ---
+# X (Twitter) secrets
 API_KEY = os.environ["API_KEY"]
 API_SECRET = os.environ["API_KEY_SECRET"]
 ACCESS_TOKEN = os.environ["ACCESS_TOKEN"]
 ACCESS_SECRET = os.environ["ACCESS_TOKEN_SECRET"]
 
-# ---------------- State ----------------
+# ---------------- state ----------------
 def load_state():
     if STATE_PATH.exists():
         return json.loads(STATE_PATH.read_text(encoding="utf-8"))
@@ -26,16 +26,14 @@ def save_state(s):
 def sha(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
-# ---------------- Helpers ----------------
+# ---------------- helpers ----------------
 TIME_PATTS = [
     re.compile(r"\s*(?:Dün|Bugün|Az önce|Saat)?\s*\d{1,2}[:.]\d{2}\s*$", re.I),
     re.compile(r"\s*\d{1,2}\s+[A-Za-zÇĞİÖŞÜçğıöşü]+\s+\d{1,2}[:.]\d{2}\s*$", re.I),
 ]
-
 def strip_time(s: str) -> str:
     s = s.strip()
-    for p in TIME_PATTS:
-        s = p.sub("", s)
+    for p in TIME_PATTS: s = p.sub("", s)
     return s.strip()
 
 def format_tweet(code: str, text: str) -> str:
@@ -47,8 +45,8 @@ def format_tweet(code: str, text: str) -> str:
     return prefix + body
 
 def dismiss_banners(page):
-    for sel in ["button:has-text('Kabul et')", "button:has-text('Kabul')",
-                "button:has-text('Accept')", "button:has-text('Accept all')",
+    for sel in ["button:has-text('Kabul et')","button:has-text('Kabul')",
+                "button:has-text('Accept')","button:has-text('Accept all')",
                 "text=Kabul et"]:
         try:
             el = page.locator(sel).first
@@ -59,94 +57,120 @@ def dismiss_banners(page):
         except Exception:
             pass
 
-# ---------------- Scrape ----------------
+# ---------------- core: robust DOM scrape in-page JS ----------------
+JS_SCRAPE = r"""
+(() => {
+  // normalize helper
+  const norm = (s) => (s||"")
+    .replace(/\u00A0/g, " ")   // nbsp
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // tüm satır adayları: li, article, div (metin içerenler)
+  const nodes = Array.from(document.querySelectorAll('li, article, div'))
+    .filter(n => n.innerText && /KAP\s*[-–]/i.test(n.innerText));
+
+  const out = [];
+  for (const n of nodes) {
+    const raw = norm(n.innerText);
+
+    // Fintables özel/Günlük Bülten ele
+    if (/Fintables|G[üu]nl[üu]k B[üu]lten|Bültenler/i.test(raw)) continue;
+    if (!/KAP\s*[-–]/i.test(raw)) continue;
+
+    // hisse kodu: önce mavi linklerden
+    let code = null;
+    const links = n.querySelectorAll("a[href*='/borsa/hisse/']");
+    for (const a of links) {
+      const t = norm(a.innerText).toUpperCase();
+      if (/^[A-Z]{3,5}$/.test(t)) { code = t; break; }
+    }
+    // yedek: "KAP - KOD ..." paterninden
+    if (!code) {
+      const m = raw.match(/KAP\s*[-–]\s*([A-Z]{3,5})\b/i);
+      if (m) code = m[1].toUpperCase();
+    }
+    if (!code) continue;
+
+    // detay: "KAP - KOD" sonrası her şey
+    let detail = raw.replace(new RegExp(`^[\\s\\S]*?KAP\\s*[-–]\\s*${code}\\s*`,`i`), "");
+    detail = norm(detail).replace(/^[\-\|–—\s]+/,"");
+    if (!detail) continue;
+
+    out.push({ code, detail });
+  }
+
+  // uniq
+  const seen = new Set();
+  return out.filter(it => {
+    const k = it.code + "|" + it.detail;
+    if (seen.has(k)) return false;
+    seen.add(k); return true;
+  });
+})()
+"""
+
+def scrape_once(page):
+    # lazy load için bir miktar scroll
+    for _ in range(6):
+        page.mouse.wheel(0, 2200)
+        page.wait_for_timeout(300)
+
+    # görünür metinde 'KAP -' oluşana kadar bekle (maks 10 sn)
+    try:
+        page.wait_for_function(
+            "document.body && document.body.innerText && /KAP\\s*[-–]/i.test(document.body.innerText)",
+            timeout=10000
+        )
+    except Exception:
+        pass
+
+    items = page.evaluate(JS_SCRAPE)
+    # eskiden yeniye
+    items = list(dict.fromkeys([(i["code"], i["detail"]) for i in items]))
+    return [{"code": c, "detail": d} for (c, d) in items][::-1]
+
 def scrape():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
         ctx = browser.new_context(
             locale="tr-TR",
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/127.0 Safari/537.36"),
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36"),
             viewport={"width": 1440, "height": 900},
         )
-        # stealth
         ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
         page = ctx.new_page()
 
-        page.goto(URL, wait_until="domcontentloaded")
-        page.wait_for_load_state("networkidle")
-        dismiss_banners(page)
+        results = []
+        for attempt in range(3):  # sağlam retry
+            page.goto(URL, wait_until="domcontentloaded")
+            page.wait_for_load_state("networkidle")
+            dismiss_banners(page)
 
-        # Lazy içerik için biraz kaydır
-        for _ in range(6):
-            page.mouse.wheel(0, 2200)
-            page.wait_for_timeout(300)
-
-        # KAP satırlarını bekle (li altında hisse linki olan satırlar)
-        row_locator = page.locator("xpath=//li[.//a[contains(@href,'/borsa/hisse/')]]")
-        try:
-            row_locator.first.wait_for(timeout=8000)
-        except Exception:
-            pass
-
-        rows = row_locator.all()
-        items = []
-        for r in rows:
-            try:
-                # Sol etiket metni: "KAP - TERA BVSAN" gibi
-                row_text = re.sub(r"\s+", " ", r.inner_text()).strip()
-            except Exception:
-                continue
-
-            # Yalnızca KAP olanlar; Fintables/Günlük Bülten hariç
-            if not row_text.upper().startswith("KAP -"):
-                continue
-            if re.search(r"Fintables|G[üu]nl[üu]k B[üu]lten|Bültenler", row_text, re.I):
-                continue
-
-            # Kodu mavi linkten al
-            try:
-                code = r.locator("a[href*='/borsa/hisse/']").first.inner_text().strip().upper()
-            except Exception:
-                # yedek: “KAP - KOD …”
-                m = re.search(r"KAP\s*-\s*([A-Z]{3,5})\b", row_text, re.I)
-                code = m.group(1).upper() if m else None
-            if not code:
-                continue
-
-            # Detay: “KAP - KOD” sonrası tüm cümle
-            # bazen “KAP - TERA BVSAN …” olabilir → KOD’dan sonrasını al
-            detail = row_text
-            # önce KAP - KOD kırp
-            detail = re.split(rf"KAP\s*-\s*{re.escape(code)}\s*", detail, flags=re.I, maxsplit=1)
-            detail = detail[1] if len(detail) == 2 else row_text
-            detail = strip_time(detail)
-            detail = re.sub(r"^[\-\|–—\s]+", "", detail).strip()
-            if not detail:
-                continue
-
-            items.append({"code": code, "detail": detail})
+            items = scrape_once(page)
+            if items:
+                results = items
+                break
+            # küçük gecikme ve tekrar
+            page.wait_for_timeout(1200)
 
         browser.close()
+        # saat/tarih temizliği ve son filtre
+        cleaned = []
+        for it in results:
+            detail = strip_time(it["detail"])
+            if not detail: continue
+            cleaned.append({"code": it["code"], "detail": detail})
+        return cleaned
 
-        # Aynı tetiklemede uniq + en eskiden yeniye
-        uniq, seen = [], set()
-        for it in reversed(items):
-            k = (it["code"], it["detail"])
-            if k in seen: 
-                continue
-            seen.add(k)
-            uniq.append(it)
-        return uniq
-
-# ---------------- Twitter ----------------
+# ---------------- twitter ----------------
 def post_to_twitter(text: str):
     auth = tweepy.OAuth1UserHandler(API_KEY, API_SECRET, ACCESS_TOKEN, ACCESS_SECRET)
     api = tweepy.API(auth)
     api.update_status(status=text)
 
-# ---------------- Main ----------------
+# ---------------- main ----------------
 def main():
     state = load_state()
     items = scrape()
@@ -160,8 +184,7 @@ def main():
     posted = 0
     for h, it in to_post:
         tweet = format_tweet(it["code"], it["detail"])
-        if len(tweet) < 10:
-            continue
+        if len(tweet) < 10: continue
         post_to_twitter(tweet)
         state["hashes"].append(h)
         posted += 1
