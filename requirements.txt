@@ -1,3 +1,5 @@
-requests
+selenium
+webdriver-manager
 beautifulsoup4
 tweepy
+requests
