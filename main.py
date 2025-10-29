@@ -14,7 +14,7 @@ from tweepy import TooManyRequests, TweepyException
 
 # ============== CONFIGURATION ==============
 @dataclass
-class Config:
+hasclass Config:
     api_key: Optional[str] = None
     api_key_secret: Optional[str] = None
     access_token: Optional[str] = None
