@@ -1,9 +1,9 @@
-import os, re, json, time, hashlib
+import os, re, json, time
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 import tweepy
 
-# ================== X (Twitter) SECRETS ==================
+# ===== X (Twitter) =====
 API_KEY = os.getenv("API_KEY")
 API_KEY_SECRET = os.getenv("API_KEY_SECRET")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
@@ -20,147 +20,148 @@ def twitter_client():
         access_token_secret=ACCESS_TOKEN_SECRET,
     )
 
-# ================== STATE ==================
+# ===== STATE =====
 STATE_FILE = Path("state.json")
 posted = set(json.loads(STATE_FILE.read_text())) if STATE_FILE.exists() else set()
 def save_state():
     keep = sorted(list(posted))[-5000:]
     STATE_FILE.write_text(json.dumps(keep, ensure_ascii=False))
 
-# ================== HELPERS ==================
-AKIS_URL = "https://fintables.com/borsa-haber-akisi"
-
+# ===== HELPERS =====
+AKIS_URL = "https://fintables.com/borsa-haber-akisi?tab=featured"
 UPPER_TR = "A-ZÇĞİÖŞÜ"
 TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}[0-9]?$")
-
-BANNED_TAGS = {"KAP","FINTABLES","FİNTABLES","GÜNLÜK","BÜLTEN","BULTEN","GUNLUK","HABER"}
-NON_NEWS_PATTERNS = [r"\bGünlük Bülten\b", r"\bBülten\b"]
-
-STOP_PHRASES = [
-    r"işbu açıklama.*?amaçla", r"yatırım tavsiyesi değildir",
-    r"kamunun bilgisine arz olunur", r"saygılarımızla",
-    r"özel durum açıklaması", r"yatırımcılarımızın bilgisine",
-]
-TIME_PATTERNS = [
-    r"\b\d{1,2}:\d{2}\b", r"\bDün\s+\d{1,2}:\d{2}\b", r"\bBugün\b", r"\bAz önce\b"
-]
+NON_NEWS = re.compile(r"(Fintables|G[üu]nl[üu]k\s*B[üu]lten|Bültenler?)", re.I)
 
 def clean_text(t: str) -> str:
-    t = re.sub(r"\s+", " ", (t or "")).strip()
-    for p in STOP_PHRASES: t = re.sub(p, "", t, flags=re.I)
-    for p in TIME_PATTERNS: t = re.sub(p, "", t, flags=re.I)
+    if not t: return ""
+    t = re.sub(r"\s+", " ", t).strip()
     t = re.sub(r"\b(Fintables|KAP)\b\s*[·\.]?\s*", "", t, flags=re.I)
-    return t.strip(" -–—:|•·")
+    t = re.sub(r"\b(Dün\s+\d{1,2}:\d{2}|\d{1,2}:\d{2}|Bugün|Az önce)\b", "", t, flags=re.I)
+    t = re.sub(r"\s+", " ", t).strip(" -–—:|•·")
+    return t
 
-def summarize(text: str, limit: int) -> str:
-    text = clean_text(text)
-    if len(text) <= limit: return text
-    parts = re.split(r"(?<=[.!?])\s+", text)
-    out = ""
-    for s in parts:
-        if not s: continue
-        cand = (out + " " + s).strip()
-        if len(cand) > limit: break
-        out = cand
-    return out or text[:limit]
+def build_tweet(code: str, detail: str) -> str:
+    base = clean_text(detail)
+    if len(base) > 240: base = base[:240].rstrip() + "…"
+    return (f"📰 #{code} | {base}")[:279]
 
-def build_tweet(code: str, snippet: str) -> str:
-    base = summarize(snippet, 240)
-    return (f"📰 #{code} | " + base)[:279]
-
-def infinite_scroll(page, steps=3, pause_ms=350):
+def infinite_scroll(page, steps=6, pause_ms=300):
     for _ in range(steps):
-        page.mouse.wheel(0, 1600)
+        page.mouse.wheel(0, 1800)
         page.wait_for_timeout(pause_ms)
 
-def go_highlights(page):
-    selectors = [
-        "button:has-text('Öne çıkanlar')",
-        "role=button[name='Öne çıkanlar']",
-        "text='Öne çıkanlar'",
-        "xpath=//button[contains(normalize-space(.),'Öne çıkanlar')]",
-    ]
-    for sel in selectors:
+# ---------- 1) Network üzerinden yakala ----------
+def extract_from_string(s: str):
+    if NON_NEWS.search(s): return None
+    m = re.search(r"\bKAP\s*[-–]\s*([A-ZÇĞİÖŞÜ]{3,6}[0-9]?)\b", s)
+    if not m: return None
+    code = m.group(1).upper()
+    if not TICKER_RE.fullmatch(code): return None
+    # 'KAP - KOD' sonrası
+    after = re.split(rf"KAP\s*[-–]\s*{re.escape(code)}\s*", s, flags=re.I, maxsplit=1)
+    detail = clean_text(after[1] if len(after) == 2 else s)
+    if len(detail) < 8: return None
+    return {"id": f"{code}-{hash(s)}", "code": code, "snippet": detail}
+
+def walk_json(x, bag):
+    if isinstance(x, dict):
+        for v in x.values(): walk_json(v, bag)
+    elif isinstance(x, list):
+        for v in x: walk_json(v, bag)
+    elif isinstance(x, str):
+        if "KAP" in x: bag.append(re.sub(r"\s+", " ", x).strip())
+
+def fetch_via_network(page):
+    captured = []
+    def on_response(resp):
+        url = (resp.url or "").lower()
+        if "topic-feed" not in url: return
         try:
-            loc = page.locator(sel).first
-            if loc and loc.count() > 0:
-                loc.click(timeout=1500)
-                page.wait_for_load_state("networkidle")
-                page.wait_for_timeout(300)
-                print(">> highlights ON")
-                return True
+            ctype = resp.headers.get("content-type","").lower()
+            if "json" in ctype:
+                data = resp.json(); tmp = []; walk_json(data, tmp); captured.extend(tmp)
+            else:
+                txt = resp.text(); 
+                if txt: captured.extend(txt.splitlines())
         except Exception:
             pass
-    print(">> highlights button not found; staying on 'Tümü'")
-    return False
+    page.on("response", on_response)
 
-# --- yalnızca metin düğümlerini al (button/svg hariç) ---
-def get_text_only(div_locator):
-    return div_locator.evaluate("""
-        el => Array.from(el.childNodes)
-                  .filter(n => n.nodeType === Node.TEXT_NODE)
-                  .map(n => n.textContent)
-                  .join(' ')
-    """)
-
-# ================== SCRAPE (KAP etiketi + mavi kod) ==================
-def extract_company_rows(page, max_collect=60):
-    """
-    Sadece KAP etiketli satırlar:
-      - KAP etiketi:  div.text-utility-02.text-fg-03  (innerText == 'KAP')
-      - Hisse kodu:   span.text-shared-brand-01        (örn. ONCSM, YBTAS)
-      - Haber detayı: div.font-medium.text-body-sm     (yalın metin)
-    Dönüş: yeni→eski (ekranda görünen sıra)
-    """
-    row_xpath = (
-        "//li[.//div[contains(@class,'text-utility-02') and contains(@class,'text-fg-03') and normalize-space()='KAP']"
-        "    and .//span[contains(@class,'text-shared-brand-01')]]"
-        " | "
-        "//div[.//div[contains(@class,'text-utility-02') and contains(@class,'text-fg-03') and normalize-space()='KAP']"
-        "     and .//span[contains(@class,'text-shared-brand-01')]]"
-    )
-    rows = page.locator(f"xpath={row_xpath}")
-    total = min(600, rows.count())
-    print(">> raw rows (KAP-filtered):", total)
+    page.goto(AKIS_URL, wait_until="domcontentloaded")
+    page.wait_for_load_state("networkidle")
+    infinite_scroll(page, 6, 300)
 
     items = []
-    for i in range(total):
-        if len(items) >= max_collect:
-            break
-        row = rows.nth(i)
+    for s in captured:
+        it = extract_from_string(s)
+        if it: items.append(it)
 
-        # 1) Kod
-        try:
-            code = row.locator("span.text-shared-brand-01").first.inner_text().strip().upper()
-        except Exception:
-            code = ""
-        if not code or not TICKER_RE.fullmatch(code) or code in BANNED_TAGS:
-            continue
+    # uniq yeni→eski
+    uniq, seen = [], set()
+    for it in items:
+        k = (it["code"], it["snippet"])
+        if k in seen: continue
+        seen.add(k); uniq.append(it)
+    return uniq
 
-        # 2) Detay
-        detail_loc = row.locator("div.font-medium.text-body-sm").first
-        if detail_loc.count() == 0:
-            continue
-        try:
-            detail = get_text_only(detail_loc)
-        except Exception:
-            detail = detail_loc.inner_text()
-        detail = clean_text(detail)
-        if len(detail) < 10:
-            continue
+# ---------- 2) DOM üzerinden (senin sınıflarla) ----------
+DOM_JS = r"""
+(() => {
+  const norm = s => (s||"").replace(/\u00A0/g,' ').replace(/\s+/g,' ').trim();
+  const rows = Array.from(document.querySelectorAll("li, div"));
 
-        # 3) Güvenlik: bülten vs ele
-        if any(re.search(p, detail, re.I) for p in NON_NEWS_PATTERNS):
-            continue
+  const out = [];
+  for (const r of rows) {
+    const kap = r.querySelector("div.text-utility-02.text-fg-03");
+    const codeEl = r.querySelector("span.text-shared-brand-01");
+    if (!kap || !codeEl) continue;
+    if (norm(kap.textContent) !== "KAP") continue;
 
-        rid = f"{code}-{hash(code + '|' + detail)}"
-        items.append({"id": rid, "code": code, "snippet": detail})
+    const code = norm(codeEl.textContent).toUpperCase();
+    if (!/^[A-ZÇĞİÖŞÜ]{3,6}[0-9]?$/.test(code)) continue;
 
+    const d = r.querySelector("div.font-medium.text-body-sm");
+    if (!d) continue;
+    // sadece text node'ları al (button/svg hariç)
+    const detail = norm(Array.from(d.childNodes)
+      .filter(n => n.nodeType === Node.TEXT_NODE)
+      .map(n => n.textContent).join(" "));
+    if (!detail || /Fintables|G[üu]nl[üu]k\s*B[üu]lten|Bültenler?/i.test(detail)) continue;
+
+    out.push({ code, detail });
+  }
+
+  // uniq yeni→eski
+  const seen = new Set();
+  return out.filter(it => {
+    const k = it.code + "|" + it.detail;
+    if (seen.has(k)) return false;
+    seen.add(k); return true;
+  });
+})()
+"""
+
+def fetch_via_dom(page):
+    page.goto(AKIS_URL, wait_until="domcontentloaded")
+    page.wait_for_load_state("networkidle")
+    infinite_scroll(page, 6, 300)
+    try:
+        raw = page.evaluate(DOM_JS)
+    except Exception:
+        raw = []
+    items = []
+    for it in raw:
+        code = it["code"].upper()
+        if not TICKER_RE.fullmatch(code): continue
+        detail = clean_text(it["detail"])
+        if len(detail) < 8: continue
+        items.append({"id": f"{code}-{hash(code+'|'+detail)}", "code": code, "snippet": detail})
     return items
 
-# ================== MAIN ==================
+# ===== MAIN =====
 def main():
-    print(">> start")
+    print(">> start (hybrid featured)")
     tw = twitter_client()
 
     with sync_playwright() as p:
@@ -172,27 +173,23 @@ def main():
         ctx = browser.new_context(
             user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                         "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
-            locale="tr-TR", timezone_id="Europe/Istanbul"
+            locale="tr-TR", timezone_id="Europe/Istanbul",
         )
         ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
-
         page = ctx.new_page(); page.set_default_timeout(30000)
-        page.goto(AKIS_URL, wait_until="networkidle")
-        page.wait_for_timeout(500)
-        go_highlights(page)
-        infinite_scroll(page, steps=3, pause_ms=350)
 
-        items = extract_company_rows(page, max_collect=60)
+        items = fetch_via_network(page)
+        if not items:
+            items = fetch_via_dom(page)
+
         if not items:
             print(">> no eligible rows"); browser.close(); return
 
-        # state filtresi
         new_items = [it for it in items if it["id"] not in posted]
         if not new_items:
             print(">> nothing new to post"); browser.close(); return
 
-        # eskiden → yeniye sırala
-        new_items.reverse()
+        new_items.reverse()  # eskiden → yeniye
 
         sent = 0
         for it in new_items:
@@ -209,7 +206,7 @@ def main():
             time.sleep(2)
 
         browser.close()
-        print(">> done (posted:", sent, ")")
+        print(f">> done (posted: {sent})")
 
 if __name__ == "__main__":
     main()
