@@ -3,7 +3,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 import tweepy
 
-# ===== X (Twitter) =====
+# ================== X (Twitter) SECRETS ==================
 API_KEY = os.getenv("API_KEY")
 API_KEY_SECRET = os.getenv("API_KEY_SECRET")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
@@ -14,30 +14,36 @@ def twitter_client():
         print("!! Twitter secrets missing; tweets will be skipped")
         return None
     return tweepy.Client(
-        consumer_key=API_KEY, consumer_secret=API_KEY_SECRET,
-        access_token=ACCESS_TOKEN, access_token_secret=ACCESS_TOKEN_SECRET
+        consumer_key=API_KEY,
+        consumer_secret=API_KEY_SECRET,
+        access_token=ACCESS_TOKEN,
+        access_token_secret=ACCESS_TOKEN_SECRET,
     )
 
-# ===== STATE =====
+# ================== STATE ==================
 STATE_FILE = Path("state.json")
 posted = set(json.loads(STATE_FILE.read_text())) if STATE_FILE.exists() else set()
 def save_state():
     keep = sorted(list(posted))[-5000:]
     STATE_FILE.write_text(json.dumps(keep, ensure_ascii=False))
 
-# ===== HELPERS =====
+# ================== HELPERS ==================
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
+
 UPPER_TR = "A-ZÇĞİÖŞÜ"
 TICKER_RE = re.compile(rf"^[{UPPER_TR}]{{3,6}}[0-9]?$")
-NON_NEWS_PATTERNS = [r"\bGünlük Bülten\b", r"\bBülten\b"]
+
 BANNED_TAGS = {"KAP","FINTABLES","FİNTABLES","GÜNLÜK","BÜLTEN","BULTEN","GUNLUK","HABER"}
+NON_NEWS_PATTERNS = [r"\bGünlük Bülten\b", r"\bBülten\b"]
 
 STOP_PHRASES = [
     r"işbu açıklama.*?amaçla", r"yatırım tavsiyesi değildir",
     r"kamunun bilgisine arz olunur", r"saygılarımızla",
     r"özel durum açıklaması", r"yatırımcılarımızın bilgisine",
 ]
-TIME_PATTERNS = [r"\b\d{1,2}:\d{2}\b", r"\bDün\s+\d{1,2}:\d{2}\b", r"\bBugün\b", r"\bAz önce\b"]
+TIME_PATTERNS = [
+    r"\b\d{1,2}:\d{2}\b", r"\bDün\s+\d{1,2}:\d{2}\b", r"\bBugün\b", r"\bAz önce\b"
+]
 
 def clean_text(t: str) -> str:
     t = re.sub(r"\s+", " ", (t or "")).strip()
@@ -88,9 +94,8 @@ def go_highlights(page):
     print(">> highlights button not found; staying on 'Tümü'")
     return False
 
-# === NEW: sınıfa dayalı sağlam çıkarım ===
+# --- yalnızca metin düğümlerini al (button/svg hariç) ---
 def get_text_only(div_locator):
-    """div.font-medium.text-body-sm içindeki yalnızca metin düğümlerini döndürür (button/svg hariç)."""
     return div_locator.evaluate("""
         el => Array.from(el.childNodes)
                   .filter(n => n.nodeType === Node.TEXT_NODE)
@@ -98,25 +103,33 @@ def get_text_only(div_locator):
                   .join(' ')
     """)
 
+# ================== SCRAPE (KAP etiketi + mavi kod) ==================
 def extract_company_rows(page, max_collect=60):
     """
-    Satırlar: li/div içinde
-      - kod: span.text-shared-brand-01
-      - detay: div.font-medium.text-body-sm (yalnızca text nodes)
-    Sadece 'KAP' içerenler; Fintables/Bülten hariç.
-    Dönen: yeni→eski
+    Sadece KAP etiketli satırlar:
+      - KAP etiketi:  div.text-utility-02.text-fg-03  (innerText == 'KAP')
+      - Hisse kodu:   span.text-shared-brand-01        (örn. ONCSM, YBTAS)
+      - Haber detayı: div.font-medium.text-body-sm     (yalın metin)
+    Dönüş: yeni→eski (ekranda görünen sıra)
     """
-    # Kod sınıfını taşıyan satırlar
-    rows = page.locator("xpath=//li[.//span[contains(@class,'text-shared-brand-01')]] | //div[.//span[contains(@class,'text-shared-brand-01')]]")
+    row_xpath = (
+        "//li[.//div[contains(@class,'text-utility-02') and contains(@class,'text-fg-03') and normalize-space()='KAP']"
+        "    and .//span[contains(@class,'text-shared-brand-01')]]"
+        " | "
+        "//div[.//div[contains(@class,'text-utility-02') and contains(@class,'text-fg-03') and normalize-space()='KAP']"
+        "     and .//span[contains(@class,'text-shared-brand-01')]]"
+    )
+    rows = page.locator(f"xpath={row_xpath}")
     total = min(600, rows.count())
-    print(">> raw rows:", total)
+    print(">> raw rows (KAP-filtered):", total)
 
     items = []
     for i in range(total):
-        if len(items) >= max_collect: break
+        if len(items) >= max_collect:
+            break
         row = rows.nth(i)
 
-        # 1) kod
+        # 1) Kod
         try:
             code = row.locator("span.text-shared-brand-01").first.inner_text().strip().upper()
         except Exception:
@@ -124,19 +137,7 @@ def extract_company_rows(page, max_collect=60):
         if not code or not TICKER_RE.fullmatch(code) or code in BANNED_TAGS:
             continue
 
-        # 2) satırda 'KAP' var mı?
-        try:
-            row_text = re.sub(r"\s+", " ", row.inner_text()).strip()
-        except Exception:
-            row_text = ""
-        if "KAP" not in row_text.upper():
-            continue
-        if any(re.search(p, row_text, re.I) for p in NON_NEWS_PATTERNS):
-            continue
-        if re.search(r"\bFintables\b", row_text, re.I):
-            continue
-
-        # 3) detay
+        # 2) Detay
         detail_loc = row.locator("div.font-medium.text-body-sm").first
         if detail_loc.count() == 0:
             continue
@@ -148,12 +149,16 @@ def extract_company_rows(page, max_collect=60):
         if len(detail) < 10:
             continue
 
-        rid = f"{code}-{hash(row_text)}"
+        # 3) Güvenlik: bülten vs ele
+        if any(re.search(p, detail, re.I) for p in NON_NEWS_PATTERNS):
+            continue
+
+        rid = f"{code}-{hash(code + '|' + detail)}"
         items.append({"id": rid, "code": code, "snippet": detail})
 
     return items
 
-# ===== MAIN =====
+# ================== MAIN ==================
 def main():
     print(">> start")
     tw = twitter_client()
@@ -165,7 +170,8 @@ def main():
                   "--disable-blink-features=AutomationControlled"],
         )
         ctx = browser.new_context(
-            user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
+            user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
             locale="tr-TR", timezone_id="Europe/Istanbul"
         )
         ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
@@ -180,11 +186,12 @@ def main():
         if not items:
             print(">> no eligible rows"); browser.close(); return
 
+        # state filtresi
         new_items = [it for it in items if it["id"] not in posted]
         if not new_items:
             print(">> nothing new to post"); browser.close(); return
 
-        # Eskiden → yeniye
+        # eskiden → yeniye sırala
         new_items.reverse()
 
         sent = 0
