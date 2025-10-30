@@ -1,7 +1,7 @@
 name: Run bot (remote dispatch)
 
 on:
-  workflow_dispatch: {}   # Elle veya API ile tetiklenecek
+  workflow_dispatch: {}   # sadece dış tetikleme/manuel
 
 jobs:
   run:
@@ -13,14 +13,20 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # -------------- STATE.json geri yükle --------------
+      # ----- CACHE KEY üret (benzersiz) -----
+      - name: Compute cache key
+        id: key
+        shell: bash
+        run: |
+          echo "key=state-v1-$(date -u +%Y%m%d%H%M%S)" >> $GITHUB_OUTPUT
+
+      # ----- ÖNCEKİ state.json'u geri yükle -----
       - name: Restore state cache
         id: cache-restore
         uses: actions/cache/restore@v4
         with:
-          path: |
-            state.json
-          key: state-v1-${{ github.run_id }}
+          path: state.json
+          key: ${{ steps.key.outputs.key }}
           restore-keys: |
             state-v1-
 
@@ -49,16 +55,14 @@ jobs:
         run: |
           python -u main.py
 
-      # -------------- STATE.json'u kaydet --------------
+      # ----- Güncellenen state.json'u kaydet -----
       - name: Save updated state cache
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: |
-            state.json
-          key: state-v1-${{ github.run_id }}
+          path: state.json
+          key: ${{ steps.key.outputs.key }}
 
-      # -------------- Debug çıktıları --------------
       - name: Upload debug artifacts (logs & screenshots)
         if: always()
         uses: actions/upload-artifact@v4
