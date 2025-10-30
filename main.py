@@ -57,6 +57,9 @@ def load_state():
 
 def save_state(s):
     try:
+        # posted listesini şişirmemek için son 5000 kaydı tut
+        if "posted" in s and isinstance(s["posted"], list):
+            s["posted"] = s["posted"][-5000:]
         STATE_PATH.write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
         log(f"state.json güncellendi: {len(s.get('posted', []))} tweet kaydedildi")
     except Exception as e:
@@ -105,27 +108,29 @@ JS_EXTRACTOR = r"""
   const skip = /(Fintables|Günlük Bülten|Analist|Bülten|Fintables Akış)/i;
 
   for (const a of nodes) {
-    const text = a.textContent;
+    const text = a.textContent || "";
+    const href = (a.href || a.getAttribute('href') || "").split('?')[0];
     const match = text.match(/KAP\s*[:•·]\s*([A-ZÇĞİÖŞÜ]{2,6})\s*([^]+?)(?=\n|$)/i);
     if (!match) continue;
 
     const code = match[1].toUpperCase();
-    let content = match[2].trim();
+    let content = (match[2] || "").trim();
     if (content.length < 20 || skip.test(content)) continue;
 
     content = content.replace(/^[^\wÇĞİÖŞÜçğıöşü]+/u, '').replace(/\s+/g, ' ').trim();
 
+    // HREF tabanlı stabil hash → metin ufak değişse bile aynı ID kalsın
     let hash = 0;
-    const raw = a.textContent;
-    for (let i = 0; i < raw.length; i++) {
-      hash = ((hash << 5) - hash + raw.charCodeAt(i)) | 0;
+    const rawForHash = href || text;
+    for (let i = 0; i < rawForHash.length; i++) {
+      hash = ((hash << 5) - hash + rawForHash.charCodeAt(i)) | 0;
     }
 
     out.push({
       id: `kap-${code}-${Math.abs(hash)}`,
       codes: [code],
       content: content,
-      raw: raw
+      raw: text
     });
   }
   return out;
@@ -133,14 +138,27 @@ JS_EXTRACTOR = r"""
 """
 
 # MEGAFON + ESTETİK + BENZERSİZ ID
+TWEET_EMOJI = "📣"
+
 def build_tweet(codes, content, tweet_id="") -> str:
     codes_str = " ".join(f"#{c}" for c in codes)
     text = re.sub(r'^\d{1,2}:\d{2}\s*', '', content).strip()
-    if len(text) > 230:
-        cutoff = text[:230].rfind(".")
-        text = (text[:cutoff + 1] + "..." if cutoff > 160 else text[:227].rsplit(" ", 1)[0] + "...")
+
+    prefix = f"{TWEET_EMOJI} {codes_str} | "
     uniq = tweet_id[-4:] if tweet_id else ""
-    return f" {codes_str} | {text}{' [K'+uniq+']' if uniq else ''}"[:280]
+    suffix = f" [K{uniq}]" if uniq else ""
+
+    max_len = 279 - len(prefix) - len(suffix)
+    if len(text) > max_len:
+        cut = text[:max_len]
+        dot = cut.rfind(".")
+        if dot >= 0 and dot >= max_len - 120:
+            cut = cut[:dot + 1]
+        else:
+            cut = cut.rsplit(" ", 1)[0] if " " in cut else cut
+        text = cut.rstrip() + "..."
+
+    return (prefix + text + suffix)[:279]
 
 # ================== SAYFA İŞLEMLERİ ==================
 def goto_with_retry(page, url, retries=3) -> bool:
@@ -268,8 +286,10 @@ def main():
 
         sent = 0
         for it in to_send:
-            if sent >= MAX_PER_RUN: break
-            if not it.get("codes") or not it.get("content"): continue
+            if sent >= MAX_PER_RUN:
+                break
+            if not it.get("codes") or not it.get("content"):
+                continue
 
             tweet = build_tweet(it["codes"], it["content"], it["id"])
             log(f"Tweeting: {tweet}")
