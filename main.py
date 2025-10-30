@@ -16,11 +16,9 @@ API_KEY_SECRET     = os.getenv("API_KEY_SECRET")
 ACCESS_TOKEN       = os.getenv("ACCESS_TOKEN")
 ACCESS_TOKEN_SECRET= os.getenv("ACCESS_TOKEN_SECRET")
 
-# ---------------- logging ----------------
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%H:%M:%S')
 log = logging.info
 
-# ---------------- state ----------------
 def load_state():
     if STATE_PATH.exists():
         try:
@@ -44,7 +42,6 @@ def in_cooldown() -> bool:
     except:
         return False
 
-# ---------------- twitter ----------------
 def twitter_client() -> Optional[tweepy.Client]:
     if not all([API_KEY, API_KEY_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET]):
         log("Twitter anahtarları yok → simülasyon mod")
@@ -77,19 +74,16 @@ def tweet(client: Optional[tweepy.Client], text: str) -> bool:
         log(f"Tweet hata: {e}")
         return False
 
-# ---------------- helpers ----------------
 UPPER = "A-ZÇĞİÖŞÜ"
 KAP_HEADER_RE = re.compile(
     rf"^KAP\s*[•·\-\.:]?\s*([{UPPER}]{{3,6}})(?:\s*/\s*([{UPPER}]{{3,6}}))?",
     re.UNICODE
 )
-
-SPAM_PAT = re.compile(r"(Fintables|Günlük Bülten|Bülten|Piyasa|Analiz|Analyst|Rapor|KVK|Kişisel Veri)", re.I)
+SPAM_PAT = re.compile(r"(Fintables|Bülten|Piyasa|Analiz|Rapor|KVK|Kişisel Veri)", re.I)
 REL_TIME = re.compile(r"\b(Dün|Bugün)\b", re.I)
 CLOCK = re.compile(r"\b\d{1,2}:\d{2}\b")
 
 def clean_detail(text: str) -> str:
-    # satırları birleştir, zaman ve kaynak kırpıntılarını kaldır
     t = re.sub(r"\s+", " ", (text or "")).strip()
     t = REL_TIME.sub("", t)
     t = CLOCK.sub("", t)
@@ -101,11 +95,10 @@ def build_id(codes: List[str], detail: str) -> str:
     return f"kap-{'-'.join(codes)}-{h}"
 
 def build_tweet(codes: List[str], detail: str) -> str:
-    codes_part = " ".join(f"#{c}" for c in codes[:2])  # en çok 2 kod
+    codes_part = " ".join(f"#{c}" for c in codes[:2])
     txt = f"📰 {codes_part} | {detail}"
     return txt[:279]
 
-# ---------------- DOM extractor (linke tıklamadan) ----------------
 JS_EXTRACTOR = r"""
 () => {
   const cards = Array.from(document.querySelectorAll("main div, main li, main article"));
@@ -113,16 +106,12 @@ JS_EXTRACTOR = r"""
   for (const el of cards) {
     const raw = (el.innerText || "").trim();
     if (!raw) continue;
-    // İlk satır genellikle başlık (KAP · KOD(/KOD2) ... saat)
     const lines = raw.split(/\n+/).map(s => s.trim()).filter(Boolean);
     if (lines.length < 2) continue;
     const header = lines[0];
     if (!/^KAP\b/.test(header)) continue;
-
-    // Detayı: başlıktan sonra gelen satırları birleştir
     let detail = lines.slice(1).join(" ").replace(/\s+/g, " ").trim();
     if (!detail || detail.length < 30) continue;
-
     blocks.push({header, detail});
   }
   return blocks;
@@ -137,100 +126,90 @@ def extract_items(page) -> List[dict]:
         detail = blk["detail"]
         if SPAM_PAT.search(header) or SPAM_PAT.search(detail):
             continue
-
         m = KAP_HEADER_RE.search(header.upper())
         if not m: 
             continue
-
         codes = [m.group(1)]
-        if m.group(2):
-            codes.append(m.group(2))
-
-        # kod temizliği
+        if m.group(2): codes.append(m.group(2))
         codes = [c for c in codes if re.fullmatch(rf"[{UPPER}]{{3,6}}", c)]
-        if not codes:
-            continue
-
+        if not codes: continue
         detail_clean = clean_detail(detail)
-        if len(detail_clean) < 30:
-            continue
-
+        if len(detail_clean) < 30: continue
         item_id = build_id(codes, detail_clean)
         items.append({"id": item_id, "codes": codes, "content": detail_clean})
     return items
 
-# ---------------- main ----------------
 def main():
     log("Başladı")
     if in_cooldown():
         log("Cooldown aktif, çıkılıyor")
         return
-
     tw = twitter_client()
 
-    with sync_playwright().start() as pw:
-        br = pw.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
-        ctx = br.new_context(
-            locale="tr-TR",
-            timezone_id="Europe/Istanbul",
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/118.0.0.0 Safari/537.36")
-        )
-        pg = ctx.new_page(); pg.set_default_timeout(30000)
+    pw = sync_playwright().start()
+    br = pw.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
+    ctx = br.new_context(
+        locale="tr-TR",
+        timezone_id="Europe/Istanbul",
+        user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/118 Safari/537.36")
+    )
+    pg = ctx.new_page()
+    pg.set_default_timeout(30000)
 
-        # sayfayı yükle (küçük retry)
-        for attempt in range(3):
-            try:
-                log(f"Sayfa yükleme deneme {attempt+1}/3")
-                pg.goto(AKIS_URL, wait_until="networkidle")
-                break
-            except Exception as e:
-                log(f"Yükleme hatası: {e}")
-                if attempt == 2:
-                    ctx.close(); br.close(); return
-                time.sleep(3)
-
-        # Öne çıkanlar
+    # sayfayı aç
+    for attempt in range(3):
         try:
-            pg.locator("text=Öne çıkanlar").first.click(timeout=4000)
-            pg.wait_for_timeout(800)
-        except:
-            pass
+            log(f"Sayfa yükleme deneme {attempt+1}/3")
+            pg.goto(AKIS_URL, wait_until="networkidle")
+            break
+        except Exception as e:
+            log(f"Yükleme hatası: {e}")
+            if attempt == 2:
+                ctx.close(); br.close(); pw.stop()
+                return
+            time.sleep(3)
 
-        # biraz aşağı kaydır ki kartlar render olsun
-        try:
-            pg.evaluate("window.scrollTo(0, 600)")
-            pg.wait_for_timeout(600)
-        except:
-            pass
+    # "Öne çıkanlar" sekmesi
+    try:
+        pg.locator("text=Öne çıkanlar").first.click(timeout=4000)
+        pg.wait_for_timeout(800)
+    except:
+        pass
 
-        # kartlardan çek
-        items = extract_items(pg)
-        log(f"Bulunan KAP haberleri: {len(items)}")
-        if not items:
-            ctx.close(); br.close(); return
+    try:
+        pg.evaluate("window.scrollTo(0, 600)")
+        pg.wait_for_timeout(600)
+    except:
+        pass
 
-        # eski→yeni ve sadece yeni olanlar
-        new_items = [i for i in reversed(items) if i["id"] not in state["posted"]]
-        if not new_items:
-            log("Yeni haber yok")
-            ctx.close(); br.close(); return
+    items = extract_items(pg)
+    log(f"Bulunan KAP haberleri: {len(items)}")
+    if not items:
+        ctx.close(); br.close(); pw.stop()
+        return
 
-        sent = 0
-        for it in new_items:
-            if sent >= MAX_PER_RUN: break
-            t = build_tweet(it["codes"], it["content"])
-            log(f"TWEET: {t}")
-            ok = tweet(tw, t)
-            if not ok: break
-            state["posted"].append(it["id"])
-            save_state(state)
-            sent += 1
-            time.sleep(2)
+    new_items = [i for i in reversed(items) if i["id"] not in state["posted"]]
+    if not new_items:
+        log("Yeni haber yok")
+        ctx.close(); br.close(); pw.stop()
+        return
 
-        log(f"Bitti. Gönderilen: {sent}")
-        ctx.close(); br.close()
+    sent = 0
+    for it in new_items:
+        if sent >= MAX_PER_RUN: break
+        t = build_tweet(it["codes"], it["content"])
+        log(f"TWEET: {t}")
+        ok = tweet(tw, t)
+        if not ok: break
+        state["posted"].append(it["id"])
+        save_state(state)
+        sent += 1
+        time.sleep(2)
+
+    log(f"Bitti. Gönderilen: {sent}")
+    ctx.close(); br.close(); pw.stop()
 
 if __name__ == "__main__":
     main()
