@@ -132,7 +132,7 @@ JS_EXTRACTOR = r"""
 }
 """
 
-# MEGAFONLU + ESTETİK + BENZERSİZ ID
+# MEGAFON + ESTETİK + BENZERSİZ ID
 def build_tweet(codes, content, tweet_id="") -> str:
     codes_str = " ".join(f"#{c}" for c in codes)
     text = re.sub(r'^\d{1,2}:\d{2}\s*', '', content).strip()
@@ -247,12 +247,16 @@ def main():
             return
 
         posted_set = set(state.get("posted", []))
-        newest_id = items[0]["id"]
+        newest_id = items[0]["id"]  # EN YENİ HABERİN ID'Sİ
         to_send = []
         last_id = state.get("last_id")
+
+        # YENİ HABERLERİ BUL
         for it in items:
             if last_id and it["id"] == last_id:
                 break
+            if it["id"] in posted_set:
+                continue
             to_send.append(it)
 
         if not to_send:
@@ -265,7 +269,6 @@ def main():
         sent = 0
         for it in to_send:
             if sent >= MAX_PER_RUN: break
-            if it["id"] in posted_set: continue
             if not it.get("codes") or not it.get("content"): continue
 
             tweet = build_tweet(it["codes"], it["content"], it["id"])
@@ -275,7 +278,6 @@ def main():
                 if ok:
                     posted_set.add(it["id"])
                     state["posted"] = sorted(list(posted_set))
-                    state["last_id"] = newest_id
                     state["count_today"] += 1
                     save_state(state)
                     sent += 1
@@ -287,6 +289,11 @@ def main():
                     save_state(state)
                     log("Rate limit → cooldown")
                     break
+
+        # SONRA last_id GÜNCELLE
+        if sent > 0:
+            state["last_id"] = newest_id
+            save_state(state)
 
         browser.close()
         log(f"Bitti. Gönderilen: {sent}")
