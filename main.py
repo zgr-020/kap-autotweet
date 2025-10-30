@@ -6,6 +6,7 @@ import time
 import logging
 from pathlib import Path
 from datetime import datetime as dt, timezone, timedelta
+from random import randint
 
 os.environ["TZ"] = "Europe/Istanbul"
 try:
@@ -21,7 +22,10 @@ AKIS_URL = "https://fintables.com/borsa-haber-akisi"
 STATE_PATH = Path("state.json")
 MAX_PER_RUN = 5
 MAX_TODAY = 25
-COOLDOWN_MIN = 15
+
+# Daha güvenli backoff
+COOLDOWN_MIN_DEFAULT = 45           # eskiden 15'ti
+MIN_GAP_SEC = 90                    # tweetler arası asgari süre
 
 # ================== SECRETS ==================
 API_KEY = os.getenv("API_KEY")
@@ -40,7 +44,14 @@ log = logging.getLogger().info
 
 # ================== STATE ==================
 def load_state():
-    default = {"last_id": None, "posted": [], "cooldown_until": None, "count_today": 0, "day": None}
+    default = {
+        "last_id": None,
+        "posted": [],
+        "cooldown_until": None,
+        "count_today": 0,
+        "day": None,
+        "last_sent_at": None,   # tweetler arası hız limiti için
+    }
     if not STATE_PATH.exists():
         return default
     try:
@@ -57,9 +68,8 @@ def load_state():
 
 def save_state(s):
     try:
-        # posted listesini şişirmemek için son 5000 kaydı tut
         if "posted" in s and isinstance(s["posted"], list):
-            s["posted"] = s["posted"][-5000:]
+            s["posted"] = s["posted"][-5000:]  # şişmeyi önle
         STATE_PATH.write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
         log(f"state.json güncellendi: {len(s.get('posted', []))} tweet kaydedildi")
     except Exception as e:
@@ -95,12 +105,12 @@ def send_tweet(client, text: str) -> bool:
             log("Twitter: Duplicate content → zaten atılmış, atlanıyor")
             return True
         if "429" in err_msg or "too many requests" in err_msg:
-            log("Rate limit → 15 dk cooldown")
+            # üst bloğa RuntimeError olarak bildir
             raise RuntimeError("RATE_LIMIT")
         log(f"Tweet hatası: {e}")
         return False
 
-# ================== EXTRACTOR ==================
+# ================== EXTRACTOR (çoklu kod desteği) ==================
 JS_EXTRACTOR = r"""
 () => {
   const out = [];
@@ -108,18 +118,28 @@ JS_EXTRACTOR = r"""
   const skip = /(Fintables|Günlük Bülten|Analist|Bülten|Fintables Akış)/i;
 
   for (const a of nodes) {
-    const text = a.textContent || "";
+    const text = (a.textContent || "").replace(/\s+/g, " ").trim();
     const href = (a.href || a.getAttribute('href') || "").split('?')[0];
-    const match = text.match(/KAP\s*[:•·]\s*([A-ZÇĞİÖŞÜ]{2,6})\s*([^]+?)(?=\n|$)/i);
-    if (!match) continue;
 
-    const code = match[1].toUpperCase();
-    let content = (match[2] || "").trim();
+    // "KAP:" sonrası kısmı al
+    const kapSplit = text.split(/KAP\s*[:•·-]\s*/i);
+    if (kapSplit.length < 2) continue;
+    const afterKap = kapSplit[1];
+
+    // İlk cümle/başlıktan kod adaylarını topla (A-Z 2-6)
+    const head = afterKap.split(/[.|–—-]|\u2013|\u2014|\n/i)[0];
+    const rawCodes = Array.from(head.matchAll(/\b[A-ZÇĞİÖŞÜ]{2,6}\b/g)).map(m => m[0].toUpperCase());
+    const codes = [...new Set(rawCodes)].slice(0, 3);
+    if (codes.length === 0) continue;
+
+    // İçerikten baştaki kod listesini temizle
+    let content = afterKap
+      .replace(/^((?:[A-ZÇĞİÖŞÜ]{2,6})(?:\s*(?:,|\/|&|\+|-|ve)\s*[A-ZÇĞİÖŞÜ]{2,6}){0,5})\s*[:\-–—]?\s*/i, "")
+      .trim();
+
     if (content.length < 20 || skip.test(content)) continue;
 
-    content = content.replace(/^[^\wÇĞİÖŞÜçğıöşü]+/u, '').replace(/\s+/g, ' ').trim();
-
-    // HREF tabanlı stabil hash → metin ufak değişse bile aynı ID kalsın
+    // HREF tabanlı stabil hash
     let hash = 0;
     const rawForHash = href || text;
     for (let i = 0; i < rawForHash.length; i++) {
@@ -127,8 +147,8 @@ JS_EXTRACTOR = r"""
     }
 
     out.push({
-      id: `kap-${code}-${Math.abs(hash)}`,
-      codes: [code],
+      id: `kap-${codes.join('-')}-${Math.abs(hash)}`,
+      codes: codes,
       content: content,
       raw: text
     });
@@ -137,20 +157,18 @@ JS_EXTRACTOR = r"""
 }
 """
 
-# MEGAFON + ESTETİK
+# ================== TWEET FORMAT ==================
 TWEET_EMOJI = "📣"
-ADD_UNIQ = False  # ← etiketi kapat
+ADD_UNIQ = False  # benzersiz etiket kapalı
 
 def build_tweet(codes, content, tweet_id="") -> str:
     codes_str = " ".join(f"#{c}" for c in codes)
     text = re.sub(r'^\d{1,2}:\d{2}\s*', '', content).strip()
-
     prefix = f"{TWEET_EMOJI} {codes_str} | "
     suffix = ""
     if ADD_UNIQ and tweet_id:
         uniq = tweet_id[-4:]
         suffix = f" [K{uniq}]"
-
     max_len = 279 - len(prefix) - len(suffix)
     if len(text) > max_len:
         cut = text[:max_len]
@@ -160,7 +178,6 @@ def build_tweet(codes, content, tweet_id="") -> str:
         else:
             cut = cut.rsplit(" ", 1)[0] if " " in cut else cut
         text = cut.rstrip() + "..."
-
     return (prefix + text + suffix)[:279]
 
 # ================== SAYFA İŞLEMLERİ ==================
@@ -225,22 +242,26 @@ def main():
         state["count_today"] = 0
         state["day"] = today
 
+    # Cooldown kontrolü (TR saatine çevirip göster)
     if state.get("cooldown_until"):
         try:
             cd = dt.fromisoformat(state["cooldown_until"])
             cd = cd.replace(tzinfo=timezone.utc) if cd.tzinfo is None else cd
-            if dt.now(timezone.utc) < cd:
-                log("Cooldown aktif")
+            now_utc = dt.now(timezone.utc)
+            if now_utc < cd:
+                ist = timezone(timedelta(hours=3))
+                log(f"Cooldown aktif → bitecek: {(cd.astimezone(ist)).strftime('%Y-%m-%d %H:%M:%S')}")
                 return
             state["cooldown_until"] = None
         except:
             state["cooldown_until"] = None
 
     if state["count_today"] >= MAX_TODAY:
-        log(f"Günlük limit aşıldı")
+        log("Günlük limit aşıldı")
         return
 
     tw = twitter_client()
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
         ctx = browser.new_context(
@@ -268,11 +289,11 @@ def main():
             return
 
         posted_set = set(state.get("posted", []))
-        newest_id = items[0]["id"]  # EN YENİ HABERİN ID'Sİ
+        newest_id = items[0]["id"]
         to_send = []
         last_id = state.get("last_id")
 
-        # YENİ HABERLERİ BUL
+        # Yeni haberleri belirle
         for it in items:
             if last_id and it["id"] == last_id:
                 break
@@ -294,32 +315,42 @@ def main():
             if not it.get("codes") or not it.get("content"):
                 continue
 
+            # Tweetler arası hız limiti
+            try:
+                if state.get("last_sent_at"):
+                    last = dt.fromisoformat(state["last_sent_at"]).replace(tzinfo=timezone.utc)
+                    gap = (dt.now(timezone.utc) - last).total_seconds()
+                    if gap < MIN_GAP_SEC:
+                        wait = int(MIN_GAP_SEC - gap)
+                        log(f"Oransal hız limiti → {wait}s bekleniyor")
+                        time.sleep(wait)
+            except Exception:
+                pass
+
             tweet = build_tweet(it["codes"], it["content"], it["id"])
             log(f"Tweeting: {tweet}")
+
             try:
                 ok = send_tweet(tw, tweet)
                 if ok:
                     posted_set.add(it["id"])
                     state["posted"] = sorted(list(posted_set))
                     state["count_today"] += 1
+                    state["last_sent_at"] = dt.now(timezone.utc).isoformat()
                     save_state(state)
                     sent += 1
                     if tw and sent < MAX_PER_RUN:
-                        time.sleep(3)
+                        time.sleep(8 + randint(0, 5))  # 8–13 sn
             except RuntimeError as e:
                 if str(e) == "RATE_LIMIT":
-                    log("Rate limit → cooldown, başarısız tweet kaydedilmedi")
-                    state["cooldown_until"] = (dt.now(timezone.utc) + timedelta(minutes=COOLDOWN_MIN)).isoformat()
+                    mins = randint(30, 75)  # 30–75 dk arası rastgele cooldown
+                    until = dt.now(timezone.utc) + timedelta(minutes=mins)
+                    state["cooldown_until"] = until.isoformat()
                     save_state(state)
-                    break
-            except RuntimeError as e:
-                if str(e) == "RATE_LIMIT":
-                    state["cooldown_until"] = (dt.now(timezone.utc) + timedelta(minutes=COOLDOWN_MIN)).isoformat()
-                    save_state(state)
-                    log("Rate limit → cooldown")
+                    log(f"Rate limit → {mins} dk cooldown")
                     break
 
-        # SONRA last_id GÜNCELLE
+        # En son last_id güncelle
         if sent > 0:
             state["last_id"] = newest_id
             save_state(state)
