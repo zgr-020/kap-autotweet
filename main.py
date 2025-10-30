@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 from datetime import datetime as dt, timezone, timedelta
 
+# Zaman dilimi
 os.environ["TZ"] = "Europe/Istanbul"
 try:
     time.tzset()
@@ -91,7 +92,7 @@ def send_tweet(client, text: str) -> bool:
             raise RuntimeError("RATE_LIMIT")
         return False
 
-# ================== EXTRACTOR: KAP + KOD ayrı span'larda ==================
+# ================== EXTRACTOR: KAP + KOD ayrı span'larda (textContent ile) ==================
 JS_EXTRACTOR = r"""
 () => {
   const out = [];
@@ -99,23 +100,27 @@ JS_EXTRACTOR = r"""
   const skip = /(Fintables|Günlük Bülten|Analist|Bülten)/i;
 
   for (const a of nodes) {
-    const kapSpan = a.querySelector('div.text-utility-02 span:text-matches("^KAP$", "i")');
+    // KAP span'ini textContent ile bul
+    const kapSpan = Array.from(a.querySelectorAll('div.text-utility-02 span'))
+      .find(s => s.textContent.trim().toUpperCase() === 'KAP');
     if (!kapSpan) continue;
 
+    // Kodları bul
     const codeSpans = Array.from(a.querySelectorAll('span.inline-flex.text-shared-brand-01'))
-      .map(s => s.innerText.trim())
+      .map(s => s.textContent.trim())
       .filter(c => /^[A-ZÇĞİÖŞÜ]{2,6}$/.test(c));
 
     if (codeSpans.length === 0) continue;
 
+    // İçerik: ikinci div
     const contentDiv = a.querySelector('div.space-y-1 > div:nth-child(2)');
-    let content = contentDiv ? contentDiv.innerText.trim() : '';
-
-    content = content.replace(/^\p{P}+/u, '').replace(/\s+/g, ' ').trim();
+    let content = contentDiv ? contentDiv.textContent.trim() : '';
+    content = content.replace(/^[^\wÇĞİÖŞÜçğıöşü]+/u, '').replace(/\s+/g, ' ').trim();
     if (content.length < 15) continue;
 
+    // ID
     let hash = 0;
-    const raw = a.innerText;
+    const raw = a.textContent;
     for (let i = 0; i < raw.length; i++) {
       hash = ((hash << 5) - hash + raw.charCodeAt(i)) | 0;
     }
