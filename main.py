@@ -58,6 +58,7 @@ def load_state():
 def save_state(s):
     try:
         STATE_PATH.write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
+        log(f"state.json güncellendi: {len(s.get('posted', []))} tweet kaydedildi")
     except Exception as e:
         log(f"!! state.json kaydedilemedi: {e}")
 
@@ -126,12 +127,13 @@ JS_EXTRACTOR = r"""
 }
 """
 
+# YENİ: MEGAFON + SAAT KALDIR
 def build_tweet(codes, content) -> str:
     codes_str = " ".join(f"#{c}" for c in codes)
     text = re.sub(r'^\d{1,2}:\d{2}\s*', '', content).strip()
-    if len(text) > 240:
-        cutoff = text[:240].rfind(".")
-        text = (text[:cutoff + 1] + "..." if cutoff > 180 else text[:237].rsplit(" ", 1)[0] + "...")
+    if len(text) > 235:
+        cutoff = text[:235].rfind(".")
+        text = (text[:cutoff + 1] + "..." if cutoff > 170 else text[:232].rsplit(" ", 1)[0] + "...")
     return f"{codes_str} | {text}"[:280]
 
 # ================== SAYFA İŞLEMLERİ ==================
@@ -266,10 +268,10 @@ def main():
                 ok = send_tweet(tw, tweet)
                 if ok:
                     posted_set.add(it["id"])
-                    state["posted"] = sorted(list(posted_set))  # BU SATIR EKLENDİ!
+                    state["posted"] = sorted(list(posted_set))  # DÜZELTİLDİ!
                     state["last_id"] = newest_id
                     state["count_today"] += 1
-                    save_state(state)
+                    save_state(state)  # LOG EKLENDİ!
                     sent += 1
                     if tw and sent < MAX_PER_RUN:
                         time.sleep(3)
