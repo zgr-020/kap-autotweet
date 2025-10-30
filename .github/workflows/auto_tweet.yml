@@ -3,11 +3,13 @@ name: Run bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/30 * * * *'  # her 30 dakikada bir çalışır (isteğe göre değiştir)
+    - cron: '*/30 * * * *'  # her 30 dakikada bir çalışır (isteğe göre değiştirilebilir)
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      TZ: Europe/Istanbul  # Türkiye saati ile çalış
 
     steps:
       - name: Checkout repo
@@ -18,7 +20,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies (Playwright + Tweepy)
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install playwright tweepy
