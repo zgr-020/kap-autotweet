@@ -1,47 +1,21 @@
-name: Run bot
+name: Run bot manually
+
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: '*/30 * * * *' # her 30 dakikada bir çalışır
+  workflow_dispatch:  # sadece manuel tetiklenir
 
 jobs:
-  build:
+  run:
     runs-on: ubuntu-latest
-    env:
-      TZ: Europe/Istanbul # Türkiye saati ile çalış
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Install dependencies
+      - name: Install deps & run
         run: |
-          python -m pip install --upgrade pip
+          pip install --upgrade pip
           pip install playwright tweepy
           python -m playwright install --with-deps chromium
-
-      - name: Run bot
-        env:
-          API_KEY: ${{ secrets.API_KEY }}
-          API_KEY_SECRET: ${{ secrets.API_KEY_SECRET }}
-          ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-          ACCESS_TOKEN_SECRET: ${{ secrets.ACCESS_TOKEN_SECRET }}
-        run: |
           python -u main.py
-
-      # DEBUG: Hata olursa log + screenshot'ları Actions'ta göster
-      - name: Upload debug artifacts (logs & screenshots)
-        if: always()  # Hata olsa da, başarı olsa da çalışır
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-output
-          path: |
-            bot.log
-            debug-*.png
-            state.json
-          retention-days: 7
