@@ -1,200 +1,236 @@
-import os, re, json, hashlib, time
+import os, re, json, time, logging, base64
 from pathlib import Path
-import requests
-from bs4 import BeautifulSoup
-import tweepy
-
-# Playwright
+from datetime import datetime, timezone, timedelta
+from typing import List, Optional
 from playwright.sync_api import sync_playwright
+import tweepy
+from tweepy import TooManyRequests
 
-BASE_URL = "https://www.foreks.com/analizler/piyasa-analizleri/sirket"
-AMP_URL = BASE_URL.rstrip("/") + "/amp"
+AKIS_URL = "https://fintables.com/borsa-haber-akisi"
+STATE_PATH = Path("state.json")
+MAX_PER_RUN = 5
+COOLDOWN_MIN = 15
 
-STATE_PATH = Path("data/posted.json")
-UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36")
+API_KEY            = os.getenv("API_KEY")
+API_KEY_SECRET     = os.getenv("API_KEY_SECRET")
+ACCESS_TOKEN       = os.getenv("ACCESS_TOKEN")
+ACCESS_TOKEN_SECRET= os.getenv("ACCESS_TOKEN_SECRET")
 
-TICKER_RE = re.compile(r"\b[A-ZÇĞİÖŞÜ]{3,5}\b", re.UNICODE)
+# ---------------- logging ----------------
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%H:%M:%S')
+log = logging.info
 
+# ---------------- state ----------------
 def load_state():
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     if STATE_PATH.exists():
         try:
-            return set(json.loads(STATE_PATH.read_text()))
-        except Exception:
-            return set()
-    return set()
+            data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            data.setdefault("posted", [])
+            data.setdefault("cooldown_until", None)
+            return data
+        except:
+            pass
+    return {"posted": [], "cooldown_until": None}
 
-def save_state(ids):
-    STATE_PATH.write_text(json.dumps(sorted(list(ids)), ensure_ascii=False, indent=2))
+def save_state(s): STATE_PATH.write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
+state = load_state()
 
-def sha24(text: str) -> str:
-    import hashlib
-    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:24]
+def in_cooldown() -> bool:
+    cd = state.get("cooldown_until")
+    if not cd: return False
+    try:
+        until = datetime.fromisoformat(cd.replace("Z", "+00:00"))
+        return datetime.now(timezone.utc) < until
+    except:
+        return False
 
-def http_get(url):
-    r = requests.get(
-        url,
-        headers={
-            "User-Agent": UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-        },
-        timeout=25,
-    )
-    r.raise_for_status()
-    return r.text
+# ---------------- twitter ----------------
+def twitter_client() -> Optional[tweepy.Client]:
+    if not all([API_KEY, API_KEY_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET]):
+        log("Twitter anahtarları yok → simülasyon mod")
+        return None
+    try:
+        return tweepy.Client(
+            consumer_key=API_KEY,
+            consumer_secret=API_KEY_SECRET,
+            access_token=ACCESS_TOKEN,
+            access_token_secret=ACCESS_TOKEN_SECRET,
+        )
+    except Exception as e:
+        log(f"Twitter init hata: {e}")
+        return None
 
-def normalize_ticker(m: str) -> str:
-    return (m.replace("Ç","C").replace("Ğ","G").replace("İ","I")
-              .replace("Ö","O").replace("Ş","S").replace("Ü","U"))
+def tweet(client: Optional[tweepy.Client], text: str) -> bool:
+    if not client:
+        log(f"SIM TWEET: {text}")
+        return True
+    try:
+        client.create_tweet(text=text)
+        log("Tweet gönderildi")
+        return True
+    except TooManyRequests:
+        log("429: Limit doldu → cooldown")
+        state["cooldown_until"] = (datetime.now(timezone.utc) + timedelta(minutes=COOLDOWN_MIN)).isoformat()
+        save_state(state)
+        return False
+    except Exception as e:
+        log(f"Tweet hata: {e}")
+        return False
 
-def compose_tweet(ticker: str, title: str) -> str:
-    base = f"📰 #{ticker} | {title}"
-    return base if len(base) <= 279 else base[:276] + "…"
+# ---------------- helpers ----------------
+UPPER = "A-ZÇĞİÖŞÜ"
+KAP_HEADER_RE = re.compile(
+    rf"^KAP\s*[•·\-\.:]?\s*([{UPPER}]{{3,6}})(?:\s*/\s*([{UPPER}]{{3,6}}))?",
+    re.UNICODE
+)
 
-# ---------- Parsers ----------
-def extract_rows_from_html(html: str):
-    soup = BeautifulSoup(html, "lxml")
-    rows = []
+SPAM_PAT = re.compile(r"(Fintables|Günlük Bülten|Bülten|Piyasa|Analiz|Analyst|Rapor|KVK|Kişisel Veri)", re.I)
+REL_TIME = re.compile(r"\b(Dün|Bugün)\b", re.I)
+CLOCK = re.compile(r"\b\d{1,2}:\d{2}\b")
 
-    # Sayfadaki listeleri kaba tarama – etiket (kod) + başlık aynı blokta
-    for blk in soup.find_all(["li", "article", "div", "section"]):
-        a_tags = [a for a in blk.find_all("a") if a.get_text(strip=True)]
-        if not a_tags:
+def clean_detail(text: str) -> str:
+    # satırları birleştir, zaman ve kaynak kırpıntılarını kaldır
+    t = re.sub(r"\s+", " ", (text or "")).strip()
+    t = REL_TIME.sub("", t)
+    t = CLOCK.sub("", t)
+    t = re.sub(r"\b(Fintables|KAP)\b\s*[•·\-\.:]?\s*", "", t, flags=re.I)
+    return t.strip(" -–—:|•·")
+
+def build_id(codes: List[str], detail: str) -> str:
+    h = base64.urlsafe_b64encode(detail.encode("utf-8")).decode("ascii")[:10]
+    return f"kap-{'-'.join(codes)}-{h}"
+
+def build_tweet(codes: List[str], detail: str) -> str:
+    codes_part = " ".join(f"#{c}" for c in codes[:2])  # en çok 2 kod
+    txt = f"📰 {codes_part} | {detail}"
+    return txt[:279]
+
+# ---------------- DOM extractor (linke tıklamadan) ----------------
+JS_EXTRACTOR = r"""
+() => {
+  const cards = Array.from(document.querySelectorAll("main div, main li, main article"));
+  const blocks = [];
+  for (const el of cards) {
+    const raw = (el.innerText || "").trim();
+    if (!raw) continue;
+    // İlk satır genellikle başlık (KAP · KOD(/KOD2) ... saat)
+    const lines = raw.split(/\n+/).map(s => s.trim()).filter(Boolean);
+    if (lines.length < 2) continue;
+    const header = lines[0];
+    if (!/^KAP\b/.test(header)) continue;
+
+    // Detayı: başlıktan sonra gelen satırları birleştir
+    let detail = lines.slice(1).join(" ").replace(/\s+/g, " ").trim();
+    if (!detail || detail.length < 30) continue;
+
+    blocks.push({header, detail});
+  }
+  return blocks;
+}
+"""
+
+def extract_items(page) -> List[dict]:
+    blocks = page.evaluate(JS_EXTRACTOR)
+    items = []
+    for blk in blocks:
+        header = blk["header"]
+        detail = blk["detail"]
+        if SPAM_PAT.search(header) or SPAM_PAT.search(detail):
             continue
-        title_link = max(a_tags, key=lambda a: len(a.get_text(strip=True)))
-        title = " ".join(title_link.get_text(" ", strip=True).split())
-        if not title or "ŞİRKET HABERLERİ" in title.upper():
+
+        m = KAP_HEADER_RE.search(header.upper())
+        if not m: 
             continue
 
-        # Etiket/kod: kısa ve TAM büyük harfli link/etiket
-        codes = []
-        for el in blk.find_all(["a", "span", "div"]):
-            text = el.get_text(strip=True)
-            if not text or len(text) > 8:  # sağdaki chip kısadır
-                continue
-            for m in TICKER_RE.findall(text):
-                n = normalize_ticker(m)
-                if 3 <= len(n) <= 5 and n.isupper() and n not in {"TCMB","CEO","BIST"}:
-                    codes.append(n)
-        codes = list(dict.fromkeys(codes))
+        codes = [m.group(1)]
+        if m.group(2):
+            codes.append(m.group(2))
+
+        # kod temizliği
+        codes = [c for c in codes if re.fullmatch(rf"[{UPPER}]{{3,6}}", c)]
         if not codes:
             continue
 
-        rows.append({"title": title, "ticker": codes[0]})
+        detail_clean = clean_detail(detail)
+        if len(detail_clean) < 30:
+            continue
 
-    # Çok kısa başlıkları ele
-    rows = [r for r in rows if len(r["title"]) >= 20]
-    return rows
+        item_id = build_id(codes, detail_clean)
+        items.append({"id": item_id, "codes": codes, "content": detail_clean})
+    return items
 
-def fetch_rendered_with_playwright(url: str) -> str:
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(user_agent=UA, locale="tr-TR")
-        page = context.new_page()
-        page.set_default_timeout(25000)
-
-        # Bazı siteler cookie banner koyar; önce direkt git
-        page.goto(url, wait_until="networkidle")
-        # İçerik akışı yüklensin diye az beklet
-        page.wait_for_timeout(2000)
-
-        # "BIST Şirketleri" filtresi otomatik aktif ama garanti olsun:
-        # Eğer bir filtre sekmesi görünüyorsa, metin içeren butonu tıkla
-        try:
-            tab = page.get_by_role("button", name=re.compile("BIST Şirketleri", re.I))
-            if tab.is_visible():
-                tab.click()
-                page.wait_for_timeout(500)
-        except Exception:
-            pass
-
-        html = page.content()
-        browser.close()
-        return html
-
-# ---------- Twitter ----------
-def twitter_client():
-    api_key = os.getenv("API_KEY")
-    api_secret = os.getenv("API_KEY_SECRET")
-    access_token = os.getenv("ACCESS_TOKEN")
-    access_secret = os.getenv("ACCESS_TOKEN_SECRET")
-
-    auth = tweepy.OAuth1UserHandler(api_key, api_secret, access_token, access_secret)
-    api = tweepy.API(auth)
-    api.verify_credentials()
-    return api
-
+# ---------------- main ----------------
 def main():
-    print(">> start (Foreks BIST Şirketleri)")
-
-    # 1) AMP dene
-    try:
-        amp_html = http_get(AMP_URL)
-        print(f">> fetched AMP html: {len(amp_html)} bytes")
-        rows = extract_rows_from_html(amp_html)
-        if rows:
-            print(f">> amp rows: {len(rows)}")
-        else:
-            print(">> amp gave 0 rows")
-    except Exception as e:
-        print("!! amp error:", e)
-        rows = []
-
-    # 2) Normal sayfa
-    if not rows:
-        try:
-            norm_html = http_get(BASE_URL)
-            print(f">> fetched normal html: {len(norm_html)} bytes")
-            rows = extract_rows_from_html(norm_html)
-            print(f">> normal rows: {len(rows)}")
-        except Exception as e:
-            print("!! normal error:", e)
-            rows = []
-
-    # 3) Render (Playwright)
-    if not rows:
-        print(">> trying Playwright rendered DOM…")
-        try:
-            rend_html = fetch_rendered_with_playwright(BASE_URL)
-            print(f">> fetched rendered html: {len(rend_html)} bytes")
-            rows = extract_rows_from_html(rend_html)
-            print(f">> rendered rows: {len(rows)}")
-        except Exception as e:
-            print("!! render error:", e)
-            rows = []
-
-    print(f">> parsed rows: {len(rows)}")
-    if not rows:
-        print(">> no eligible rows")
+    log("Başladı")
+    if in_cooldown():
+        log("Cooldown aktif, çıkılıyor")
         return
 
-    seen = load_state()
-    api = twitter_client()
-    posted_any = False
+    tw = twitter_client()
 
-    for r in rows:
-        tweet = compose_tweet(r["ticker"], r["title"])
-        uid = sha24(tweet)
-        if uid in seen:
-            continue
+    with sync_playwright().start() as pw:
+        br = pw.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
+        ctx = br.new_context(
+            locale="tr-TR",
+            timezone_id="Europe/Istanbul",
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/118.0.0.0 Safari/537.36")
+        )
+        pg = ctx.new_page(); pg.set_default_timeout(30000)
+
+        # sayfayı yükle (küçük retry)
+        for attempt in range(3):
+            try:
+                log(f"Sayfa yükleme deneme {attempt+1}/3")
+                pg.goto(AKIS_URL, wait_until="networkidle")
+                break
+            except Exception as e:
+                log(f"Yükleme hatası: {e}")
+                if attempt == 2:
+                    ctx.close(); br.close(); return
+                time.sleep(3)
+
+        # Öne çıkanlar
         try:
-            api.update_status(status=tweet)
-            print(">> tweeted:", tweet)
-            seen.add(uid)
-            posted_any = True
-            time.sleep(3)
-        except Exception as e:
-            print("!! tweet error:", e)
+            pg.locator("text=Öne çıkanlar").first.click(timeout=4000)
+            pg.wait_for_timeout(800)
+        except:
+            pass
 
-    if posted_any:
-        save_state(seen)
-        print(">> state saved")
-    else:
-        print(">> nothing new to tweet")
+        # biraz aşağı kaydır ki kartlar render olsun
+        try:
+            pg.evaluate("window.scrollTo(0, 600)")
+            pg.wait_for_timeout(600)
+        except:
+            pass
+
+        # kartlardan çek
+        items = extract_items(pg)
+        log(f"Bulunan KAP haberleri: {len(items)}")
+        if not items:
+            ctx.close(); br.close(); return
+
+        # eski→yeni ve sadece yeni olanlar
+        new_items = [i for i in reversed(items) if i["id"] not in state["posted"]]
+        if not new_items:
+            log("Yeni haber yok")
+            ctx.close(); br.close(); return
+
+        sent = 0
+        for it in new_items:
+            if sent >= MAX_PER_RUN: break
+            t = build_tweet(it["codes"], it["content"])
+            log(f"TWEET: {t}")
+            ok = tweet(tw, t)
+            if not ok: break
+            state["posted"].append(it["id"])
+            save_state(state)
+            sent += 1
+            time.sleep(2)
+
+        log(f"Bitti. Gönderilen: {sent}")
+        ctx.close(); br.close()
 
 if __name__ == "__main__":
     main()
