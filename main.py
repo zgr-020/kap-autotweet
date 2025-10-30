@@ -1,5 +1,6 @@
 # main.py
 import os
+import re  # YENİ EKLENDİ: saat kaldırmak için
 import json
 import time
 import logging
@@ -90,7 +91,7 @@ def send_tweet(client, text: str) -> bool:
             raise RuntimeError("RATE_LIMIT")
         return False
 
-# ================== YENİ EXTRACTOR: Regex ile KAP • KOD + içerik ==================
+# ================== EXTRACTOR ==================
 JS_EXTRACTOR = r"""
 () => {
   const out = [];
@@ -125,9 +126,11 @@ JS_EXTRACTOR = r"""
 }
 """
 
+# YENİ: SAATİ KALDIR
 def build_tweet(codes, content) -> str:
     codes_str = " ".join(f"#{c}" for c in codes)
-    text = content.strip()
+    # SAATİ KALDIR: 11:35, 10:34 gibi
+    text = re.sub(r'^\d{1,2}:\d{2}\s*', '', content).strip()
     if len(text) > 240:
         cutoff = text[:240].rfind(".")
         text = (text[:cutoff + 1] + "..." if cutoff > 180 else text[:237].rsplit(" ", 1)[0] + "...")
