@@ -87,9 +87,14 @@ def send_tweet(client, text: str) -> bool:
         log("Tweet gönderildi")
         return True
     except Exception as e:
-        log(f"Tweet hatası: {e}")
-        if "429" in str(e) or "Too Many Requests" in str(e):
+        err_msg = str(e).lower()
+        if "duplicate content" in err_msg:
+            log("Twitter: Duplicate content → zaten atılmış, atlanıyor")
+            return True
+        if "429" in err_msg or "too many requests" in err_msg:
+            log("Rate limit → 15 dk cooldown")
             raise RuntimeError("RATE_LIMIT")
+        log(f"Tweet hatası: {e}")
         return False
 
 # ================== EXTRACTOR ==================
@@ -127,14 +132,15 @@ JS_EXTRACTOR = r"""
 }
 """
 
-# YENİ: MEGAFON + SAAT KALDIR
-def build_tweet(codes, content) -> str:
+# MEGAFONLU + ESTETİK + BENZERSİZ ID
+def build_tweet(codes, content, tweet_id="") -> str:
     codes_str = " ".join(f"#{c}" for c in codes)
     text = re.sub(r'^\d{1,2}:\d{2}\s*', '', content).strip()
-    if len(text) > 235:
-        cutoff = text[:235].rfind(".")
-        text = (text[:cutoff + 1] + "..." if cutoff > 170 else text[:232].rsplit(" ", 1)[0] + "...")
-    return f"{codes_str} | {text}"[:280]
+    if len(text) > 230:
+        cutoff = text[:230].rfind(".")
+        text = (text[:cutoff + 1] + "..." if cutoff > 160 else text[:227].rsplit(" ", 1)[0] + "...")
+    uniq = tweet_id[-4:] if tweet_id else ""
+    return f" {codes_str} | {text}{' [K'+uniq+']' if uniq else ''}"[:280]
 
 # ================== SAYFA İŞLEMLERİ ==================
 def goto_with_retry(page, url, retries=3) -> bool:
@@ -262,16 +268,16 @@ def main():
             if it["id"] in posted_set: continue
             if not it.get("codes") or not it.get("content"): continue
 
-            tweet = build_tweet(it["codes"], it["content"])
+            tweet = build_tweet(it["codes"], it["content"], it["id"])
             log(f"Tweeting: {tweet}")
             try:
                 ok = send_tweet(tw, tweet)
                 if ok:
                     posted_set.add(it["id"])
-                    state["posted"] = sorted(list(posted_set))  # DÜZELTİLDİ!
+                    state["posted"] = sorted(list(posted_set))
                     state["last_id"] = newest_id
                     state["count_today"] += 1
-                    save_state(state)  # LOG EKLENDİ!
+                    save_state(state)
                     sent += 1
                     if tw and sent < MAX_PER_RUN:
                         time.sleep(3)
