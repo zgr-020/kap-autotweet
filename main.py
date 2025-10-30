@@ -90,7 +90,7 @@ def send_tweet(client, text: str) -> bool:
             raise RuntimeError("RATE_LIMIT")
         return False
 
-# ================== YENİ EXTRACTOR: KAP • KOD + satır bazlı ==================
+# ================== YENİ EXTRACTOR: Regex ile KAP • KOD + içerik ==================
 JS_EXTRACTOR = r"""
 () => {
   const out = [];
@@ -98,17 +98,15 @@ JS_EXTRACTOR = r"""
   const skip = /(Fintables|Günlük Bülten|Analist|Bülten|Fintables Akış)/i;
 
   for (const a of nodes) {
-    const lines = a.textContent.split('\n').map(l => l.trim()).filter(l => l);
-    const kapIndex = lines.findIndex(l => l.toUpperCase().startsWith('KAP'));
-    if (kapIndex === -1) continue;
+    const text = a.textContent;
+    const match = text.match(/KAP\s*[:•·]\s*([A-ZÇĞİÖŞÜ]{2,6})\s*([^]+?)(?=\n|$)/i);
+    if (!match) continue;
 
-    const kapLine = lines[kapIndex];
-    const codeMatch = kapLine.match(/KAP\s*[:•·]\s*([A-ZÇĞİÖŞÜ]{2,6})/i);
-    if (!codeMatch) continue;
+    const code = match[1].toUpperCase();
+    let content = match[2].trim();
+    if (content.length < 20 || skip.test(content)) continue;
 
-    const code = codeMatch[1].toUpperCase();
-    const content = (kapIndex + 1 < lines.length) ? lines[kapIndex + 1] : '';
-    if (!content || content.length < 20 || skip.test(content)) continue;
+    content = content.replace(/^[^\wÇĞİÖŞÜçğıöşü]+/u, '').replace(/\s+/g, ' ').trim();
 
     let hash = 0;
     const raw = a.textContent;
