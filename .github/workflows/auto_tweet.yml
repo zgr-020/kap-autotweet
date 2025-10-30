@@ -1,15 +1,14 @@
 name: Run bot
-
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/30 * * * *'  # her 30 dakikada bir çalışır (isteğe göre değiştirilebilir)
+    - cron: '*/30 * * * *' # her 30 dakikada bir çalışır
 
 jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      TZ: Europe/Istanbul  # Türkiye saati ile çalış
+      TZ: Europe/Istanbul # Türkiye saati ile çalış
 
     steps:
       - name: Checkout repo
@@ -34,3 +33,15 @@ jobs:
           ACCESS_TOKEN_SECRET: ${{ secrets.ACCESS_TOKEN_SECRET }}
         run: |
           python -u main.py
+
+      # DEBUG: Hata olursa log + screenshot'ları Actions'ta göster
+      - name: Upload debug artifacts (logs & screenshots)
+        if: always()  # Hata olsa da, başarı olsa da çalışır
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-output
+          path: |
+            bot.log
+            debug-*.png
+            state.json
+          retention-days: 7
