@@ -1,21 +1,71 @@
-name: Run bot manually
+name: Run bot (remote dispatch)
 
 on:
-  workflow_dispatch:  # sadece manuel tetiklenir
+  workflow_dispatch: {}   # Elle veya API ile tetiklenecek
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      TZ: Europe/Istanbul
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
+      # -------------- STATE.json geri yükle --------------
+      - name: Restore state cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            state.json
+          key: state-v1-${{ github.run_id }}
+          restore-keys: |
+            state-v1-
+
+      - name: Show restored state
+        run: |
+          echo "Restored state.json (if any):"
+          [ -f state.json ] && cat state.json || echo "No state.json yet"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install deps & run
+
+      - name: Install dependencies
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install playwright tweepy
           python -m playwright install --with-deps chromium
+
+      - name: Run bot
+        env:
+          API_KEY: ${{ secrets.API_KEY }}
+          API_KEY_SECRET: ${{ secrets.API_KEY_SECRET }}
+          ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          ACCESS_TOKEN_SECRET: ${{ secrets.ACCESS_TOKEN_SECRET }}
+        run: |
           python -u main.py
+
+      # -------------- STATE.json'u kaydet --------------
+      - name: Save updated state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            state.json
+          key: state-v1-${{ github.run_id }}
+
+      # -------------- Debug çıktıları --------------
+      - name: Upload debug artifacts (logs & screenshots)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-output
+          path: |
+            bot.log
+            debug-*.png
+            state.json
+          retention-days: 7
