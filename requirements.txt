@@ -1,5 +1,2 @@
-requests
-beautifulsoup4
-lxml
-tweepy
-playwright
+playwright==1.48.0
+tweepy==4.14.0
