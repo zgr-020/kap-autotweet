@@ -1,6 +1,5 @@
 # main.py
 import os
-import re
 import json
 import time
 import logging
@@ -91,7 +90,7 @@ def send_tweet(client, text: str) -> bool:
             raise RuntimeError("RATE_LIMIT")
         return False
 
-# ================== YENİ EXTRACTOR: KAP + KOD geniş araması ==================
+# ================== YENİ EXTRACTOR: KAP • KOD + satır bazlı ==================
 JS_EXTRACTOR = r"""
 () => {
   const out = [];
@@ -99,27 +98,17 @@ JS_EXTRACTOR = r"""
   const skip = /(Fintables|Günlük Bülten|Analist|Bülten|Fintables Akış)/i;
 
   for (const a of nodes) {
-    const kapSpan = Array.from(a.querySelectorAll('span'))
-      .find(s => s.textContent.trim().toUpperCase() === 'KAP');
-    if (!kapSpan) continue;
+    const lines = a.textContent.split('\n').map(l => l.trim()).filter(l => l);
+    const kapIndex = lines.findIndex(l => l.toUpperCase().startsWith('KAP'));
+    if (kapIndex === -1) continue;
 
-    const codeSpans = Array.from(a.querySelectorAll('span'))
-      .filter(s => {
-        const txt = s.textContent.trim();
-        if (!/^[A-ZÇĞİÖŞÜ]{2,6}$/.test(txt)) return false;
-        const style = window.getComputedStyle(s);
-        return style.color && (style.color.includes('rgb(59, 130, 246)') || s.classList.contains('text-shared-brand-01'));
-      })
-      .map(s => s.textContent.trim());
+    const kapLine = lines[kapIndex];
+    const codeMatch = kapLine.match(/KAP\s*[:•·]\s*([A-ZÇĞİÖŞÜ]{2,6})/i);
+    if (!codeMatch) continue;
 
-    if (codeSpans.length === 0) continue;
-
-    const contentDivs = Array.from(a.querySelectorAll('div'))
-      .filter(d => d.textContent && d.textContent.length > 20 && !d.querySelector('span'));
-    let content = contentDivs[1] ? contentDivs[1].textContent.trim() : a.textContent.split('\n')[2] || '';
-
-    content = content.replace(/^[^\wÇĞİÖŞÜçğıöşü]+/u, '').replace(/\s+/g, ' ').trim();
-    if (content.length < 20 || skip.test(content)) continue;
+    const code = codeMatch[1].toUpperCase();
+    const content = (kapIndex + 1 < lines.length) ? lines[kapIndex + 1] : '';
+    if (!content || content.length < 20 || skip.test(content)) continue;
 
     let hash = 0;
     const raw = a.textContent;
@@ -128,8 +117,8 @@ JS_EXTRACTOR = r"""
     }
 
     out.push({
-      id: `kap-${codeSpans.join("-")}-${Math.abs(hash)}`,
-      codes: codeSpans,
+      id: `kap-${code}-${Math.abs(hash)}`,
+      codes: [code],
       content: content,
       raw: raw
     });
