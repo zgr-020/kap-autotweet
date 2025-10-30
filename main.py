@@ -7,7 +7,6 @@ import logging
 from pathlib import Path
 from datetime import datetime as dt, timezone, timedelta
 
-# Zaman dilimi
 os.environ["TZ"] = "Europe/Istanbul"
 try:
     time.tzset()
@@ -92,33 +91,36 @@ def send_tweet(client, text: str) -> bool:
             raise RuntimeError("RATE_LIMIT")
         return False
 
-# ================== EXTRACTOR: KAP + KOD ayrı span'larda (textContent ile) ==================
+# ================== YENİ EXTRACTOR: KAP + KOD geniş araması ==================
 JS_EXTRACTOR = r"""
 () => {
   const out = [];
   const nodes = Array.from(document.querySelectorAll('a.block[href^="/borsa-haber-akisi/"]')).slice(0, 200);
-  const skip = /(Fintables|Günlük Bülten|Analist|Bülten)/i;
+  const skip = /(Fintables|Günlük Bülten|Analist|Bülten|Fintables Akış)/i;
 
   for (const a of nodes) {
-    // KAP span'ini textContent ile bul
-    const kapSpan = Array.from(a.querySelectorAll('div.text-utility-02 span'))
+    const kapSpan = Array.from(a.querySelectorAll('span'))
       .find(s => s.textContent.trim().toUpperCase() === 'KAP');
     if (!kapSpan) continue;
 
-    // Kodları bul
-    const codeSpans = Array.from(a.querySelectorAll('span.inline-flex.text-shared-brand-01'))
-      .map(s => s.textContent.trim())
-      .filter(c => /^[A-ZÇĞİÖŞÜ]{2,6}$/.test(c));
+    const codeSpans = Array.from(a.querySelectorAll('span'))
+      .filter(s => {
+        const txt = s.textContent.trim();
+        if (!/^[A-ZÇĞİÖŞÜ]{2,6}$/.test(txt)) return false;
+        const style = window.getComputedStyle(s);
+        return style.color && (style.color.includes('rgb(59, 130, 246)') || s.classList.contains('text-shared-brand-01'));
+      })
+      .map(s => s.textContent.trim());
 
     if (codeSpans.length === 0) continue;
 
-    // İçerik: ikinci div
-    const contentDiv = a.querySelector('div.space-y-1 > div:nth-child(2)');
-    let content = contentDiv ? contentDiv.textContent.trim() : '';
-    content = content.replace(/^[^\wÇĞİÖŞÜçğıöşü]+/u, '').replace(/\s+/g, ' ').trim();
-    if (content.length < 15) continue;
+    const contentDivs = Array.from(a.querySelectorAll('div'))
+      .filter(d => d.textContent && d.textContent.length > 20 && !d.querySelector('span'));
+    let content = contentDivs[1] ? contentDivs[1].textContent.trim() : a.textContent.split('\n')[2] || '';
 
-    // ID
+    content = content.replace(/^[^\wÇĞİÖŞÜçğıöşü]+/u, '').replace(/\s+/g, ' ').trim();
+    if (content.length < 20 || skip.test(content)) continue;
+
     let hash = 0;
     const raw = a.textContent;
     for (let i = 0; i < raw.length; i++) {
@@ -161,7 +163,6 @@ def goto_with_retry(page, url, retries=3) -> bool:
     return False
 
 def click_highlights(page):
-    """SADECE 'Öne çıkanlar' sekmesine tıkla. Tümü YOK SAYILIR."""
     selectors = [
         "text=/öne[\\s]*çıkanlar/i",
         "button:has-text('Öne çıkanlar')",
@@ -170,39 +171,29 @@ def click_highlights(page):
         "div[role='button']:has-text('Öne çıkanlar')"
     ]
     page.wait_for_timeout(2500)
-
     for sel in selectors:
         try:
             loc = page.locator(sel)
-            count = loc.count()
-            if count > 0:
-                first = loc.first
-                if first.is_visible(timeout=5000):
-                    first.click()
-                    page.wait_for_timeout(2500)
-                    log(">> 'ÖNE ÇIKANLAR' sekmesi aktif!")
-                    page.screenshot(path="debug-one-cikanlar.png")
-                    return True
+            if loc.count() > 0 and loc.first.is_visible(timeout=5000):
+                loc.first.click()
+                page.wait_for_timeout(2500)
+                log(">> 'ÖNE ÇIKANLAR' sekmesi aktif!")
+                page.screenshot(path="debug-one-cikanlar.png")
+                return True
         except Exception as e:
             log(f"Selector hatası '{sel}': {e}")
-            continue
-
-    log(">> 'ÖNE ÇIKANLAR' butonu BULUNAMADI → Tümü'nde kalınıyor")
+    log(">> 'ÖNE ÇIKANLAR' butonu BULUNAMADI")
     page.screenshot(path="debug-one-cikanlar-yok.png")
     return False
 
 def scroll_warmup(page):
-    log(">> Scroll warmup başlıyor (Öne çıkanlar için)")
+    log(">> Scroll warmup başlıyor")
     for y in [0, 300, 600, 900, 1200]:
         page.evaluate(f"window.scrollTo(0,{y})")
         page.wait_for_timeout(1200)
-
     try:
-        page.wait_for_function(
-            "document.querySelectorAll('a.block[href^=\"/borsa-haber-akisi/\"]').length > 5",
-            timeout=12000
-        )
-        log(">> Öne çıkanlar yüklendi")
+        page.wait_for_function("document.querySelectorAll('a.block[href^=\"/borsa-haber-akisi/\"]').length > 10", timeout=15000)
+        log(">> Yeterli haber yüklendi")
     except:
         log(">> Scroll timeout")
     page.evaluate("window.scrollTo(0,0)")
@@ -246,7 +237,7 @@ def main():
             browser.close()
             return
 
-        click_highlights(page)  # SADECE ÖNE ÇIKANLAR
+        click_highlights(page)
         scroll_warmup(page)
 
         item_count = page.evaluate("document.querySelectorAll('a.block[href^=\"/borsa-haber-akisi/\"]').length")
