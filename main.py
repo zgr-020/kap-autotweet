@@ -137,16 +137,19 @@ JS_EXTRACTOR = r"""
 }
 """
 
-# MEGAFON + ESTETİK + BENZERSİZ ID
+# MEGAFON + ESTETİK
 TWEET_EMOJI = "📣"
+ADD_UNIQ = False  # ← etiketi kapat
 
 def build_tweet(codes, content, tweet_id="") -> str:
     codes_str = " ".join(f"#{c}" for c in codes)
     text = re.sub(r'^\d{1,2}:\d{2}\s*', '', content).strip()
 
     prefix = f"{TWEET_EMOJI} {codes_str} | "
-    uniq = tweet_id[-4:] if tweet_id else ""
-    suffix = f" [K{uniq}]" if uniq else ""
+    suffix = ""
+    if ADD_UNIQ and tweet_id:
+        uniq = tweet_id[-4:]
+        suffix = f" [K{uniq}]"
 
     max_len = 279 - len(prefix) - len(suffix)
     if len(text) > max_len:
