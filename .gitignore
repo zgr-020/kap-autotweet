@@ -1,0 +1,7 @@
+__pycache__/
+playwright/.local-browsers/
+debug.log
+*.pyc
+*.pyo
+*.log
+state.json
