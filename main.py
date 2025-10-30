@@ -1,4 +1,3 @@
-# main.py
 import os
 import re
 import json
@@ -57,7 +56,6 @@ def load_state():
 
 def save_state(s):
     try:
-        # posted listesini şişirmemek için son 5000 kaydı tut
         if "posted" in s and isinstance(s["posted"], list):
             s["posted"] = s["posted"][-5000:]
         STATE_PATH.write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -113,13 +111,16 @@ JS_EXTRACTOR = r"""
     const match = text.match(/KAP\s*[:•·]\s*([A-ZÇĞİÖŞÜ]{2,6})\s*([^]+?)(?=\n|$)/i);
     if (!match) continue;
 
-    const code = match[1].toUpperCase();
+    // 👇 YENİ: sadece ilk geçerli 2–6 harfli kodu al
+    let code = (match[1] || "").toUpperCase();
+    code = (code.match(/[A-ZÇĞİÖŞÜ]{2,6}/) || [""])[0];
+    if (!code) continue;
+
     let content = (match[2] || "").trim();
     if (content.length < 20 || skip.test(content)) continue;
 
     content = content.replace(/^[^\wÇĞİÖŞÜçğıöşü]+/u, '').replace(/\s+/g, ' ').trim();
 
-    // HREF tabanlı stabil hash → metin ufak değişse bile aynı ID kalsın
     let hash = 0;
     const rawForHash = href || text;
     for (let i = 0; i < rawForHash.length; i++) {
@@ -139,11 +140,17 @@ JS_EXTRACTOR = r"""
 
 # MEGAFON + ESTETİK
 TWEET_EMOJI = "📣"
-ADD_UNIQ = False  # ← etiketi kapat
+ADD_UNIQ = False
 
 def build_tweet(codes, content, tweet_id="") -> str:
     codes_str = " ".join(f"#{c}" for c in codes)
-    text = re.sub(r'^\d{1,2}:\d{2}\s*', '', content).strip()
+    # 👇 YENİ: “dün/bugün + saat” başlarını temizle
+    text = re.sub(
+        r'^(?:(?:dün|bugün|yarın|pazartesi|salı|çarşamba|perşembe|cuma|cumartesi|pazar)\s*)?\d{1,2}:\d{2}\s*|^(?:dün|bugün|yarın)\s+',
+        '',
+        content.strip(),
+        flags=re.IGNORECASE
+    ).strip()
 
     prefix = f"{TWEET_EMOJI} {codes_str} | "
     suffix = ""
@@ -268,11 +275,10 @@ def main():
             return
 
         posted_set = set(state.get("posted", []))
-        newest_id = items[0]["id"]  # EN YENİ HABERİN ID'Sİ
+        newest_id = items[0]["id"]
         to_send = []
         last_id = state.get("last_id")
 
-        # YENİ HABERLERİ BUL
         for it in items:
             if last_id and it["id"] == last_id:
                 break
@@ -312,14 +318,7 @@ def main():
                     state["cooldown_until"] = (dt.now(timezone.utc) + timedelta(minutes=COOLDOWN_MIN)).isoformat()
                     save_state(state)
                     break
-            except RuntimeError as e:
-                if str(e) == "RATE_LIMIT":
-                    state["cooldown_until"] = (dt.now(timezone.utc) + timedelta(minutes=COOLDOWN_MIN)).isoformat()
-                    save_state(state)
-                    log("Rate limit → cooldown")
-                    break
 
-        # SONRA last_id GÜNCELLE
         if sent > 0:
             state["last_id"] = newest_id
             save_state(state)
