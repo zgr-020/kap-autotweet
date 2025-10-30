@@ -1,6 +1,6 @@
 # main.py
 import os
-import re  # YENİ EKLENDİ: saat kaldırmak için
+import re
 import json
 import time
 import logging
@@ -126,10 +126,8 @@ JS_EXTRACTOR = r"""
 }
 """
 
-# YENİ: SAATİ KALDIR
 def build_tweet(codes, content) -> str:
     codes_str = " ".join(f"#{c}" for c in codes)
-    # SAATİ KALDIR: 11:35, 10:34 gibi
     text = re.sub(r'^\d{1,2}:\d{2}\s*', '', content).strip()
     if len(text) > 240:
         cutoff = text[:240].rfind(".")
@@ -268,7 +266,7 @@ def main():
                 ok = send_tweet(tw, tweet)
                 if ok:
                     posted_set.add(it["id"])
-                    state["posted"] = sorted(list(posted_set))
+                    state["posted"] = sorted(list(posted_set))  # BU SATIR EKLENDİ!
                     state["last_id"] = newest_id
                     state["count_today"] += 1
                     save_state(state)
