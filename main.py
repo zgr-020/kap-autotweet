@@ -299,19 +299,19 @@ def main():
             try:
                 ok = send_tweet(tw, tweet)
                 if ok:
-                posted_set.add(it["id"])
-                state["posted"] = sorted(list(posted_set))
-                state["count_today"] += 1
-                save_state(state)
-                sent += 1
-            if tw and sent < MAX_PER_RUN:
-                time.sleep(3)
-except RuntimeError as e:
-    if str(e) == "RATE_LIMIT":
-        log("Rate limit → cooldown, başarısız tweet kaydedilmedi")
-        state["cooldown_until"] = (dt.now(timezone.utc) + timedelta(minutes=COOLDOWN_MIN)).isoformat()
-        save_state(state)
-        break
+                    posted_set.add(it["id"])
+                    state["posted"] = sorted(list(posted_set))
+                    state["count_today"] += 1
+                    save_state(state)
+                    sent += 1
+                    if tw and sent < MAX_PER_RUN:
+                        time.sleep(3)
+            except RuntimeError as e:
+                if str(e) == "RATE_LIMIT":
+                    log("Rate limit → cooldown, başarısız tweet kaydedilmedi")
+                    state["cooldown_until"] = (dt.now(timezone.utc) + timedelta(minutes=COOLDOWN_MIN)).isoformat()
+                    save_state(state)
+                    break
             except RuntimeError as e:
                 if str(e) == "RATE_LIMIT":
                     state["cooldown_until"] = (dt.now(timezone.utc) + timedelta(minutes=COOLDOWN_MIN)).isoformat()
