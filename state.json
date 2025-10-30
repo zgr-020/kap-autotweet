@@ -1,4 +1,7 @@
 {
+  "last_id": null,
   "posted": [],
-  "cooldown_until": null
+  "cooldown_until": null,
+  "count_today": 0,
+  "day": null
 }
