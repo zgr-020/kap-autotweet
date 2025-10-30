@@ -1,290 +1,330 @@
 # main.py
-import os, re, json, time
+import os
+import re
+import json
+import time
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
+from datetime import datetime as dt, timezone, timedelta
+
+# ----- Zaman dilimini TR yap (log ve Playwright bağlamı için) -----
+os.environ["TZ"] = "Europe/Istanbul"
+try:
+    time.tzset()  # Linux'ta çalışır
+except Exception:
+    pass
+
 from playwright.sync_api import sync_playwright
 import tweepy
 
+# ================== AYARLAR ==================
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
 STATE_PATH = Path("state.json")
-MAX_PER_RUN = 5
-COOLDOWN_MIN = 15
 
-STOP_PHRASES = [
-    "yatırım tavsiyesi değildir","yasal uyarı","kişisel veri","kvk","saygılarımızla","kamunun bilgisine"
-]
-REL_PREFIX = re.compile(r'^(?:dün|bugün|yesterday|today)\b[:\-–]?\s*', re.IGNORECASE)
-NOT_TICKERS = {
-    "VE","VEYA","İLE","ILE","DÜN","DUN","BUGÜN","BUGUN","EKİM","EKIM","YURT","YER","SAHİP","SAHIP",
-    "TL","USD","EURO","DOLAR","KDV","ADET","PAY","BİRİM","BIRIM","HİSSE","HISSE","KAP",
-    "FİNTABLES","FINTABLES","SEKTÖRLER","GÜNLÜK","BÜLTEN"
-}
+MAX_PER_RUN = 5          # Bir çalıştırmada en fazla kaç tweet
+MAX_TODAY   = 25         # Günlük üst limit
+COOLDOWN_MIN = 15        # 429 sonrası bekleme dk
 
+# ================== SECRETS ==================
 API_KEY = os.getenv("API_KEY")
 API_KEY_SECRET = os.getenv("API_KEY_SECRET")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 ACCESS_TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET")
 
-def log(msg): print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+# ================== LOG ==================
+def log(msg: str):
+    stamp = dt.now().strftime("%H:%M:%S")
+    print(f"[{stamp}] {msg}")
 
-def twitter_client():
-    if not all([API_KEY, API_KEY_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET]):
-        log("!! Twitter anahtarları yok → simülasyon")
-        return None
-    return tweepy.Client(
-        consumer_key=API_KEY, consumer_secret=API_KEY_SECRET,
-        access_token=ACCESS_TOKEN, access_token_secret=ACCESS_TOKEN_SECRET
-    )
-
+# ================== STATE ==================
 def load_state():
+    default = {
+        "last_id": None,
+        "posted": [],
+        "cooldown_until": None,
+        "count_today": 0,
+        "day": None
+    }
     if not STATE_PATH.exists():
-        return {"posted": [], "cooldown_until": None, "last_id": None}
+        return default
     try:
         data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        if isinstance(data, list): data = {"posted": data, "cooldown_until": None, "last_id": None}
-        for k,v in [("posted",[]),("cooldown_until",None),("last_id",None)]:
+        if isinstance(data, list):
+            # Eski format desteği
+            default["posted"] = data
+            return default
+        for k, v in default.items():
             data.setdefault(k, v)
         return data
-    except Exception:
-        return {"posted": [], "cooldown_until": None, "last_id": None}
-
-def save_state(state):
-    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-
-state = load_state()
-posted = set(state.get("posted", []))
-
-def in_cooldown():
-    cu = state.get("cooldown_until")
-    if not cu: return False
-    try:
-        return datetime.now(timezone.utc) < datetime.fromisoformat(cu.replace("Z","+00:00"))
-    except: 
-        state["cooldown_until"]=None; return False
-
-def clean_content(text: str) -> str:
-    t = re.sub(r"\s+", " ", text).strip()
-    for p in STOP_PHRASES: t = re.sub(p, "", t, flags=re.I)
-    t = REL_PREFIX.sub("", t).strip(" .-–—|•·")
-    if t and t[-1] not in ".!?": t += "."
-    return t
-
-def build_tweet(codes, content):
-    codes_str = " ".join(f"#{c}" for c in codes)
-    body = clean_content(content)
-    head = f"📰 {codes_str} | "
-    if len(head + body) <= 279: return head + body
-    max_len = 279 - len(head) - 3
-    body = body[:max_len]
-    if " " in body: body = body.rsplit(" ", 1)[0]
-    return head + body + "..."
-
-def valid_code(tok: str) -> bool:
-    return bool(re.fullmatch(r"[A-ZÇĞİÖŞÜ]{3,5}", tok)) and tok not in NOT_TICKERS
-
-# -------- robust highlights clicker --------
-def click_highlights(page) -> bool:
-    page.wait_for_load_state("domcontentloaded", timeout=30000)
-    # sekme barı görünür olsun
-    page.evaluate("window.scrollTo(0, 0)")
-    page.wait_for_timeout(300)
-
-    texts = [
-        "Öne çıkanlar","ÖNE ÇIKANLAR","Öne çıkanlar","One cikanlar",  # diakritik varyasyon
-        "Öne Çıkanlar","ÖNE ÇIKANLAR"
-    ]
-    selectors = [
-        "button:has-text('{}')", "a:has-text('{}')", "[role=tab]:has-text('{}')", "text={}"
-    ]
-    # 1) metin tabanlı denemeler
-    for t in texts:
-        for s in selectors:
-            sel = s.format(t)
-            try:
-                loc = page.locator(sel)
-                if loc.count() and loc.first.is_visible():
-                    loc.first.click()
-                    page.wait_for_timeout(300)
-                    if is_highlights_active(page): return True
-            except: pass
-
-    # 2) XPath normalize-space
-    try:
-        loc = page.locator("xpath=//*[normalize-space(text())='Öne çıkanlar']")
-        if loc.count(): loc.first.click(); page.wait_for_timeout(300)
-        if is_highlights_active(page): return True
-    except: pass
-
-    # 3) header içinde arama (sağ üst küme)
-    try:
-        header = page.locator("main").locator("xpath=..").first
-        btns = header.locator("xpath=.//a|.//button")
-        n = btns.count()
-        for i in range(min(n,30)):
-            el = btns.nth(i)
-            try:
-                txt = el.inner_text(timeout=500).strip()
-                if "Öne" in txt and "çıkan" in txt.lower():
-                    el.click(); page.wait_for_timeout(300)
-                    if is_highlights_active(page): return True
-            except: pass
-    except: pass
-
-    # 4) doğrudan evaluate ile tıkla
-    try:
-        clicked = page.evaluate("""
-        () => {
-          const norm = s => (s||"").normalize('NFKD').replace(/[\\u0300-\\u036f]/g,'').toLowerCase();
-          const want = norm('Öne çıkanlar');
-          const all = [...document.querySelectorAll('a,button,div,span')];
-          for (const el of all) {
-            const t = norm(el.textContent);
-            if (t.includes('one') && t.includes('cikanlar')) {
-              el.click(); return true;
-            }
-          }
-          return false;
-        }
-        """)
-        if clicked:
-            page.wait_for_timeout(300)
-            if is_highlights_active(page): return True
-    except: pass
-
-    return False
-
-def is_highlights_active(page) -> bool:
-    # KAP etiketli satırlar görünür mü?
-    try:
-        page.wait_for_selector("main :text('KAP')", timeout=1500)
-        # aynı hatta sağ üst segmentte 'Öne çıkanlar' aria-selected true olabilir
-        try:
-            active = page.locator("[aria-selected='true']").filter(has_text="Öne")
-            if active.count(): return True
-        except: pass
-        return True
-    except: 
-        return False
-
-# -------- extraction (mavi anchorlardan kod) --------
-JS_EXTRACT = """
-() => {
-  const items = [];
-  const root = document.querySelector('main') || document.body;
-  const rows = root.querySelectorAll('div, li, article, section');
-  const isAllUpper = s => /^[A-ZÇĞİÖŞÜ]{3,5}$/.test(s||"");
-  const NOTS = new Set(%s);
-
-  for (const el of rows) {
-    try{
-      const txt = (el.innerText||"").replace(/\\s+/g," ").trim();
-      if (!txt || !/\\bKAP\\b/.test(txt)) continue;
-      if (/^Fintables\\b/i.test(txt) || /^Günlük Bülten\\b/i.test(txt)) continue;
-
-      const anchors = Array.from(el.querySelectorAll('a'));
-      let codes = anchors.map(a => (a.textContent||"").trim().toUpperCase())
-                         .filter(s => isAllUpper(s) && !NOTS.has(s));
-      codes = Array.from(new Set(codes));
-      if (codes.length===0) continue;
-
-      let content = txt.replace(/^\\s*KAP\\s*[•·\\-\\.]?\\s*.+?\\s+/, "");
-      if (content.length < 25) content = txt;
-
-      const h = Array.from((codes.join("-")+"|"+txt).slice(0,120))
-                     .reduce((a,c)=>((a*31 + c.charCodeAt(0))>>>0),0);
-      items.push({id:`kap_${h}`, codes, content, raw:txt});
-    }catch(e){}
-  }
-  return items;
-}
-""" % (json.dumps(list(NOT_TICKERS), ensure_ascii=False))
-
-def extract_items(page):
-    page.wait_for_selector("main", timeout=20000)
-    page.evaluate("window.scrollTo(0, 240)")
-    page.wait_for_timeout(400)
-    return page.evaluate(JS_EXTRACT)
-
-def send_tweet(client, text):
-    if not client:
-        log(f"(SIM) {text}")
-        return True
-    try:
-        client.create_tweet(text=text); return True
     except Exception as e:
+        log(f"!! state.json okunamadı, sıfırlanıyor: {e}")
+        return default
+
+def save_state(s):
+    try:
+        STATE_PATH.write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        log(f"!! state.json kaydedilemedi: {e}")
+
+# ================== TWITTER ==================
+def twitter_client():
+    if not all([API_KEY, API_KEY_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET]):
+        log("!! Twitter anahtarları eksik → SIMÜLASYON modunda tweetlenecek.")
+        return None
+    try:
+        return tweepy.Client(
+            consumer_key=API_KEY,
+            consumer_secret=API_KEY_SECRET,
+            access_token=ACCESS_TOKEN,
+            access_token_secret=ACCESS_TOKEN_SECRET,
+        )
+    except Exception as e:
+        log(f"!! Twitter client kurulamadı: {e} → SIMÜLASYON")
+        return None
+
+def send_tweet(client, text: str) -> bool:
+    if not client:
+        log(f"SIMULATION TWEET: {text}")
+        return True
+    try:
+        client.create_tweet(text=text)
+        log("Tweet sent")
+        return True
+    except Exception as e:
+        log(f"Tweet error: {e}")
         if "429" in str(e) or "Too Many Requests" in str(e):
             raise RuntimeError("RATE_LIMIT")
-        log(f"Tweet hatası: {e}"); return False
+        return False
 
+# ================== EXTRACTOR (sağlam/regex tabanlı) ==================
+JS_EXTRACTOR = r"""
+() => {
+  const out = [];
+  const nodes = Array.from(document.querySelectorAll(
+    "main [role='listitem'], main li, main article, main .flex, main .grid, main div"
+  )).slice(0, 600);
+
+  const skip = /(Fintables|Günlük Bülten|Analist|Bülten)/i;
+  const kapRe = /\bKAP\b[^A-Za-zÇĞİÖŞÜ0-9]*([A-ZÇĞİÖŞÜ]{2,6})(?:\s*[•\/\-\|]\s*([A-ZÇĞİÖŞÜ]{2,6}))?/i;
+
+  for (const el of nodes) {
+    const text = (el.innerText || "").replace(/\s+/g, " ").trim();
+    if (!text || text.length < 35) continue;
+    if (skip.test(text)) continue;
+
+    const m = text.match(kapRe);
+    if (!m) continue;
+
+    const codes = [];
+    if (m[1]) codes.push(m[1].toUpperCase());
+    if (m[2]) codes.push(m[2].toUpperCase());
+
+    // İçerik: KAP + KOD(lar) ifadesinden sonrasını al
+    let content = text;
+    const idx = text.toUpperCase().indexOf("KAP");
+    if (idx >= 0) {
+      const after = text.slice(idx);
+      const mm = after.match(kapRe);
+      if (mm) {
+        const cut = after.indexOf(mm[0]) + mm[0].length;
+        content = after.slice(cut).trim();
+      }
+    }
+
+    // Temizlik
+    content = content.replace(/^\p{P}+/u, "").replace(/\s+/g, " ").trim();
+
+    // ID stabil olsun
+    const hash = text.split('').reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 0);
+    out.push({ id: `kap-${codes.join("-")}-${hash}`, codes, content, raw: text });
+  }
+  return out;
+}
+"""
+
+def build_tweet(codes, content) -> str:
+    """Quanta, Fin. haber tweet formatı (çift kod destekli)"""
+    codes_str = " ".join(f"#{c}" for c in codes)
+    text = content.strip()
+
+    # Cümle sonunu koruyarak kısalt
+    if len(text) > 240:
+        text = text[:237].rsplit(" ", 1)[0] + "..."
+
+    return f"📰 {codes_str} | {text}"[:280]
+
+# ================== SAYFA İŞLEMLERİ ==================
+def goto_with_retry(page, url, retries=3) -> bool:
+    for i in range(retries):
+        try:
+            log(f"Sayfa yükleme deneme {i+1}/{retries}")
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_selector("main", timeout=15000)
+            return True
+        except Exception as e:
+            log(f"Yükleme hatası: {e}")
+            if i < retries - 1:
+                time.sleep(3)
+    return False
+
+def click_highlights(page):
+    """‘Öne çıkanlar’ sekmesini güvenli tıkla; değilse Tümü'nde kal."""
+    selectors = [
+        "button:has-text('Öne çıkanlar')",
+        "a:has-text('Öne çıkanlar')",
+        "text=Öne çıkanlar"
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0 and loc.first.is_visible():
+                loc.first.click()
+                page.wait_for_timeout(800)
+                log(">> Öne çıkanlar sekmesi aktif")
+                return True
+        except Exception:
+            continue
+    log(">> Öne çıkanlar butonu bulunamadı (Tümü'nde kalındı)")
+    return False
+
+def scroll_warmup(page):
+    """Dinamik yükleme için kısa kaydırma zinciri."""
+    for y in [0, 500, 1000, 1500]:
+        try:
+            page.evaluate(f"window.scrollTo(0,{y})")
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
+    try:
+        page.evaluate("window.scrollTo(0,0)")
+        page.wait_for_timeout(400)
+    except Exception:
+        pass
+
+# ================== ANA AKIŞ ==================
 def main():
     log("Başladı")
-    if in_cooldown():
-        log("Cooldown aktif, çıkılıyor"); return
+    state = load_state()
+
+    # Günlük sayaç reset
+    today = dt.now().strftime("%Y-%m-%d")
+    if state.get("day") != today:
+        state["count_today"] = 0
+        state["day"] = today
+
+    # Cooldown kontrol
+    if state.get("cooldown_until"):
+        try:
+            cd = dt.fromisoformat(state["cooldown_until"].replace("Z", "+00:00"))
+            if dt.now(timezone.utc) < cd:
+                log("In cooldown, exiting")
+                return
+            else:
+                state["cooldown_until"] = None
+        except Exception:
+            state["cooldown_until"] = None
+
+    if state["count_today"] >= MAX_TODAY:
+        log(f"Günlük limit ({MAX_TODAY}) aşıldı")
+        return
+
     tw = twitter_client()
 
     with sync_playwright() as pw:
-        br = pw.chromium.launch(headless=True, args=[
-            "--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-gpu"
-        ])
-        ctx = br.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36",
-            locale="tr-TR", timezone_id="Europe/Istanbul",
-            viewport={"width":1280,"height":1024}
+        browser = pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
         )
-        page = ctx.new_page(); page.set_default_timeout(30000)
+        ctx = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36",
+            locale="tr-TR",
+            timezone_id="Europe/Istanbul",
+            viewport={"width": 1600, "height": 1000},
+        )
+        page = ctx.new_page()
+        page.set_default_timeout(30000)
 
-        # sayfayı aç
-        for i in range(3):
-            try:
-                log(f"Sayfa yükleme deneme {i+1}/3")
-                page.goto(AKIS_URL, wait_until="networkidle"); break
-            except Exception as e:
-                log(f"Yükleme hatası: {e}")
-                if i==2: br.close(); return
-                time.sleep(2)
+        if not goto_with_retry(page, AKIS_URL):
+            log("!! Sayfa açılamadı")
+            browser.close()
+            return
 
         # Öne çıkanlar
-        if click_highlights(page):
-            log(">> Öne çıkanlar sekmesi aktif")
-        else:
-            log("!! Öne çıkanlar butonu bulunamadı; iş sonlandırıldı")
-            br.close(); return
+        click_highlights(page)
+        scroll_warmup(page)
 
-        items = extract_items(page)
+        # Çıkarım
+        try:
+            items = page.evaluate(JS_EXTRACTOR) or []
+        except Exception as e:
+            log(f"JS extractor hatası: {e}")
+            items = []
+
         log(f"Bulunan KAP haberleri: {len(items)}")
-        if not items: br.close(); return
+        if not items:
+            browser.close()
+            return
 
+        # En yeni → en eski geliyor ihtimali; last_id kullanarak filtrele
+        posted_set = set(state.get("posted", []))
+        newest_id = items[0]["id"]
+        to_send = []
         last_id = state.get("last_id")
-        to_post = []
+
         for it in items:
-            if last_id and it["id"] == last_id: break
-            if it["id"] in posted: continue
-            to_post.append(it)
+            if last_id and it["id"] == last_id:
+                break
+            to_send.append(it)
 
-        if not to_post:
-            state["last_id"] = items[0]["id"]; save_state(state)
-            br.close(); log("Yeni haber yok"); return
+        if not to_send:
+            # İlk çalıştırma ya da yeni yoksa last_id güncelle
+            state["last_id"] = newest_id
+            save_state(state)
+            browser.close()
+            log("Yeni öğe yok")
+            return
 
-        to_post = list(reversed(to_post))[:MAX_PER_RUN]
+        # Eski → yeni sırada tweet at
+        to_send.reverse()
         sent = 0
-        for it in to_post:
-            codes = [c for c in it["codes"] if valid_code(c)]
-            if not codes: continue
-            tweet = build_tweet(codes, it["content"])
-            log(f"Tweet: {tweet}")
-            try:
-                if send_tweet(tw, tweet):
-                    posted.add(it["id"]); sent += 1
-                    state["posted"] = sorted(list(posted))
-                    state["last_id"] = items[0]["id"]
-                    save_state(state)
-                    if tw and sent < MAX_PER_RUN: time.sleep(2)
-            except RuntimeError:
-                log(">> 429 alındı; cooldown başlatıldı")
-                state["cooldown_until"] = (datetime.now(timezone.utc)+timedelta(minutes=COOLDOWN_MIN)).isoformat()
-                save_state(state); break
+        for it in to_send:
+            if sent >= MAX_PER_RUN:
+                break
+            if it["id"] in posted_set:
+                continue
+            if not it.get("codes") or not it.get("content"):
+                continue
 
-        br.close(); log(f"Bitti. Gönderilen tweet: {sent}")
+            tweet = build_tweet(it["codes"], it["content"])
+            log(f"Tweeting: {tweet}")
+
+            try:
+                ok = send_tweet(tw, tweet)
+                if ok:
+                    posted_set.add(it["id"])
+                    state["posted"] = sorted(list(posted_set))
+                    state["last_id"] = newest_id
+                    state["count_today"] += 1
+                    save_state(state)
+                    sent += 1
+                    if tw and sent < MAX_PER_RUN:
+                        time.sleep(2)
+            except RuntimeError as e:
+                if str(e) == "RATE_LIMIT":
+                    log(f"Cooldown activated for {COOLDOWN_MIN} minutes")
+                    state["cooldown_until"] = (dt.now(timezone.utc) + timedelta(minutes=COOLDOWN_MIN)).isoformat()
+                    save_state(state)
+                    break
+                else:
+                    log("Beklenmeyen hata (tweet): " + str(e))
+
+        browser.close()
+        log(f"Done. Sent {sent} tweets")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        log("!! FATAL !!")
+        log(str(e))
+        log(traceback.format_exc())
