@@ -105,13 +105,25 @@ JS_EXTRACTOR = r"""
   const nodes = Array.from(document.querySelectorAll('a.block[href^="/borsa-haber-akisi/"]')).slice(0, 200);
   const skip = /(Fintables|Günlük Bülten|Analist|Bülten|Fintables Akış)/i;
 
+  // Zaman başını (Dün/Bugün/Yarın + HH:MM ya da sadece Dün/Bugün/Yarın) temizle
+  const stripTimeHead = (s) => {
+    if (!s) return "";
+    return s
+      .replace(/^\s*/, "")
+      .replace(
+        /^(?:(?:dün|bugün|yarın|pazartesi|salı|çarşamba|perşembe|cuma|cumartesi|pazar)\s*)?\d{1,2}:\d{2}\s*|^(?:dün|bugün|yarın)\s+/i,
+        ""
+      )
+      .trim();
+  };
+
   for (const a of nodes) {
     const text = a.textContent || "";
     const href = (a.href || a.getAttribute('href') || "").split('?')[0];
     const match = text.match(/KAP\s*[:•·]\s*([A-ZÇĞİÖŞÜ]{2,6})\s*([^]+?)(?=\n|$)/i);
     if (!match) continue;
 
-    // 👇 YENİ: sadece ilk geçerli 2–6 harfli kodu al
+    // 👇 sadece ilk geçerli 2–6 harfli kodu al
     let code = (match[1] || "").toUpperCase();
     code = (code.match(/[A-ZÇĞİÖŞÜ]{2,6}/) || [""])[0];
     if (!code) continue;
@@ -121,8 +133,9 @@ JS_EXTRACTOR = r"""
 
     content = content.replace(/^[^\wÇĞİÖŞÜçğıöşü]+/u, '').replace(/\s+/g, ' ').trim();
 
+    // ⬇️ ID için: varsa href kullan; yoksa zaman başı temizlenmiş metni kullan
     let hash = 0;
-    const rawForHash = href || text;
+    const rawForHash = href || stripTimeHead(text);
     for (let i = 0; i < rawForHash.length; i++) {
       hash = ((hash << 5) - hash + rawForHash.charCodeAt(i)) | 0;
     }
