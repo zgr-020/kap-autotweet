@@ -105,22 +105,23 @@ JS_EXTRACTOR = r"""
   const nodes = Array.from(document.querySelectorAll('a.block[href^="/borsa-haber-akisi/"]')).slice(0, 200);
   const skip = /(Fintables|Günlük Bülten|Analist|Bülten|Fintables Akış)/i;
 
-  // İçerik başındaki tarih/saat/gün ibaresini temizle
-  // Ör: "Dün 19:22", "31 Ekim 18:20", "Pazartesi 11:05", "Bugün 09:15"
-  const stripDateHead = (s) => {
+  // Zaman başını temizle (EK: "31 Ekim 18:50" ve "31 Ekim" destekleri eklendi)
+  const stripTimeHead = (s) => {
     if (!s) return "";
-    let r = s.replace(/^\s*/, "");
-    r = r.replace(/^(?:(?:dün|bugün|yarın|pazartesi|salı|çarşamba|perşembe|cuma|cumartesi|pazar)\s*)?\d{1,2}:\d{2}\s*/i, "");
-    r = r.replace(/^(?:dün|bugün|yarın)\s+/i, "");
-    r = r.replace(/^\d{1,2}\s*(ocak|şubat|mart|nisan|mayıs|haziran|temmuz|ağustos|eylül|ekim|kasım|aralık)\s*\d{1,2}:\d{2}\s*/i, "");
-    r = r.replace(/^\d{1,2}\s*(ocak|şubat|mart|nisan|mayıs|haziran|temmuz|ağustos|eylül|ekim|kasım|aralık)\s+/i, "");
-    return r.trim();
+    return s
+      .replace(/^\s*/, "")
+      // Dün/Bugün/Yarın [+ HH:MM] veya Gün adı [+ HH:MM]
+      .replace(/^(?:(?:dün|bugün|yarın|pazartesi|salı|çarşamba|perşembe|cuma|cumartesi|pazar)\s*)?\d{1,2}:\d{2}\s*|^(?:dün|bugün|yarın)\s+/i, "")
+      // EK: "31 Ekim 18:50"
+      .replace(/^\d{1,2}\s*(ocak|şubat|mart|nisan|mayıs|haziran|temmuz|ağustos|eylül|ekim|kasım|aralık)\s*\d{1,2}:\d{2}\s*/i, "")
+      // EK: "31 Ekim"
+      .replace(/^\d{1,2}\s*(ocak|şubat|mart|nisan|mayıs|haziran|temmuz|ağustos|eylül|ekim|kasım|aralık)\s+/i, "")
+      .trim();
   };
 
   for (const a of nodes) {
     const text = a.textContent || "";
     const href = (a.href || a.getAttribute('href') || "").split('?')[0];
-
     const match = text.match(/KAP\s*[:•·]\s*([A-ZÇĞİÖŞÜ]{2,6})\s*([^]+?)(?=\n|$)/i);
     if (!match) continue;
 
@@ -134,20 +135,13 @@ JS_EXTRACTOR = r"""
 
     content = content.replace(/^[^\wÇĞİÖŞÜçğıöşü]+/u, '').replace(/\s+/g, ' ').trim();
 
-    // ID tabanı: 1) mümkünse sadece URL path, 2) yoksa "code + temizlenmiş içerik"
+    // ID için: VARSA URL'in yalnızca PATH'i, yoksa tarih başı temizlenmiş metin
     let pathOnly = "";
     try { pathOnly = new URL(href, location.origin).pathname || ""; } catch (e) { pathOnly = href || ""; }
-
-    const contentForId = (code + " | " + stripDateHead(content))
-      .toLowerCase()
-      .replace(/\s+/g, " ")
-      .trim();
-
-    const idBase = pathOnly || contentForId;
-
     let hash = 0;
-    for (let i = 0; i < idBase.length; i++) {
-      hash = ((hash << 5) - hash + idBase.charCodeAt(i)) | 0;
+    const rawForHash = pathOnly || stripTimeHead(text);  // ← sadece bu satır değişti
+    for (let i = 0; i < rawForHash.length; i++) {
+      hash = ((hash << 5) - hash + rawForHash.charCodeAt(i)) | 0;
     }
 
     out.push({
