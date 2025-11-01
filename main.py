@@ -105,25 +105,27 @@ JS_EXTRACTOR = r"""
   const nodes = Array.from(document.querySelectorAll('a.block[href^="/borsa-haber-akisi/"]')).slice(0, 200);
   const skip = /(Fintables|Günlük Bülten|Analist|Bülten|Fintables Akış)/i;
 
-  // Zaman başını (Dün/Bugün/Yarın + HH:MM ya da sadece Dün/Bugün/Yarın) temizle
-  const stripTimeHead = (s) => {
+  // Başındaki tarih/zaman/gün ibarelerini temizle (Dün 19:22 / 31 Ekim 18:20 / Pazartesi 11:05 / Bugün ...)
+  const stripDateHead = (s) => {
     if (!s) return "";
-    return s
-      .replace(/^\s*/, "")
-      .replace(
-        /^(?:(?:dün|bugün|yarın|pazartesi|salı|çarşamba|perşembe|cuma|cumartesi|pazar)\s*)?\d{1,2}:\d{2}\s*|^(?:dün|bugün|yarın)\s+/i,
-        ""
-      )
-      .trim();
+    let r = s.replace(/^\s*/, "");
+    // Gün adı + saat  |  sadece gün adı
+    r = r.replace(/^(?:(?:dün|bugün|yarın|pazartesi|salı|çarşamba|perşembe|cuma|cumartesi|pazar)\s*)?\d{1,2}:\d{2}\s*/i, "");
+    r = r.replace(/^(?:dün|bugün|yarın)\s+/i, "");
+    // Gün + Ay adı + saat  |  Gün + Ay adı (TR ay adları)
+    r = r.replace(/^\d{1,2}\s*(ocak|şubat|mart|nisan|mayıs|haziran|temmuz|ağustos|eylül|ekim|kasım|aralık)\s*\d{1,2}:\d{2}\s*/i, "");
+    r = r.replace(/^\d{1,2}\s*(ocak|şubat|mart|nisan|mayıs|haziran|temmuz|ağustos|eylül|ekim|kasım|aralık)\s+/i, "");
+    return r.trim();
   };
 
   for (const a of nodes) {
     const text = a.textContent || "";
     const href = (a.href || a.getAttribute('href') || "").split('?')[0];
+
     const match = text.match(/KAP\s*[:•·]\s*([A-ZÇĞİÖŞÜ]{2,6})\s*([^]+?)(?=\n|$)/i);
     if (!match) continue;
 
-    // 👇 sadece ilk geçerli 2–6 harfli kodu al
+    // sadece ilk geçerli 2–6 harfli kodu al
     let code = (match[1] || "").toUpperCase();
     code = (code.match(/[A-ZÇĞİÖŞÜ]{2,6}/) || [""])[0];
     if (!code) continue;
@@ -133,9 +135,16 @@ JS_EXTRACTOR = r"""
 
     content = content.replace(/^[^\wÇĞİÖŞÜçğıöşü]+/u, '').replace(/\s+/g, ' ').trim();
 
-    // ⬇️ ID için: varsa href kullan; yoksa zaman başı temizlenmiş metni kullan
+    // ID için: mümkünse URL'in sadece path kısmını kullan; yoksa tarih/zaman başı temizlenmiş metni kullan
+    let pathOnly = "";
+    try {
+      pathOnly = new URL(href, location.origin).pathname || "";
+    } catch (e) {
+      pathOnly = href || "";
+    }
+
     let hash = 0;
-    const rawForHash = href || stripTimeHead(text);
+    const rawForHash = pathOnly || stripDateHead(text);
     for (let i = 0; i < rawForHash.length; i++) {
       hash = ((hash << 5) - hash + rawForHash.charCodeAt(i)) | 0;
     }
