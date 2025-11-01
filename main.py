@@ -105,14 +105,13 @@ JS_EXTRACTOR = r"""
   const nodes = Array.from(document.querySelectorAll('a.block[href^="/borsa-haber-akisi/"]')).slice(0, 200);
   const skip = /(Fintables|Günlük Bülten|Analist|Bülten|Fintables Akış)/i;
 
-  // Başındaki tarih/zaman/gün ibarelerini temizle (Dün 19:22 / 31 Ekim 18:20 / Pazartesi 11:05 / Bugün ...)
+  // İçerik başındaki tarih/saat/gün ibaresini temizle
+  // Ör: "Dün 19:22", "31 Ekim 18:20", "Pazartesi 11:05", "Bugün 09:15"
   const stripDateHead = (s) => {
     if (!s) return "";
     let r = s.replace(/^\s*/, "");
-    // Gün adı + saat  |  sadece gün adı
     r = r.replace(/^(?:(?:dün|bugün|yarın|pazartesi|salı|çarşamba|perşembe|cuma|cumartesi|pazar)\s*)?\d{1,2}:\d{2}\s*/i, "");
     r = r.replace(/^(?:dün|bugün|yarın)\s+/i, "");
-    // Gün + Ay adı + saat  |  Gün + Ay adı (TR ay adları)
     r = r.replace(/^\d{1,2}\s*(ocak|şubat|mart|nisan|mayıs|haziran|temmuz|ağustos|eylül|ekim|kasım|aralık)\s*\d{1,2}:\d{2}\s*/i, "");
     r = r.replace(/^\d{1,2}\s*(ocak|şubat|mart|nisan|mayıs|haziran|temmuz|ağustos|eylül|ekim|kasım|aralık)\s+/i, "");
     return r.trim();
@@ -125,7 +124,7 @@ JS_EXTRACTOR = r"""
     const match = text.match(/KAP\s*[:•·]\s*([A-ZÇĞİÖŞÜ]{2,6})\s*([^]+?)(?=\n|$)/i);
     if (!match) continue;
 
-    // sadece ilk geçerli 2–6 harfli kodu al
+    // sadece ilk geçerli 2–6 harfli kod
     let code = (match[1] || "").toUpperCase();
     code = (code.match(/[A-ZÇĞİÖŞÜ]{2,6}/) || [""])[0];
     if (!code) continue;
@@ -135,18 +134,20 @@ JS_EXTRACTOR = r"""
 
     content = content.replace(/^[^\wÇĞİÖŞÜçğıöşü]+/u, '').replace(/\s+/g, ' ').trim();
 
-    // ID için: mümkünse URL'in sadece path kısmını kullan; yoksa tarih/zaman başı temizlenmiş metni kullan
+    // ID tabanı: 1) mümkünse sadece URL path, 2) yoksa "code + temizlenmiş içerik"
     let pathOnly = "";
-    try {
-      pathOnly = new URL(href, location.origin).pathname || "";
-    } catch (e) {
-      pathOnly = href || "";
-    }
+    try { pathOnly = new URL(href, location.origin).pathname || ""; } catch (e) { pathOnly = href || ""; }
+
+    const contentForId = (code + " | " + stripDateHead(content))
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const idBase = pathOnly || contentForId;
 
     let hash = 0;
-    const rawForHash = pathOnly || stripDateHead(text);
-    for (let i = 0; i < rawForHash.length; i++) {
-      hash = ((hash << 5) - hash + rawForHash.charCodeAt(i)) | 0;
+    for (let i = 0; i < idBase.length; i++) {
+      hash = ((hash << 5) - hash + idBase.charCodeAt(i)) | 0;
     }
 
     out.push({
