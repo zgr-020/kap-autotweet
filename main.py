@@ -105,50 +105,72 @@ JS_EXTRACTOR = r"""
   const nodes = Array.from(document.querySelectorAll('a.block[href^="/borsa-haber-akisi/"]')).slice(0, 200);
   const skip = /(Fintables|Günlük Bülten|Analist|Bülten|Fintables Akış)/i;
 
-  const stripTimeHead = (s) => {
-    if (!s) return "";
-    return s.replace(/^\s*/, "")
-      .replace(/^(?:(?:dün|bugün|yarın|pazartesi|salı|çarşamba|perşembe|cuma|cumartesi|pazar)\s*)?\d{1,2}:\d{2}\s*|^(?:dün|bugün|yarın)\s+/i, "")
-      .replace(/^\d{1,2}\s*(ocak|şubat|mart|nisan|mayıs|haziran|temmuz|ağustos|eylül|ekim|kasım|aralık)\s*\d{1,2}:\d{2}\s*/i, "")
-      .replace(/^\d{1,2}\s*(ocak|şubat|mart|nisan|mayıs|haziran|temmuz|ağustos|eylül|ekim|kasım|aralık)\s+/i, "")
-      .trim();
+  // Zaman belirten token'ları tespit et
+  const monthRe = new RegExp('(Ocak|Şubat|Mart|Nisan|Mayıs|Haziran|Temmuz|Ağustos|Eylül|Ekim|Kasım|Aralık|Oca|Şub|Mar|Nis|May|Haz|Tem|Ağu|Eyl|Eki|Kas|Ara)', 'i');
+  const timeToken = (t) => {
+    const s = (t || '').trim();
+    return (
+      /^(dün|bugün|yarın)$/i.test(s) ||
+      /^\d{1,2}:\d{2}$/.test(s) ||
+      // 31 Eki 18:48 , 31 Ekim 18:48 , 31 Eki
+      /^\d{1,2}\s+[A-Za-zÇĞİÖŞÜçğıöşü]{2,}\s*(\d{1,2}:\d{2})?$/.test(s) ||
+      monthRe.test(s)
+    );
   };
 
+  // İçerikteki zaman başını temizle (ID stabilliği için yedek)
+  const stripTimeHead = (s) => {
+    if (!s) return '';
+    return s.replace(/^\s*/, '')
+            .replace(/^(?:(?:dün|bugün|yarın|pazartesi|salı|çarşamba|perşembe|cuma|cumartesi|pazar)\s*)?\d{1,2}:\d{2}\s*|^(?:dün|bugün|yarın)\s+/i, '')
+            .trim();
+  };
+
+  // Gövdedeki metni "KAP :/• KOD( • KOD) …" sonrasından al
+  const bodyRe = new RegExp('KAP\\s*[:•·]\\s*[A-ZÇĞİÖŞÜ]{2,6}(?:\\s*[•·]\\s*[A-ZÇĞİÖŞÜ]{2,6})?\\s*([\\s\\S]+?)(?=\\n|$)', 'i');
+
   for (const a of nodes) {
-    const text = a.textContent || "";
-    const hrefRaw = (a.href || a.getAttribute('href') || "");
-    let pathOnly = "";
-    try { pathOnly = new URL(hrefRaw, location.origin).pathname || ""; } catch { pathOnly = (hrefRaw.split('?')[0] || ""); }
+    const text = a.textContent || '';
+    const href = (a.href || a.getAttribute('href') || '').split('?')[0];
 
-    // Başlıktaki çiplerden (KAP • CODE1 • CODE2?) al
-    const head = text.split('\n')[0] || "";
-    const mHead = head.match(/^\s*KAP\s*[•·]\s*([A-ZÇĞİÖŞÜ]{2,6})(?:\s*[•·]\s*([A-ZÇĞİÖŞÜ]{2,6}))?/i);
-    if (!mHead) continue;
+    // === BAŞLIK ===  "KAP • KOD1 • (KOD2) • ZAMAN"
+    const head = (text.split('\n')[0] || '').replace(/\s+/g, ' ').trim();
 
-    const codes = [mHead[1], mHead[2]].filter(Boolean).map(c => c.toUpperCase()).slice(0, 2);
+    // "KAP • " sonrasını al, bullet'lara göre parçala
+    const afterKap = head.replace(/^.*?KAP\s*[•·]\s*/i, '');
+    const tokens = afterKap.split(/[•·]/).map(t => t.trim()).filter(Boolean);
 
-    // İçeriği, KAP + (1 veya 2 kod) sonrasından al
-    const mBody = text.match(/KAP\s*[:•·]\s*[A-ZÇ
-    if (!match) continue;
+    // KOD adaylarını sırayla al, zaman görürsek dur
+    const codes = [];
+    for (const tok of tokens) {
+      if (timeToken(tok)) break;
+      if (/^[A-ZÇĞİÖŞÜ]{2,6}$/.test(tok)) {
+        codes.push(tok.toUpperCase());
+        if (codes.length === 2) break;
+      } else {
+        // kod dışında bir şey geldiyse kır (ör. "MEPET payları…")
+        break;
+      }
+    }
+    if (codes.length === 0) continue; // kod çıkmadıysa geç
 
-    // 🔹 Yalnızca geçerli hisse kodlarını al (örnek: ALARK, ISATR, VB, “EKIM” gibi ay isimlerini at)
-    const codesRaw = (match[1] || "").toUpperCase();
-    const allCodes = Array.from(codesRaw.matchAll(/[A-ZÇĞİÖŞÜ]{2,6}/g)).map(m => m[0]);
-    const validCodes = allCodes.filter(c => !/^(OCAK|ŞUBAT|MART|NİSAN|MAYIS|HAZİRAN|TEMMUZ|AĞUSTOS|EYLÜL|EKİM|KASIM|ARALIK)$/.test(c));
-    const uniqCodes = Array.from(new Set(validCodes)).slice(0, 2);
-    if (uniqCodes.length === 0) continue;
-
-    let content = (match[2] || "").trim();
+    // === GÖVDE ===
+    const mb = text.match(bodyRe);
+    if (!mb) continue;
+    let content = (mb[1] || '').trim();
     if (content.length < 20 || skip.test(content)) continue;
     content = content.replace(/^[^\wÇĞİÖŞÜçğıöşü]+/u, '').replace(/\s+/g, ' ').trim();
 
-    const idBase = pathOnly || (uniqCodes[0] + " | " + stripTimeHead(content)).toLowerCase().replace(/\s+/g, " ").trim();
+    // === ID: href varsa hep onu kullan; yoksa zaman-başı temizlenmiş metin ===
     let hash = 0;
-    for (let i = 0; i < idBase.length; i++) hash = ((hash << 5) - hash + idBase.charCodeAt(i)) | 0;
+    const rawForHash = href || stripTimeHead(text);
+    for (let i = 0; i < rawForHash.length; i++) {
+      hash = ((hash << 5) - hash + rawForHash.charCodeAt(i)) | 0;
+    }
 
     out.push({
-      id: `kap-${uniqCodes[0]}-${Math.abs(hash)}`,
-      codes: uniqCodes,
+      id: `kap-${codes[0]}-${Math.abs(hash)}`,
+      codes: codes,          // build_tweet zaten #KOD1 #KOD2 yazacak
       content: content,
       raw: text
     });
