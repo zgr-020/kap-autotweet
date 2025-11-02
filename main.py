@@ -120,7 +120,15 @@ JS_EXTRACTOR = r"""
     let pathOnly = "";
     try { pathOnly = new URL(hrefRaw, location.origin).pathname || ""; } catch { pathOnly = (hrefRaw.split('?')[0] || ""); }
 
-    const match = text.match(/KAP\s*[:•·]\s*([A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜ]{1,5}(?:[^A-Za-zÇĞİÖŞÜ]+[A-ZÇĞİÖŞÜ]{2,6})*)\s*([^]+?)(?=\n|$)/i);
+    // Başlıktaki çiplerden (KAP • CODE1 • CODE2?) al
+    const head = text.split('\n')[0] || "";
+    const mHead = head.match(/^\s*KAP\s*[•·]\s*([A-ZÇĞİÖŞÜ]{2,6})(?:\s*[•·]\s*([A-ZÇĞİÖŞÜ]{2,6}))?/i);
+    if (!mHead) continue;
+
+    const codes = [mHead[1], mHead[2]].filter(Boolean).map(c => c.toUpperCase()).slice(0, 2);
+
+    // İçeriği, KAP + (1 veya 2 kod) sonrasından al
+    const mBody = text.match(/KAP\s*[:•·]\s*[A-ZÇ
     if (!match) continue;
 
     // 🔹 Yalnızca geçerli hisse kodlarını al (örnek: ALARK, ISATR, VB, “EKIM” gibi ay isimlerini at)
