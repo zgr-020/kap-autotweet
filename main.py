@@ -105,7 +105,6 @@ JS_EXTRACTOR = r"""
   const nodes = Array.from(document.querySelectorAll('a.block[href^="/borsa-haber-akisi/"]')).slice(0, 200);
   const skip = /(Fintables|Günlük Bülten|Analist|Bülten|Fintables Akış)/i;
 
-  // Zaman başını temizle (Dün/Bugün/Gün adı, 31 Ekim [HH:MM], HH:MM)
   const stripTimeHead = (s) => {
     if (!s) return "";
     return s.replace(/^\s*/, "")
@@ -121,31 +120,27 @@ JS_EXTRACTOR = r"""
     let pathOnly = "";
     try { pathOnly = new URL(hrefRaw, location.origin).pathname || ""; } catch { pathOnly = (hrefRaw.split('?')[0] || ""); }
 
-    // ① Kod(lar) + içerik: kod bölümünde ayırıcı olarak boşluk/•/+/,“+2” vb. olabilir
     const match = text.match(/KAP\s*[:•·]\s*([A-ZÇĞİÖŞÜ][A-ZÇĞİÖŞÜ]{1,5}(?:[^A-Za-zÇĞİÖŞÜ]+[A-ZÇĞİÖŞÜ]{2,6})*)\s*([^]+?)(?=\n|$)/i);
     if (!match) continue;
 
-    // ② Tüm kod adaylarını çıkar, benzersizleştir, ilk 2 taneyi al
+    // 🔹 Yalnızca geçerli hisse kodlarını al (örnek: ALARK, ISATR, VB, “EKIM” gibi ay isimlerini at)
     const codesRaw = (match[1] || "").toUpperCase();
     const allCodes = Array.from(codesRaw.matchAll(/[A-ZÇĞİÖŞÜ]{2,6}/g)).map(m => m[0]);
-    const uniqCodes = Array.from(new Set(allCodes)).slice(0, 2);
+    const validCodes = allCodes.filter(c => !/^(OCAK|ŞUBAT|MART|NİSAN|MAYIS|HAZİRAN|TEMMUZ|AĞUSTOS|EYLÜL|EKİM|KASIM|ARALIK)$/.test(c));
+    const uniqCodes = Array.from(new Set(validCodes)).slice(0, 2);
     if (uniqCodes.length === 0) continue;
 
     let content = (match[2] || "").trim();
     if (content.length < 20 || skip.test(content)) continue;
-
     content = content.replace(/^[^\wÇĞİÖŞÜçğıöşü]+/u, '').replace(/\s+/g, ' ').trim();
 
-    // ③ ID tabanı: varsa PATH, yoksa ilk kod + zaman başı arındırılmış metin
     const idBase = pathOnly || (uniqCodes[0] + " | " + stripTimeHead(content)).toLowerCase().replace(/\s+/g, " ").trim();
-
-    // ④ Stabil hash
     let hash = 0;
     for (let i = 0; i < idBase.length; i++) hash = ((hash << 5) - hash + idBase.charCodeAt(i)) | 0;
 
     out.push({
-      id: `kap-${uniqCodes[0]}-${Math.abs(hash)}`,  // ID için ilk kod
-      codes: uniqCodes,                              // Tweet’te 1 veya 2 etiket
+      id: `kap-${uniqCodes[0]}-${Math.abs(hash)}`,
+      codes: uniqCodes,
       content: content,
       raw: text
     });
