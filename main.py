@@ -102,77 +102,60 @@ def send_tweet(client, text: str) -> bool:
 JS_EXTRACTOR = r"""
 () => {
   const out = [];
-  const nodes = Array.from(document.querySelectorAll('a.block[href^="/borsa-haber-akisi/"]')).slice(0, 200);
-  const skip = /(Fintables|Günlük Bülten|Analist|Bülten|Fintables Akış)/i;
+  const nodes = Array.from(document.querySelectorAll('a[href^="/borsa-haber-akisi/"]')).slice(0, 200);
+  const skipRe = /(Fintables|Günlük Bülten|Analist|Bülten|Fintables Akış)/i;
 
-  // Zaman belirten token'ları tespit et
-  const monthRe = new RegExp('(Ocak|Şubat|Mart|Nisan|Mayıs|Haziran|Temmuz|Ağustos|Eylül|Ekim|Kasım|Aralık|Oca|Şub|Mar|Nis|May|Haz|Tem|Ağu|Eyl|Eki|Kas|Ara)', 'i');
-  const timeToken = (t) => {
-    const s = (t || '').trim();
-    return (
-      /^(dün|bugün|yarın)$/i.test(s) ||
-      /^\d{1,2}:\d{2}$/.test(s) ||
-      // 31 Eki 18:48 , 31 Ekim 18:48 , 31 Eki
-      /^\d{1,2}\s+[A-Za-zÇĞİÖŞÜçğıöşü]{2,}\s*(\d{1,2}:\d{2})?$/.test(s) ||
-      monthRe.test(s)
-    );
-  };
-
-  // İçerikteki zaman başını temizle (ID stabilliği için yedek)
+  // Zaman başını (Dün/Bugün/hafta günü + HH:MM) veya "31 Eki 18:48" vb. temizle
   const stripTimeHead = (s) => {
-    if (!s) return '';
-    return s.replace(/^\s*/, '')
-            .replace(/^(?:(?:dün|bugün|yarın|pazartesi|salı|çarşamba|perşembe|cuma|cumartesi|pazar)\s*)?\d{1,2}:\d{2}\s*|^(?:dün|bugün|yarın)\s+/i, '')
-            .trim();
+    if (!s) return "";
+    return s
+      .replace(/^\s*/, "")
+      .replace(
+        /^(?:(?:dün|bugün|yarın|pazartesi|salı|çarşamba|perşembe|cuma|cumartesi|pazar)\s*)?\d{1,2}:\d{2}\s*|^(?:dün|bugün|yarın)\s+|^\d{1,2}\s+(?:Oca|Şub|Mar|Nis|May|Haz|Tem|Ağu|Eyl|Eki|Kas|Ara)\s+\d{1,2}:\d{2}\s*/i,
+        ""
+      )
+      .trim();
   };
-
-  // Gövdedeki metni "KAP :/• KOD( • KOD) …" sonrasından al
-  const bodyRe = new RegExp('KAP\\s*[:•·]\\s*[A-ZÇĞİÖŞÜ]{2,6}(?:\\s*[•·]\\s*[A-ZÇĞİÖŞÜ]{2,6})?\\s*([\\s\\S]+?)(?=\\n|$)', 'i');
 
   for (const a of nodes) {
-    const text = a.textContent || '';
-    const href = (a.href || a.getAttribute('href') || '').split('?')[0];
+    const href = (a.href || a.getAttribute('href') || "").split('?')[0];
 
-    // === BAŞLIK ===  "KAP • KOD1 • (KOD2) • ZAMAN"
-    const head = (text.split('\n')[0] || '').replace(/\s+/g, ' ').trim();
+    // Satır kapsayıcısı (anchor'ın üstündeki başlık/rozet/saat de burada)
+    const row = a.closest('li, article, div') || a;
+    const rowText = (row.textContent || "").replace(/\s+/g, ' ').trim();
 
-    // "KAP • " sonrasını al, bullet'lara göre parçala
-    const afterKap = head.replace(/^.*?KAP\s*[•·]\s*/i, '');
-    const tokens = afterKap.split(/[•·]/).map(t => t.trim()).filter(Boolean);
+    // 1) Rozet/linklerden kodları topla (ör. /borsa-hisse/…)
+    const badgeCodes = Array.from(
+      row.querySelectorAll('a[href*="/borsa-hisse/"], span[class*="tag"], span[class*="badge"]')
+    ).map(e => (e.textContent || "").trim().toUpperCase())
+     .filter(c => /^[A-ZÇĞİÖŞÜ]{2,6}$/.test(c));
 
-    // KOD adaylarını sırayla al, zaman görürsek dur
-    const codes = [];
-    for (const tok of tokens) {
-      if (timeToken(tok)) break;
-      if (/^[A-ZÇĞİÖŞÜ]{2,6}$/.test(tok)) {
-        codes.push(tok.toUpperCase());
-        if (codes.length === 2) break;
-      } else {
-        // kod dışında bir şey geldiyse kır (ör. "MEPET payları…")
-        break;
-      }
+    // 2) Bulunamazsa "KAP • KOD" deseninden yakala
+    let codes = badgeCodes;
+    if (codes.length === 0) {
+      const m = rowText.match(/KAP\s*[•·:\-]\s*([A-ZÇĞİÖŞÜ]{2,6})(?:\s+\+\d+)?/i);
+      if (m) codes = [m[1].toUpperCase()];
     }
-    if (codes.length === 0) continue; // kod çıkmadıysa geç
 
-    // === GÖVDE ===
-    const mb = text.match(bodyRe);
-    if (!mb) continue;
-    let content = (mb[1] || '').trim();
-    if (content.length < 20 || skip.test(content)) continue;
-    content = content.replace(/^[^\wÇĞİÖŞÜçğıöşü]+/u, '').replace(/\s+/g, ' ').trim();
+    if (codes.length === 0) continue;          // kodsuz satır alma
+    if (skipRe.test(rowText)) continue;
 
-    // === ID: href varsa hep onu kullan; yoksa zaman-başı temizlenmiş metin ===
+    // İçerik: anchor gövdesi (başlık/rozet/saat hariç)
+    let content = (a.textContent || "").replace(/\s+/g, ' ').trim();
+    if (content.length < 20) continue;
+
+    // ID: href öncelikli; yoksa zaman-başı soyulmuş satır metni
+    const base = href || stripTimeHead(rowText);
     let hash = 0;
-    const rawForHash = href || stripTimeHead(text);
-    for (let i = 0; i < rawForHash.length; i++) {
-      hash = ((hash << 5) - hash + rawForHash.charCodeAt(i)) | 0;
+    for (let i = 0; i < base.length; i++) {
+      hash = ((hash << 5) - hash + base.charCodeAt(i)) | 0;
     }
 
     out.push({
       id: `kap-${codes[0]}-${Math.abs(hash)}`,
-      codes: codes,          // build_tweet zaten #KOD1 #KOD2 yazacak
-      content: content,
-      raw: text
+      codes: [codes[0]],           // mevcut akışa uygun: ilk kod
+      content,
+      raw: rowText
     });
   }
   return out;
