@@ -102,62 +102,58 @@ def send_tweet(client, text: str) -> bool:
 JS_EXTRACTOR = r"""
 () => {
   const out = [];
-  const nodes = Array.from(document.querySelectorAll('a[href^="/borsa-haber-akisi/"]')).slice(0, 200);
-  const skipRe = /(Fintables|Günlük Bülten|Analist|Bülten|Fintables Akış)/i;
+  const nodes = Array.from(document.querySelectorAll('a.block[href^="/borsa-haber-akisi/"]')).slice(0, 200);
+  const skip = /(Fintables|Günlük Bülten|Analist|Bülten|Fintables Akış)/i;
 
-  // Zaman başını (Dün/Bugün/hafta günü + HH:MM) veya "31 Eki 18:48" vb. temizle
-  const stripTimeHead = (s) => {
+  // Zaman ibaresini baştan VE sondan sök: "Dün 19:22", "31 Eki 18:48", "19:22", "Bugün" vb.
+  const stripTimeTokens = (s) => {
     if (!s) return "";
-    return s
+    const mon = "(?:Oca|Şub|Mar|Nis|May|Haz|Tem|Ağu|Eyl|Eki|Kas|Ara)";
+    const hhmm = "\\d{1,2}:\\d{2}";
+    const rel  = "(?:dün|bugün|yarın|pazartesi|salı|çarşamba|perşembe|cuma|cumartesi|pazar)";
+    const dmh  = `\\d{1,2}\\s+${mon}\\s+${hhmm}`;
+
+    // baştan
+    s = s
       .replace(/^\s*/, "")
-      .replace(
-        /^(?:(?:dün|bugün|yarın|pazartesi|salı|çarşamba|perşembe|cuma|cumartesi|pazar)\s*)?\d{1,2}:\d{2}\s*|^(?:dün|bugün|yarın)\s+|^\d{1,2}\s+(?:Oca|Şub|Mar|Nis|May|Haz|Tem|Ağu|Eyl|Eki|Kas|Ara)\s+\d{1,2}:\d{2}\s*/i,
-        ""
-      )
+      .replace(new RegExp(`^(?:${rel}\\s*)?${hhmm}\\s*|^(?:${rel})\\s+|^${dmh}\\s*`, "i"), "")
       .trim();
+
+    // sondan (ayraç varsa birlikte sök)
+    const tailRe = new RegExp(`(?:\\s*[–—\\-\\|•·]?\\s*(?:${hhmm}|${dmh}|${rel}))\\s*$`, "i");
+    while (tailRe.test(s)) s = s.replace(tailRe, "").trim();
+
+    return s;
   };
 
   for (const a of nodes) {
+    const text = a.textContent || "";
     const href = (a.href || a.getAttribute('href') || "").split('?')[0];
+    const match = text.match(/KAP\s*[:•·]\s*([A-ZÇĞİÖŞÜ]{2,6})\s*([^]+?)(?=\n|$)/i);
+    if (!match) continue;
 
-    // Satır kapsayıcısı (anchor'ın üstündeki başlık/rozet/saat de burada)
-    const row = a.closest('li, article, div') || a;
-    const rowText = (row.textContent || "").replace(/\s+/g, ' ').trim();
+    // sadece ilk geçerli 2–6 harfli kod
+    let code = (match[1] || "").toUpperCase();
+    code = (code.match(/[A-ZÇĞİÖŞÜ]{2,6}/) || [""])[0];
+    if (!code) continue;
 
-    // 1) Rozet/linklerden kodları topla (ör. /borsa-hisse/…)
-    const badgeCodes = Array.from(
-      row.querySelectorAll('a[href*="/borsa-hisse/"], span[class*="tag"], span[class*="badge"]')
-    ).map(e => (e.textContent || "").trim().toUpperCase())
-     .filter(c => /^[A-ZÇĞİÖŞÜ]{2,6}$/.test(c));
+    let content = (match[2] || "").trim();
+    if (content.length < 20 || skip.test(content)) continue;
 
-    // 2) Bulunamazsa "KAP • KOD" deseninden yakala
-    let codes = badgeCodes;
-    if (codes.length === 0) {
-      const m = rowText.match(/KAP\s*[•·:\-]\s*([A-ZÇĞİÖŞÜ]{2,6})(?:\s+\+\d+)?/i);
-      if (m) codes = [m[1].toUpperCase()];
-    }
+    content = content.replace(/^[^\wÇĞİÖŞÜçğıöşü]+/u, '').replace(/\s+/g, ' ').trim();
 
-    if (codes.length === 0) continue;          // kodsuz satır alma
-    if (skipRe.test(rowText)) continue;
-
-    // İçerik: anchor gövdesi (başlık/rozet/saat hariç)
-    let content = (a.textContent || "").replace(/\s+/g, ' ').trim();
-    if (content.length < 20) continue;
-
-    // ID: SADECE href'e bağlı olsun (saat/tarih değişse bile sabit kalsın)
-    if (!href) continue;            // href yoksa stabil ID üretemeyiz → atla
-    const base = href;
-
+    // ID: href varsa onu kullan; yoksa zaman ibareleri sökülmüş metni hash’le
     let hash = 0;
+    const base = href || stripTimeTokens(text);
     for (let i = 0; i < base.length; i++) {
       hash = ((hash << 5) - hash + base.charCodeAt(i)) | 0;
     }
 
     out.push({
-      id: `kap-${codes[0]}-${Math.abs(hash)}`,
-      codes: [codes[0]],           // mevcut akışa uygun: ilk kod
-      content,
-      raw: rowText
+      id: `kap-${code}-${Math.abs(hash)}`,
+      codes: [code],
+      content: content,
+      raw: text
     });
   }
   return out;
