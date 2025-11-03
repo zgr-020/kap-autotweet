@@ -144,8 +144,10 @@ JS_EXTRACTOR = r"""
     let content = (a.textContent || "").replace(/\s+/g, ' ').trim();
     if (content.length < 20) continue;
 
-    // ID: href öncelikli; yoksa zaman-başı soyulmuş satır metni
-    const base = href || stripTimeHead(rowText);
+    // ID: SADECE href'e bağlı olsun (saat/tarih değişse bile sabit kalsın)
+    if (!href) continue;            // href yoksa stabil ID üretemeyiz → atla
+    const base = href;
+
     let hash = 0;
     for (let i = 0; i < base.length; i++) {
       hash = ((hash << 5) - hash + base.charCodeAt(i)) | 0;
