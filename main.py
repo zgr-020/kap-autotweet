@@ -19,7 +19,7 @@ import tweepy
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
 STATE_PATH = Path("state.json")
 MAX_PER_RUN = 5
-MAX_TODAY = 25
+MAX_TODAY = 100
 COOLDOWN_MIN = 15
 
 # ================== SECRETS ==================
