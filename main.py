@@ -129,15 +129,28 @@ JS_EXTRACTOR = r"""
   for (const a of nodes) {
     const text = a.textContent || "";
     const href = (a.href || a.getAttribute('href') || "").split('?')[0];
-    const match = text.match(/KAP\s*[:•·]\s*([A-ZÇĞİÖŞÜ]{2,6})\s*([^]+?)(?=\n|$)/i);
+
+    // 🔧 KOD YAKALAMA (2 koda kadar): "KAP • ODINE TCELL +2 ..." gibi
+    //  - İkinci kod opsiyonel
+    //  - "+2" vb. varsa yok say
+    //  - Ay kısaltması / zaman ifadesi kod sanılmasın
+    const match = text.match(
+      /KAP\s*[:•·\-]\s*([A-ZÇĞİÖŞÜ]{2,6})(?:\s+([A-ZÇĞİÖŞÜ]{2,6}))?(?:\s*\+\d+)?\s*([^]+?)(?=\n|$)/i
+    );
     if (!match) continue;
 
-    // sadece ilk geçerli 2–6 harfli kod
-    let code = (match[1] || "").toUpperCase();
-    code = (code.match(/[A-ZÇĞİÖŞÜ]{2,6}/) || [""])[0];
-    if (!code) continue;
+    const banToken = /^(?:OCA|ŞUB|MAR|NIS|MAY|HAZ|TEM|AĞU|EYL|EKI|KAS|ARA|DÜN|BUGÜN|YARIN|\d{1,2}:\d{2})$/i;
 
-    let content = (match[2] || "").trim();
+    // → en fazla 2 geçerli kod
+    const codes = [match[1], match[2]]
+      .map(x => (x || "").toUpperCase())
+      .filter(x => x && !banToken.test(x))
+      .slice(0, 2);
+
+    if (codes.length === 0) continue;
+
+    // İçerik grubu artık 3. grup (match[3])
+    let content = (match[3] || "").trim();
     if (content.length < 20 || skip.test(content)) continue;
 
     content = content.replace(/^[^\wÇĞİÖŞÜçğıöşü]+/u, '').replace(/\s+/g, ' ').trim();
@@ -150,8 +163,8 @@ JS_EXTRACTOR = r"""
     }
 
     out.push({
-      id: `kap-${code}-${Math.abs(hash)}`,
-      codes: [code],
+      id: `kap-${codes[0]}-${Math.abs(hash)}`,  // ID için ilk kodu kullanıyoruz (stabil)
+      codes: codes,                              // build_tweet iki etiketi de basacak
       content: content,
       raw: text
     });
