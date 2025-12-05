@@ -104,67 +104,50 @@ JS_EXTRACTOR = r"""
   const out = [];
   const nodes = Array.from(document.querySelectorAll('a.block[href^="/borsa-haber-akisi/"]')).slice(0, 200);
   const skip = /(Fintables|Günlük Bülten|Analist|Bülten|Fintables Akış)/i;
-
-  // Zaman ibaresini baştan VE sondan sök: "Dün 19:22", "31 Eki 18:48", "19:22", "Bugün" vb.
-  const stripTimeTokens = (s) => {
-    if (!s) return "";
-    const mon = "(?:Oca|Şub|Mar|Nis|May|Haz|Tem|Ağu|Eyl|Eki|Kas|Ara)";
-    const hhmm = "\\d{1,2}:\\d{2}";
-    const rel  = "(?:dün|bugün|yarın|pazartesi|salı|çarşamba|perşembe|cuma|cumartesi|pazar)";
-    const dmh  = `\\d{1,2}\\s+${mon}\\s+${hhmm}`;
-
-    // baştan
-    s = s
-      .replace(/^\s*/, "")
-      .replace(new RegExp(`^(?:${rel}\\s*)?${hhmm}\\s*|^(?:${rel})\\s+|^${dmh}\\s*`, "i"), "")
-      .trim();
-
-    // sondan (ayraç varsa birlikte sök)
-    const tailRe = new RegExp(`(?:\\s*[–—\\-\\|•·]?\\s*(?:${hhmm}|${dmh}|${rel}))\\s*$`, "i");
-    while (tailRe.test(s)) s = s.replace(tailRe, "").trim();
-
-    return s;
-  };
+  const banToken = /^(?:OCA|ŞUB|MAR|NIS|MAY|HAZ|TEM|AĞU|EYL|EKI|KAS|ARA|DÜN|BUGÜN|YARIN|SAAT|\d{1,2}:\d{2})$/i;
 
   for (const a of nodes) {
     const text = a.textContent || "";
     const href = (a.href || a.getAttribute('href') || "").split('?')[0];
 
-    // 🔧 KOD YAKALAMA (2 koda kadar): "KAP • ODINE TCELL +2 ..." gibi
-    //  - İkinci kod opsiyonel
-    //  - "+2" vb. varsa yok say
-    //  - Ay kısaltması / zaman ifadesi kod sanılmasın
-    const match = text.match(
-      /KAP\s*[:•·\-]\s*([A-ZÇĞİÖŞÜ]{2,6})(?:\s+([A-ZÇĞİÖŞÜ]{2,6}))?(?:\s*\+\d+)?\s*([^]+?)(?=\n|$)/i
-    );
-    if (!match) continue;
+    // 1. ADIM: "KAP" veya ayraçtan sonraki KODLARI bul
+    // Regex mantığı: KAP • (KODLAR...) Metnin Geri Kalanı
+    const splitMatch = text.match(/KAP\s*[:•·\-]\s*((?:[A-ZÇĞİÖŞÜ0-9]{2,10}(?:\s+|$))+)(.*)/i);
+    
+    if (!splitMatch) continue;
 
-    const banToken = /^(?:OCA|ŞUB|MAR|NIS|MAY|HAZ|TEM|AĞU|EYL|EKI|KAS|ARA|DÜN|BUGÜN|YARIN|\d{1,2}:\d{2})$/i;
-
-    // → en fazla 2 geçerli kod
-    const codes = [match[1], match[2]]
-      .map(x => (x || "").toUpperCase())
-      .filter(x => x && !banToken.test(x))
-      .slice(0, 2);
+    // Kodları ayrıştır ve temizle
+    let rawCodes = splitMatch[1].split(/\s+/);
+    let codes = rawCodes
+        .map(x => x.toUpperCase().trim())
+        .filter(x => x.length > 1 && !banToken.test(x)); // Zaman ifadeleri kod gibi görünürse ele
 
     if (codes.length === 0) continue;
 
-    // İçerik grubu artık 3. grup (match[3])
-    let content = (match[3] || "").trim();
-    if (content.length < 20 || skip.test(content)) continue;
+    // 2. ADIM: İçeriği temizle (Zaman ifadelerini metinden de sök)
+    let content = (splitMatch[2] || "").trim();
+    
+    // Başındaki "+2" gibi sayaçları veya kalan zamanları temizle
+    content = content.replace(/^(\+\d+\s*)?/, "").trim();
+    
+    if (content.length < 10 || skip.test(content)) continue;
 
+    // İçerik temizliği (Gereksiz karakterler)
     content = content.replace(/^[^\wÇĞİÖŞÜçğıöşü]+/u, '').replace(/\s+/g, ' ').trim();
 
-    // ID: href varsa onu kullan; yoksa zaman ibareleri sökülmüş metni hash’le
+    // 3. ADIM: ID OLUŞTURMA (ARTIK ZAMAN BAĞIMSIZ!)
+    // ID'yi sadece "Kodlar" + "Saf İçerik" birleşiminden oluşturuyoruz.
+    // Böylece site saati "Bugün"den "Dün"e çevirse bile bu ID değişmez.
     let hash = 0;
-    const base = href || stripTimeTokens(text);
+    const base = codes.join('') + content; 
+    
     for (let i = 0; i < base.length; i++) {
       hash = ((hash << 5) - hash + base.charCodeAt(i)) | 0;
     }
 
     out.push({
-      id: `kap-${codes[0]}-${Math.abs(hash)}`,  // ID için ilk kodu kullanıyoruz (stabil)
-      codes: codes,                              // build_tweet iki etiketi de basacak
+      id: `kap-${codes[0]}-${Math.abs(hash)}`,
+      codes: codes, 
       content: content,
       raw: text
     });
@@ -179,13 +162,18 @@ ADD_UNIQ = False
 
 def build_tweet(codes, content, tweet_id="") -> str:
     codes_str = " ".join(f"#{c}" for c in codes)
-    # 👇 YENİ: “dün/bugün + saat” başlarını temizle
+    
+    # 👇 GÜNCELLENDİ: "ün 18:31" gibi artıklar kalmaması için regex güçlendirildi.
+    # Cümle başındaki zaman ifadelerini, "Dün", "Bugün" ve saatleri temizler.
     text = re.sub(
-        r'^(?:(?:dün|bugün|yarın|pazartesi|salı|çarşamba|perşembe|cuma|cumartesi|pazar)\s*)?\d{1,2}:\d{2}\s*|^(?:dün|bugün|yarın)\s+',
+        r'^(?:(?:dün|bugün|yarın|pazartesi|salı|çarşamba|perşembe|cuma|cumartesi|pazar)\s*)?(\d{1,2}:\d{2})?\s*',
         '',
         content.strip(),
         flags=re.IGNORECASE
     ).strip()
+    
+    # Ekstra temizlik: Eğer hala metin sayı veya noktalama ile başlıyorsa temizle
+    text = re.sub(r'^[^\wÇĞİÖŞÜçğıöşü]+', '', text).strip()
 
     prefix = f"{TWEET_EMOJI} {codes_str} | "
     suffix = ""
