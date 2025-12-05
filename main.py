@@ -3,7 +3,6 @@ import re
 import json
 import time
 import logging
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime as dt, timezone, timedelta
 
@@ -19,9 +18,9 @@ import tweepy
 # ================== AYARLAR ==================
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
 STATE_PATH = Path("state.json")
-MAX_PER_RUN = 5     # Her çalışmada atılacak maksimum tweet
-MAX_TODAY = 150     # Günlük toplam limit
-COOLDOWN_MIN = 15   # Rate limit yerse beklenecek dakika
+MAX_PER_RUN = 5
+MAX_TODAY = 100
+COOLDOWN_MIN = 15
 
 # ================== SECRETS ==================
 API_KEY = os.getenv("API_KEY")
@@ -29,19 +28,12 @@ API_KEY_SECRET = os.getenv("API_KEY_SECRET")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 ACCESS_TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET")
 
-# ================== LOG AYARLARI ==================
-log_handler = RotatingFileHandler(
-    "bot.log", 
-    maxBytes=2*1024*1024,
-    backupCount=1,
-    encoding="utf-8"
-)
-
+# ================== LOG ==================
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(message)s",
     datefmt="%H:%M:%S",
-    handlers=[log_handler, logging.StreamHandler()]
+    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()]
 )
 log = logging.getLogger().info
 
@@ -67,6 +59,7 @@ def save_state(s):
         if "posted" in s and isinstance(s["posted"], list):
             s["posted"] = s["posted"][-5000:]
         STATE_PATH.write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
+        log(f"state.json güncellendi: {len(s.get('posted', []))} tweet kaydedildi")
     except Exception as e:
         log(f"!! state.json kaydedilemedi: {e}")
 
@@ -95,99 +88,84 @@ def send_tweet(client, text: str) -> bool:
         log("Tweet gönderildi")
         return True
     except Exception as e:
-        err_str = str(e).lower()
-        log(f"⚠️ TWITTER API HATASI: {e}") 
-        
-        if "duplicate content" in err_str:
-            log("Twitter: Duplicate content → zaten atılmış, işlem tamam sayılıyor.")
+        err_msg = str(e).lower()
+        if "duplicate content" in err_msg:
+            log("Twitter: Duplicate content → zaten atılmış, atlanıyor")
             return True
-        
-        if "429" in err_str or "too many requests" in err_str:
-            log("⛔️ Rate limit (429) algılandı!")
+        if "429" in err_msg or "too many requests" in err_msg:
+            log("Rate limit → 15 dk cooldown")
             raise RuntimeError("RATE_LIMIT")
-            
+        log(f"Tweet hatası: {e}")
         return False
 
-# ================== EXTRACTOR (YEPYENİ TOKENIZER MANTIĞI) ==================
+# ================== EXTRACTOR ==================
 JS_EXTRACTOR = r"""
 () => {
   const out = [];
-  // Sayfadaki haberleri seç
-  const nodes = Array.from(document.querySelectorAll('a.block[href^="/borsa-haber-akisi/"]')).slice(0, 50);
-  
-  // Yasaklı kelimeler (Kod sanılabilecek zaman ifadeleri)
-  const banList = ["OCA", "ŞUB", "MAR", "NIS", "MAY", "HAZ", "TEM", "AĞU", "EYL", "EKI", "KAS", "ARA", "DÜN", "BUGÜN", "YARIN", "SAAT"];
+  const nodes = Array.from(document.querySelectorAll('a.block[href^="/borsa-haber-akisi/"]')).slice(0, 200);
+  const skip = /(Fintables|Günlük Bülten|Analist|Bülten|Fintables Akış)/i;
+
+  // Zaman ibaresini baştan VE sondan sök: "Dün 19:22", "31 Eki 18:48", "19:22", "Bugün" vb.
+  const stripTimeTokens = (s) => {
+    if (!s) return "";
+    const mon = "(?:Oca|Şub|Mar|Nis|May|Haz|Tem|Ağu|Eyl|Eki|Kas|Ara)";
+    const hhmm = "\\d{1,2}:\\d{2}";
+    const rel  = "(?:dün|bugün|yarın|pazartesi|salı|çarşamba|perşembe|cuma|cumartesi|pazar)";
+    const dmh  = `\\d{1,2}\\s+${mon}\\s+${hhmm}`;
+
+    // baştan
+    s = s
+      .replace(/^\s*/, "")
+      .replace(new RegExp(`^(?:${rel}\\s*)?${hhmm}\\s*|^(?:${rel})\\s+|^${dmh}\\s*`, "i"), "")
+      .trim();
+
+    // sondan (ayraç varsa birlikte sök)
+    const tailRe = new RegExp(`(?:\\s*[–—\\-\\|•·]?\\s*(?:${hhmm}|${dmh}|${rel}))\\s*$`, "i");
+    while (tailRe.test(s)) s = s.replace(tailRe, "").trim();
+
+    return s;
+  };
 
   for (const a of nodes) {
-    let text = (a.textContent || "").trim();
-    // Satırın tamamında "Dün" kelimesi bağımsız olarak geçiyorsa bu haberi direkt atla (Eski haber koruması)
-    if (/\bDün\b/.test(text)) continue;
+    const text = a.textContent || "";
+    const href = (a.href || a.getAttribute('href') || "").split('?')[0];
 
-    // KAP ibaresini bul
-    const kapIndex = text.search(/KAP\s*[:•·\-]/i);
-    if (kapIndex === -1) continue;
+    // 🔧 KOD YAKALAMA (2 koda kadar): "KAP • ODINE TCELL +2 ..." gibi
+    //  - İkinci kod opsiyonel
+    //  - "+2" vb. varsa yok say
+    //  - Ay kısaltması / zaman ifadesi kod sanılmasın
+    const match = text.match(
+      /KAP\s*[:•·\-]\s*([A-ZÇĞİÖŞÜ]{2,6})(?:\s+([A-ZÇĞİÖŞÜ]{2,6}))?(?:\s*\+\d+)?\s*([^]+?)(?=\n|$)/i
+    );
+    if (!match) continue;
 
-    // Metni KAP işaretinden sonrasını alacak şekilde kes
-    // Örnek text: "18:30 KAP • ODINE TCELL +2 Lorem ipsum..." -> " ODINE TCELL +2 Lorem ipsum..."
-    let rawContent = text.substring(kapIndex).replace(/^KAP\s*[:•·\-]/i, "").trim();
+    const banToken = /^(?:OCA|ŞUB|MAR|NIS|MAY|HAZ|TEM|AĞU|EYL|EKI|KAS|ARA|DÜN|BUGÜN|YARIN|\d{1,2}:\d{2})$/i;
 
-    // Şimdi kelime kelime (token) inceleyeceğiz
-    const tokens = rawContent.split(/\s+/);
-    const codes = [];
-    let contentStartIndex = 0;
-
-    for (let i = 0; i < tokens.length; i++) {
-        let t = tokens[i].replace(/[^a-zA-Z0-9]/g, ""); // Noktalama temizle
-        let upperT = t.toUpperCase();
-
-        // Eğer kelime "+2" gibi bir sayı ise atla
-        if (tokens[i].startsWith("+") && !isNaN(parseInt(tokens[i]))) {
-            continue;
-        }
-
-        // Kelime 3-10 karakter arası, tamamen BÜYÜK HARF ve yasaklı listede değilse KOD'dur.
-        // Örn: ODINE, TCELL, MGMT
-        if (t.length >= 3 && t.length <= 10 && t === upperT && !banList.includes(upperT) && !/^\d/.test(t)) {
-            codes.push(upperT);
-        } else {
-            // Kod olmayan ilk kelimeye geldik, demek ki içerik buradan başlıyor.
-            contentStartIndex = i;
-            break;
-        }
-    }
+    // → en fazla 2 geçerli kod
+    const codes = [match[1], match[2]]
+      .map(x => (x || "").toUpperCase())
+      .filter(x => x && !banToken.test(x))
+      .slice(0, 2);
 
     if (codes.length === 0) continue;
 
-    // İçeriği birleştir (Token'ların geri kalanı)
-    // tokens arrayindeki contentStartIndex'ten sonrasını alıp birleştiriyoruz.
-    let content = tokens.slice(contentStartIndex).join(" ");
+    // İçerik grubu artık 3. grup (match[3])
+    let content = (match[3] || "").trim();
+    if (content.length < 20 || skip.test(content)) continue;
 
-    // --- TEMİZLİK ---
-    // İçeriğin başındaki saat, tarih, "ün", "ugün" gibi kalıntıları temizle
-    // Döngüyle temizliyoruz ki iç içe geçmişse de silsin.
-    let clean = content;
-    for(let k=0; k<3; k++) {
-        clean = clean
-            .replace(/^(?:Bugün|Yarın|Pazartesi|Salı|Çarşamba|Perşembe|Cuma|Cumartesi|Pazar)/i, "")
-            .replace(/^\d{1,2}:\d{2}/, "")  // 18:31 gibi saatleri sil
-            .replace(/^(?:ün|ugün|arın)/i, "") // Kesik kelimeleri sil
-            .replace(/^[^\wÇĞİÖŞÜçğıöşü]+/, "") // Baştaki noktalama işaretlerini sil (- . ,)
-            .trim();
-    }
-    
-    if (clean.length < 10) continue;
+    content = content.replace(/^[^\wÇĞİÖŞÜçğıöşü]+/u, '').replace(/\s+/g, ' ').trim();
 
-    // ID OLUŞTURMA (Zaman bağımsız, sadece Kod + İçerik)
+    // ID: href varsa onu kullan; yoksa zaman ibareleri sökülmüş metni hash’le
     let hash = 0;
-    const base = codes.join('') + clean; 
+    const base = href || stripTimeTokens(text);
     for (let i = 0; i < base.length; i++) {
       hash = ((hash << 5) - hash + base.charCodeAt(i)) | 0;
     }
 
     out.push({
-      id: `kap-${codes[0]}-${Math.abs(hash)}`,
-      codes: codes, 
-      content: clean,
+      id: `kap-${codes[0]}-${Math.abs(hash)}`,  // ID için ilk kodu kullanıyoruz (stabil)
+      codes: codes,                              // build_tweet iki etiketi de basacak
+      content: content,
       raw: text
     });
   }
@@ -201,10 +179,14 @@ ADD_UNIQ = False
 
 def build_tweet(codes, content, tweet_id="") -> str:
     codes_str = " ".join(f"#{c}" for c in codes)
-    
-    # Python tarafında son güvenlik temizliği
-    text = content.strip()
-    
+    # 👇 YENİ: “dün/bugün + saat” başlarını temizle
+    text = re.sub(
+        r'^(?:(?:dün|bugün|yarın|pazartesi|salı|çarşamba|perşembe|cuma|cumartesi|pazar)\s*)?\d{1,2}:\d{2}\s*|^(?:dün|bugün|yarın)\s+',
+        '',
+        content.strip(),
+        flags=re.IGNORECASE
+    ).strip()
+
     prefix = f"{TWEET_EMOJI} {codes_str} | "
     suffix = ""
     if ADD_UNIQ and tweet_id:
@@ -228,8 +210,10 @@ def goto_with_retry(page, url, retries=3) -> bool:
     for i in range(retries):
         try:
             log(f"Sayfa yükleme deneme {i+1}/{retries}")
-            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            page.goto(url, wait_until="networkidle", timeout=45000)
             page.wait_for_selector('a.block[href^="/borsa-haber-akisi/"]', timeout=20000)
+            page.screenshot(path="debug-load.png")
+            log("Screenshot: debug-load.png")
             return True
         except Exception as e:
             log(f"Yükleme hatası: {e}")
@@ -253,43 +237,49 @@ def click_highlights(page):
                 loc.first.click()
                 page.wait_for_timeout(2500)
                 log(">> 'ÖNE ÇIKANLAR' sekmesi aktif!")
+                page.screenshot(path="debug-one-cikanlar.png")
                 return True
         except Exception as e:
-            pass # Sessizce diğer selector'a geç
-    log(">> 'ÖNE ÇIKANLAR' butonu BULUNAMADI (Sorun olmayabilir)")
+            log(f"Selector hatası '{sel}': {e}")
+    log(">> 'ÖNE ÇIKANLAR' butonu BULUNAMADI")
+    page.screenshot(path="debug-one-cikanlar-yok.png")
     return False
 
 def scroll_warmup(page):
     log(">> Scroll warmup başlıyor")
-    page.evaluate("window.scrollTo(0,1000)")
-    page.wait_for_timeout(1000)
+    for y in [0, 300, 600, 900, 1200]:
+        page.evaluate(f"window.scrollTo(0,{y})")
+        page.wait_for_timeout(1200)
+    try:
+        page.wait_for_function("document.querySelectorAll('a.block[href^=\"/borsa-haber-akisi/\"]').length > 10", timeout=15000)
+        log(">> Yeterli haber yüklendi")
+    except:
+        log(">> Scroll timeout")
     page.evaluate("window.scrollTo(0,0)")
+    page.wait_for_timeout(1000)
 
 # ================== ANA AKIŞ ==================
 def main():
     log("Bot başladı")
     state = load_state()
     today = dt.now().strftime("%Y-%m-%d")
-    
-    # Gün değişmişse sayacı sıfırla
     if state.get("day") != today:
         state["count_today"] = 0
         state["day"] = today
 
-    # Cooldown kontrolü
     if state.get("cooldown_until"):
         try:
             cd = dt.fromisoformat(state["cooldown_until"])
             cd = cd.replace(tzinfo=timezone.utc) if cd.tzinfo is None else cd
             if dt.now(timezone.utc) < cd:
-                log("Cooldown (Ceza) süresi dolmadı. Bekleniyor...")
+                log("Cooldown aktif")
                 return
             state["cooldown_until"] = None
         except:
             state["cooldown_until"] = None
 
     if state["count_today"] >= MAX_TODAY:
-        log(f"Günlük tweet limiti ({MAX_TODAY}) doldu.")
+        log(f"Günlük limit aşıldı")
         return
 
     tw = twitter_client()
@@ -309,84 +299,73 @@ def main():
         click_highlights(page)
         scroll_warmup(page)
 
+        item_count = page.evaluate("document.querySelectorAll('a.block[href^=\"/borsa-haber-akisi/\"]').length")
+        log(f"Toplam haber (Öne çıkanlar): {item_count}")
         items = page.evaluate(JS_EXTRACTOR) or []
-        log(f"Bulunan KAP haberi: {len(items)}")
+        log(f"KAP haberleri bulundu: {len(items)}")
 
         if not items:
-            log("Haber bulunamadı.")
+            log("!! KAP haberi yok → debug-one-cikanlar.png kontrol et")
             browser.close()
             return
 
         posted_set = set(state.get("posted", []))
+        newest_id = items[0]["id"]
         to_send = []
         last_id = state.get("last_id")
 
-        # 1. Filtreleme: Gönderilenleri ve last_id öncesini ele
-        # items listesi EN YENİDEN -> EN ESKİYE doğru gelir.
         for it in items:
             if last_id and it["id"] == last_id:
-                break # En son attığımız habere geldik, daha eskiye gitmeye gerek yok.
+                break
             if it["id"] in posted_set:
                 continue
             to_send.append(it)
 
         if not to_send:
-            # Yeni haber yok ama last_id'yi en güncel habere çekelim ki
-            # state dosyası güncel kalsın.
-            state["last_id"] = items[0]["id"]
+            state["last_id"] = newest_id
             save_state(state)
-            log("Yeni haber yok.")
+            log("Yeni haber yok")
             browser.close()
             return
 
-        # 2. SIRALAMA DÜZELTMESİ (KRİTİK HAMLE)
-        # items[0] en yeni haberdir. to_send şu an [YENİ, DAHA YENİ, DAHA YENİ...] diye gidiyor.
-        # Twitter'a atarken zaman akışına uymak için ESKİDEN -> YENİYE doğru atmalıyız.
-        # Ayrıca bu sayede yarıda kesilirse (limit) eski haberler atılmış olur, sonraki turda yeniler atılır.
-        to_send.reverse() 
-        
-        log(f"Kuyrukta bekleyen tweet sayısı: {len(to_send)}")
-
-        sent_count = 0
+        sent = 0
         for it in to_send:
-            if sent_count >= MAX_PER_RUN:
-                log(f"Bu çalışma için limit ({MAX_PER_RUN}) doldu. Kalanlar sonraki tura.")
+            if sent >= MAX_PER_RUN:
                 break
-                
+            if not it.get("codes") or not it.get("content"):
+                continue
+
             tweet = build_tweet(it["codes"], it["content"], it["id"])
-            log(f"Sıradaki Tweet: {tweet}")
-            
+            log(f"Tweeting: {tweet}")
             try:
                 ok = send_tweet(tw, tweet)
                 if ok:
                     posted_set.add(it["id"])
-                    state["posted"] = sorted(list(posted_set))[-5000:] # Liste çok şişmesin
+                    state["posted"] = sorted(list(posted_set))
                     state["count_today"] += 1
-                    
-                    # KRİTİK: Her başarılı tweette last_id'yi güncelle.
-                    # Böylece script şimdi patlasa bile bu haber "atıldı" sayılacak ve next run'da bunun üstündekileri alacak.
-                    state["last_id"] = it["id"] 
                     save_state(state)
-                    
-                    sent_count += 1
-                    if tw and sent_count < MAX_PER_RUN:
-                        time.sleep(5) # İki tweet arası biraz nefes al
-                        
+                    sent += 1
+                    if tw and sent < MAX_PER_RUN:
+                        time.sleep(3)
             except RuntimeError as e:
                 if str(e) == "RATE_LIMIT":
+                    log("Rate limit → cooldown, başarısız tweet kaydedilmedi")
                     state["cooldown_until"] = (dt.now(timezone.utc) + timedelta(minutes=COOLDOWN_MIN)).isoformat()
                     save_state(state)
-                    log("Limit nedeniyle durduruldu. State kaydedildi.")
                     break
 
+        if sent > 0:
+            state["last_id"] = newest_id
+            save_state(state)
+
         browser.close()
-        log(f"Tamamlandı. Gönderilen: {sent_count}")
+        log(f"Bitti. Gönderilen: {sent}")
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
         import traceback
-        log("!! FATAL ERROR !!")
+        log("!! FATAL !!")
         log(str(e))
         log(traceback.format_exc())
