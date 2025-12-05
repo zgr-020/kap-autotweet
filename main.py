@@ -19,9 +19,9 @@ import tweepy
 # ================== AYARLAR ==================
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
 STATE_PATH = Path("state.json")
-MAX_PER_RUN = 10     # Her seferde en fazla 5 tweet
-MAX_TODAY = 150     # Günlük toplam limit
-COOLDOWN_MIN = 15   # Ceza yerse bekleme süresi
+MAX_PER_RUN = 10     # Her çalışmada en fazla kaç tweet
+MAX_TODAY = 150     # Günlük limit
+COOLDOWN_MIN = 15   # Ceza bekleme süresi
 
 # ================== SECRETS ==================
 API_KEY = os.getenv("API_KEY")
@@ -107,60 +107,84 @@ def send_tweet(client, text: str) -> bool:
             
         return False
 
-# ================== EXTRACTOR ==================
+# ================== EXTRACTOR (RAKAM DOSTU VERSİYON) ==================
 JS_EXTRACTOR = r"""
 () => {
   const out = [];
-  // Sayfayı yukarıdan aşağıya (YENİDEN ESKİYE) tarıyoruz
+  // Sayfayı yukarıdan aşağıya (YENİDEN -> ESKİYE) tarıyoruz
   const nodes = Array.from(document.querySelectorAll('a.block[href^="/borsa-haber-akisi/"]')).slice(0, 60);
   
+  // Yasaklı kelimeler
+  const banList = ["KAP", "DUN", "BUGUN", "YARIN", "SAAT", "DÜN", "BUGÜN", "TL", "LOT", "USD", "EURO"];
+
   for (const a of nodes) {
-    let rawText = (a.innerText || a.textContent || "").trim();
+    // innerText yerine textContent kullanıyoruz ki gizli formatlar karışmasın
+    // Ama HTML entity'leri temizlemek için basit bir replace yapıyoruz
+    let rawText = (a.textContent || "").replace(/\s+/g, " ").trim();
 
-    // Satırlara böl
-    let lines = rawText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-
-    // KAP satırını bul
-    let headerIndex = lines.findIndex(line => /KAP\s*[:•·\-]/.test(line));
-    if (headerIndex === -1) continue;
-
-    // --- 1. BAŞLIK VE KODLAR ---
-    let headerLine = lines[headerIndex];
-    let codePart = headerLine.replace(/^.*?KAP\s*[:•·\-]/i, "").trim();
+    // 1. KAP AYRACINI BUL
+    // Metni "KAP •" veya "KAP -" sonrasından itibaren al
+    let splitIndex = rawText.search(/KAP\s*[:•·\-]/i);
+    if (splitIndex === -1) continue;
     
-    // Sağdaki saati/tarihi sil
-    codePart = codePart.replace(/(\d{1,2}[:\.]\d{2}|Dün|Bugün|Yarın).*$/i, "").trim();
+    // "KAP •" öncesini at, temiz kısmı al
+    // Örn: "KAP • RAYSG 12.50 TL..." -> " RAYSG 12.50 TL..."
+    let afterKap = rawText.substring(splitIndex).replace(/^KAP\s*[:•·\-]/i, "").trim();
 
-    let tokens = codePart.split(/\s+/);
+    // 2. KELİME KELİME AYRIŞTIR (TOKENIZER)
+    let tokens = afterKap.split(" ");
     let codes = [];
+    let contentStartIndex = 0;
 
-    for (let t of tokens) {
-        t = t.replace(/[^a-zA-Z]/g, "").trim(); 
-        let upperT = t.toUpperCase();
+    for (let i = 0; i < tokens.length; i++) {
+        let t = tokens[i];
+        let upperT = t.toUpperCase().replace(/[^A-ZÇĞİÖŞÜ0-9]/g, ""); // Sadece harf/rakam karşılaştırma için
+
+        // HİSSE KODU MU?
+        // - Uzunluk 3-6
+        // - Sadece HARF (Rakam yok! RAYSG0702 elenir)
+        // - Yasaklı listede değil
+        // - Kelimenin kendisi tamamen büyük harf
         
-        const banList = ["KAP", "DUN", "BUGUN", "YARIN", "SAAT", "DÜN", "BUGÜN"];
-        // Kod filtresi: Rakam içermesin, 3-6 karakter olsun
-        if (t.length >= 3 && t.length <= 6 && t === upperT && !banList.includes(upperT)) {
+        const isAllLetters = /^[A-ZÇĞİÖŞÜ]+$/.test(upperT);
+        const isLengthOk = upperT.length >= 3 && upperT.length <= 6;
+        const notBanned = !banList.includes(upperT);
+        
+        // Ekstra kontrol: Kelime orijinalinde de büyük harf mi? (USD vs usd)
+        const isOriginalUpper = (t === t.toUpperCase());
+
+        if (isAllLetters && isLengthOk && notBanned && isOriginalUpper) {
             codes.push(upperT);
+        } else {
+            // Kod olmayan ilk şeye çarptık (Rakam, Tarih, Küçük harfli kelime vs.)
+            // İÇERİK BURADA BAŞLIYOR
+            contentStartIndex = i;
+            break; 
         }
     }
 
     if (codes.length === 0) continue;
 
-    // --- 2. İÇERİK ---
-    let content = lines.slice(headerIndex + 1).join(" ");
-    if (content.length < 5) {
-        content = headerLine.replace(/^.*?KAP\s*[:•·\-]/i, "").replace(codePart, "").trim();
+    // 3. İÇERİĞİ OLUŞTUR
+    // Kodlardan sonraki her şeyi birleştir.
+    let content = tokens.slice(contentStartIndex).join(" ");
+
+    // 4. HASSAS TEMİZLİK (SADECE BAŞLANGIÇTAKİ ÇÖPLERİ SİL)
+    // Cümlenin ortasındaki 12.50'ye dokunma! Sadece baştaki "Dün 18:30" veya "18:31" gibi şeyleri sil.
+    
+    // Döngü ile baştaki zaman kalıntılarını temizle
+    let oldContent = "";
+    while (content !== oldContent) {
+        oldContent = content;
+        content = content
+            .replace(/^\s*(?:Dün|Bugün|Yarın|Pazartesi|Salı|Çarşamba|Perşembe|Cuma|Cumartesi|Pazar)\b/i, "") // Baştaki gün isimlerini sil
+            .replace(/^\s*\d{1,2}[:\.]\d{2}\b/, "") // Baştaki saati sil (Sadece baştaysa!)
+            .replace(/^\s*(?:ün|ugün|arın)\b/i, "") // Kesik kelimeleri sil
+            .replace(/^[^\wÇĞİÖŞÜçğıöşü\d]+/, "")   // Baştaki noktalama işaretlerini (- . ,) sil
+            .trim();
     }
-
-    // Temizlik
-    content = content
-        .replace(/(\d{1,2}[:\.]\d{2}|Dün|Bugün|Yarın)/gi, "")
-        .replace(/^(?:ün|ugün|arın)\s*/i, "") 
-        .replace(/^[^\wÇĞİÖŞÜçğıöşü]+/, "")   
-        .trim();
-
-    if (content.length < 10) continue;
+    
+    if (content.length < 5) continue;
 
     // ID OLUŞTURMA
     let hash = 0;
@@ -186,8 +210,14 @@ ADD_UNIQ = False
 
 def build_tweet(codes, content, tweet_id="") -> str:
     codes_str = " ".join(f"#{c}" for c in codes)
+    
+    # Python tarafında da SADECE BAŞLANGIÇ temizliği yapıyoruz
     text = content.strip()
     
+    # Sadece tweetin en başındaki zaman ibarelerini temizle, ortadakilere dokunma
+    text = re.sub(r'^(?:Dün|Bugün|Yarın)\s*', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'^\d{1,2}[:\.]\d{2}\s*', '', text) # Baştaki saat
+
     prefix = f"{TWEET_EMOJI} {codes_str} | "
     suffix = ""
     if ADD_UNIQ and tweet_id:
@@ -302,16 +332,15 @@ def main():
         to_send = []
         last_id = state.get("last_id")
 
-        # 1. Filtreleme: YENİ -> ESKİ (Site sırası)
+        # Filtreleme: YENİ -> ESKİ (Site sırası)
+        # last_id görene kadar topla.
         for it in items:
-            # last_id (En son atılan) görüldüğü an DUR.
-            # Çünkü ondan sonrakiler daha eskidir.
             if last_id and it["id"] == last_id:
                 break 
             
             if it["id"] in posted_set:
                 continue
-                
+            
             to_send.append(it)
 
         if not to_send:
@@ -322,16 +351,15 @@ def main():
             browser.close()
             return
 
-        # DÜZELTME: BURADAKİ REVERSE() SİLİNDİ! ❌
-        # Artık liste [En Yeni, Yeni, Orta...] şeklinde kaldı.
-        # Böylece ilk döngüde EN TEPEDEKİ HABER (En Yeni) atılacak.
+        # DİKKAT: Reverse YOK! 
+        # En yeni haberi (listenin başı) önce atacağız.
         
         log(f"Kuyrukta bekleyen tweet sayısı: {len(to_send)}")
 
         sent = 0
         for it in to_send:
             if sent >= MAX_PER_RUN:
-                log(f"Limit ({MAX_PER_RUN}) doldu. Devamı sonra.")
+                log(f"Limit ({MAX_PER_RUN}) doldu.")
                 break
 
             tweet = build_tweet(it["codes"], it["content"], it["id"])
@@ -344,7 +372,7 @@ def main():
                     state["posted"] = sorted(list(posted_set))[-5000:]
                     state["count_today"] += 1
                     
-                    # Başarılı atılan her tweeti "Son Atılan" olarak kaydet
+                    # Her başarılı işlemde last_id güncelle
                     state["last_id"] = it["id"]
                     save_state(state)
                     
