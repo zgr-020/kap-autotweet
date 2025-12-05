@@ -3,6 +3,7 @@ import re
 import json
 import time
 import logging
+from logging.handlers import RotatingFileHandler  # <--- YENİ: Log yönetimi için eklendi
 from pathlib import Path
 from datetime import datetime as dt, timezone, timedelta
 
@@ -28,12 +29,20 @@ API_KEY_SECRET = os.getenv("API_KEY_SECRET")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 ACCESS_TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET")
 
-# ================== LOG ==================
+# ================== LOG AYARLARI (GÜNCELLENDİ) ==================
+# Dosya 2 MB'a ulaşınca yenisi açılır, en fazla 1 yedek tutulur.
+log_handler = RotatingFileHandler(
+    "bot.log", 
+    maxBytes=2*1024*1024,  # 2 MB limit
+    backupCount=1,         # Sadece 1 eski dosya tut
+    encoding="utf-8"
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(message)s",
     datefmt="%H:%M:%S",
-    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()]
+    handlers=[log_handler, logging.StreamHandler()]
 )
 log = logging.getLogger().info
 
@@ -98,7 +107,8 @@ def send_tweet(client, text: str) -> bool:
         log(f"Tweet hatası: {e}")
         return False
 
-# ================== EXTRACTOR ==================
+# ================== EXTRACTOR (GÜNCELLENDİ) ==================
+# Zaman bağımsız ID ve Çoklu Kod desteği eklendi
 JS_EXTRACTOR = r"""
 () => {
   const out = [];
