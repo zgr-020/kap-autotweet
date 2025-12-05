@@ -19,7 +19,7 @@ import tweepy
 # ================== AYARLAR ==================
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
 STATE_PATH = Path("state.json")
-MAX_PER_RUN = 5     # Her seferde en fazla 5 tweet
+MAX_PER_RUN = 10     # Her seferde en fazla 5 tweet
 MAX_TODAY = 150     # Günlük toplam limit
 COOLDOWN_MIN = 15   # Ceza yerse bekleme süresi
 
