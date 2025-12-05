@@ -3,7 +3,7 @@ import re
 import json
 import time
 import logging
-from logging.handlers import RotatingFileHandler  # <--- YENİ: Log yönetimi için eklendi
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime as dt, timezone, timedelta
 
@@ -29,12 +29,11 @@ API_KEY_SECRET = os.getenv("API_KEY_SECRET")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 ACCESS_TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET")
 
-# ================== LOG AYARLARI (GÜNCELLENDİ) ==================
-# Dosya 2 MB'a ulaşınca yenisi açılır, en fazla 1 yedek tutulur.
+# ================== LOG AYARLARI ==================
 log_handler = RotatingFileHandler(
     "bot.log", 
-    maxBytes=2*1024*1024,  # 2 MB limit
-    backupCount=1,         # Sadece 1 eski dosya tut
+    maxBytes=2*1024*1024,
+    backupCount=1,
     encoding="utf-8"
 )
 
@@ -107,47 +106,72 @@ def send_tweet(client, text: str) -> bool:
         log(f"Tweet hatası: {e}")
         return False
 
-# ================== EXTRACTOR (GÜNCELLENDİ) ==================
-# Zaman bağımsız ID ve Çoklu Kod desteği eklendi
+# ================== EXTRACTOR (GÜNCELLENDİ: Dün Koruması + Regex Temizliği) ==================
 JS_EXTRACTOR = r"""
 () => {
   const out = [];
   const nodes = Array.from(document.querySelectorAll('a.block[href^="/borsa-haber-akisi/"]')).slice(0, 200);
-  const skip = /(Fintables|Günlük Bülten|Analist|Bülten|Fintables Akış)/i;
+  
+  // Yasaklı kelimeler (Hisse kodu gibi görünen ama aslında zaman/tarih olanlar)
   const banToken = /^(?:OCA|ŞUB|MAR|NIS|MAY|HAZ|TEM|AĞU|EYL|EKI|KAS|ARA|DÜN|BUGÜN|YARIN|SAAT|\d{1,2}:\d{2})$/i;
 
   for (const a of nodes) {
-    const text = a.textContent || "";
+    let text = a.textContent || "";
     const href = (a.href || a.getAttribute('href') || "").split('?')[0];
 
-    // 1. ADIM: "KAP" veya ayraçtan sonraki KODLARI bul
-    // Regex mantığı: KAP • (KODLAR...) Metnin Geri Kalanı
-    const splitMatch = text.match(/KAP\s*[:•·\-]\s*((?:[A-ZÇĞİÖŞÜ0-9]{2,10}(?:\s+|$))+)(.*)/i);
+    // --- ÖNEMLİ DÜZELTME 1: ESKİ HABERLERİ (DÜN) ENGELLE ---
+    // Eğer satırda "Dün" kelimesi geçiyorsa bu eski haberdir.
+    // Bot bunu görmezden gelsin ve sıradaki habere geçsin.
+    if (/\bDün\b/i.test(text)) continue;
+
+    // --- ÖNEMLİ DÜZELTME 2: METNİ TEMİZLE (KODLARI KORU) ---
+    // "ESCARDün" veya "ESCARDÜN" hatasını engellemek için,
+    // Regex çalıştırmadan ÖNCE, metnin içindeki/sonundaki zaman ifadelerini siliyoruz.
+    // Böylece regex sadece "KAP • ESCAR" kısmını görüyor.
+    
+    // Geçici temiz metin oluştur (Sadece kodları bulmak için kullanılacak)
+    let textForCodeParams = text
+        .replace(/(?:Bugün|Yarın|Pazartesi|Salı|Çarşamba|Perşembe|Cuma|Cumartesi|Pazar)\s*\d{1,2}:\d{2}.*/gi, "") // "Bugün 18:31" vb. sil
+        .replace(/\d{1,2}:\d{2}.*/g, "") // Sadece saat varsa sil
+        .trim();
+
+    // 1. ADIM: Kodları temizlenmiş metinden ara
+    const splitMatch = textForCodeParams.match(/KAP\s*[:•·\-]\s*((?:[A-ZÇĞİÖŞÜ0-9]{2,10}(?:\s+|$))+)(.*)/i);
     
     if (!splitMatch) continue;
 
-    // Kodları ayrıştır ve temizle
+    // Kodları ayrıştır
     let rawCodes = splitMatch[1].split(/\s+/);
     let codes = rawCodes
         .map(x => x.toUpperCase().trim())
-        .filter(x => x.length > 1 && !banToken.test(x)); // Zaman ifadeleri kod gibi görünürse ele
+        .filter(x => x.length > 1 && !banToken.test(x)); 
 
     if (codes.length === 0) continue;
 
-    // 2. ADIM: İçeriği temizle (Zaman ifadelerini metinden de sök)
-    let content = (splitMatch[2] || "").trim();
+    // 2. ADIM: İçeriği orijinal metinden al ama temizle
+    // (Regex'in 2. grubu bazen bozulabilir diye tekrar text üzerinden temizliyoruz)
+    // "KAP • KODLAR" kısmını at, gerisini al.
+    let content = text.replace(/^.*?KAP\s*[:•·\-]\s*.*?(?=\s[A-ZÇĞİÖŞÜa-z0-9])/i, ""); 
     
-    // Başındaki "+2" gibi sayaçları veya kalan zamanları temizle
-    content = content.replace(/^(\+\d+\s*)?/, "").trim();
-    
-    if (content.length < 10 || skip.test(content)) continue;
+    // Eğer yukarıdaki regex tutmazsa (fallback), splitMatch'in kalanını kullan
+    if (content.length > text.length * 0.9) { 
+        content = (splitMatch[2] || "").trim();
+    }
 
-    // İçerik temizliği (Gereksiz karakterler)
+    // İçerikteki zamanları temizle (+2, Bugün, Saat vb.)
+    content = content
+        .replace(/^(?:[A-ZÇĞİÖŞÜ0-9]{2,10}\s*)+/, "") // Kalan kod parçalarını sil
+        .replace(/^(\+\d+\s*)?/, "")
+        .replace(/(?:Bugün|Yarın|Pazartesi|Salı|Çarşamba|Perşembe|Cuma|Cumartesi|Pazar)\s*\d{1,2}:\d{2}.*/gi, "")
+        .replace(/\d{1,2}:\d{2}.*/g, "")
+        .trim();
+    
+    // Başlangıçtaki noktalama işaretlerini temizle
     content = content.replace(/^[^\wÇĞİÖŞÜçğıöşü]+/u, '').replace(/\s+/g, ' ').trim();
 
-    // 3. ADIM: ID OLUŞTURMA (ARTIK ZAMAN BAĞIMSIZ!)
-    // ID'yi sadece "Kodlar" + "Saf İçerik" birleşiminden oluşturuyoruz.
-    // Böylece site saati "Bugün"den "Dün"e çevirse bile bu ID değişmez.
+    if (content.length < 10) continue;
+
+    // 3. ADIM: ID OLUŞTURMA
     let hash = 0;
     const base = codes.join('') + content; 
     
@@ -173,8 +197,7 @@ ADD_UNIQ = False
 def build_tweet(codes, content, tweet_id="") -> str:
     codes_str = " ".join(f"#{c}" for c in codes)
     
-    # 👇 GÜNCELLENDİ: "ün 18:31" gibi artıklar kalmaması için regex güçlendirildi.
-    # Cümle başındaki zaman ifadelerini, "Dün", "Bugün" ve saatleri temizler.
+    # Python tarafında da son bir temizlik
     text = re.sub(
         r'^(?:(?:dün|bugün|yarın|pazartesi|salı|çarşamba|perşembe|cuma|cumartesi|pazar)\s*)?(\d{1,2}:\d{2})?\s*',
         '',
@@ -182,7 +205,6 @@ def build_tweet(codes, content, tweet_id="") -> str:
         flags=re.IGNORECASE
     ).strip()
     
-    # Ekstra temizlik: Eğer hala metin sayı veya noktalama ile başlıyorsa temizle
     text = re.sub(r'^[^\wÇĞİÖŞÜçğıöşü]+', '', text).strip()
 
     prefix = f"{TWEET_EMOJI} {codes_str} | "
