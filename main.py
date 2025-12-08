@@ -107,57 +107,43 @@ def send_tweet(client, text: str) -> bool:
             
         return False
 
-# ================== EXTRACTOR (RAKAM DOSTU VERSİYON) ==================
+# ================== EXTRACTOR (GÜNCELLENDİ: DAHA GENİŞ SEÇİCİ) ==================
 JS_EXTRACTOR = r"""
 () => {
   const out = [];
-  // Sayfayı yukarıdan aşağıya (YENİDEN -> ESKİYE) tarıyoruz
-  const nodes = Array.from(document.querySelectorAll('a.block[href^="/borsa-haber-akisi/"]')).slice(0, 60);
+  // GÜNCELLEME: 'a.block' yerine sadece 'a' kullanarak "block" class zorunluluğunu kaldırdık.
+  // Sadece href linkine bakıyoruz. Bu daha güvenli.
+  const nodes = Array.from(document.querySelectorAll('a[href^="/borsa-haber-akisi/"]')).slice(0, 60);
   
   // Yasaklı kelimeler
   const banList = ["KAP", "DUN", "BUGUN", "YARIN", "SAAT", "DÜN", "BUGÜN", "TL", "LOT", "USD", "EURO"];
 
   for (const a of nodes) {
-    // innerText yerine textContent kullanıyoruz ki gizli formatlar karışmasın
-    // Ama HTML entity'leri temizlemek için basit bir replace yapıyoruz
     let rawText = (a.textContent || "").replace(/\s+/g, " ").trim();
 
     // 1. KAP AYRACINI BUL
-    // Metni "KAP •" veya "KAP -" sonrasından itibaren al
     let splitIndex = rawText.search(/KAP\s*[:•·\-]/i);
     if (splitIndex === -1) continue;
     
-    // "KAP •" öncesini at, temiz kısmı al
-    // Örn: "KAP • RAYSG 12.50 TL..." -> " RAYSG 12.50 TL..."
     let afterKap = rawText.substring(splitIndex).replace(/^KAP\s*[:•·\-]/i, "").trim();
 
-    // 2. KELİME KELİME AYRIŞTIR (TOKENIZER)
+    // 2. KELİME KELİME AYRIŞTIR
     let tokens = afterKap.split(" ");
     let codes = [];
     let contentStartIndex = 0;
 
     for (let i = 0; i < tokens.length; i++) {
         let t = tokens[i];
-        let upperT = t.toUpperCase().replace(/[^A-ZÇĞİÖŞÜ0-9]/g, ""); // Sadece harf/rakam karşılaştırma için
+        let upperT = t.toUpperCase().replace(/[^A-ZÇĞİÖŞÜ0-9]/g, ""); 
 
-        // HİSSE KODU MU?
-        // - Uzunluk 3-6
-        // - Sadece HARF (Rakam yok! RAYSG0702 elenir)
-        // - Yasaklı listede değil
-        // - Kelimenin kendisi tamamen büyük harf
-        
         const isAllLetters = /^[A-ZÇĞİÖŞÜ]+$/.test(upperT);
         const isLengthOk = upperT.length >= 3 && upperT.length <= 6;
         const notBanned = !banList.includes(upperT);
-        
-        // Ekstra kontrol: Kelime orijinalinde de büyük harf mi? (USD vs usd)
         const isOriginalUpper = (t === t.toUpperCase());
 
         if (isAllLetters && isLengthOk && notBanned && isOriginalUpper) {
             codes.push(upperT);
         } else {
-            // Kod olmayan ilk şeye çarptık (Rakam, Tarih, Küçük harfli kelime vs.)
-            // İÇERİK BURADA BAŞLIYOR
             contentStartIndex = i;
             break; 
         }
@@ -165,22 +151,18 @@ JS_EXTRACTOR = r"""
 
     if (codes.length === 0) continue;
 
-    // 3. İÇERİĞİ OLUŞTUR
-    // Kodlardan sonraki her şeyi birleştir.
+    // 3. İÇERİK
     let content = tokens.slice(contentStartIndex).join(" ");
 
-    // 4. HASSAS TEMİZLİK (SADECE BAŞLANGIÇTAKİ ÇÖPLERİ SİL)
-    // Cümlenin ortasındaki 12.50'ye dokunma! Sadece baştaki "Dün 18:30" veya "18:31" gibi şeyleri sil.
-    
-    // Döngü ile baştaki zaman kalıntılarını temizle
+    // 4. TEMİZLİK
     let oldContent = "";
     while (content !== oldContent) {
         oldContent = content;
         content = content
-            .replace(/^\s*(?:Dün|Bugün|Yarın|Pazartesi|Salı|Çarşamba|Perşembe|Cuma|Cumartesi|Pazar)\b/i, "") // Baştaki gün isimlerini sil
-            .replace(/^\s*\d{1,2}[:\.]\d{2}\b/, "") // Baştaki saati sil (Sadece baştaysa!)
-            .replace(/^\s*(?:ün|ugün|arın)\b/i, "") // Kesik kelimeleri sil
-            .replace(/^[^\wÇĞİÖŞÜçğıöşü\d]+/, "")   // Baştaki noktalama işaretlerini (- . ,) sil
+            .replace(/^\s*(?:Dün|Bugün|Yarın|Pazartesi|Salı|Çarşamba|Perşembe|Cuma|Cumartesi|Pazar)\b/i, "") 
+            .replace(/^\s*\d{1,2}[:\.]\d{2}\b/, "") 
+            .replace(/^\s*(?:ün|ugün|arın)\b/i, "") 
+            .replace(/^[^\wÇĞİÖŞÜçğıöşü\d]+/, "")   
             .trim();
     }
     
@@ -211,12 +193,9 @@ ADD_UNIQ = False
 def build_tweet(codes, content, tweet_id="") -> str:
     codes_str = " ".join(f"#{c}" for c in codes)
     
-    # Python tarafında da SADECE BAŞLANGIÇ temizliği yapıyoruz
     text = content.strip()
-    
-    # Sadece tweetin en başındaki zaman ibarelerini temizle, ortadakilere dokunma
     text = re.sub(r'^(?:Dün|Bugün|Yarın)\s*', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'^\d{1,2}[:\.]\d{2}\s*', '', text) # Baştaki saat
+    text = re.sub(r'^\d{1,2}[:\.]\d{2}\s*', '', text) 
 
     prefix = f"{TWEET_EMOJI} {codes_str} | "
     suffix = ""
@@ -241,8 +220,13 @@ def goto_with_retry(page, url, retries=3) -> bool:
     for i in range(retries):
         try:
             log(f"Sayfa yükleme deneme {i+1}/{retries}")
+            # domcontentloaded hızlıdır
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_selector('a.block[href^="/borsa-haber-akisi/"]', timeout=20000)
+            
+            # GÜNCELLEME: Burada da 'a.block' yerine sadece 'a' ve href kontrolü yapıyoruz.
+            # Böylece CSS değişse bile link yapısı değişmediği sürece çalışır.
+            page.wait_for_selector('a[href^="/borsa-haber-akisi/"]', timeout=30000)
+            
             return True
         except Exception as e:
             log(f"Yükleme hatası: {e}")
@@ -325,6 +309,8 @@ def main():
 
         if not items:
             log("Haber bulunamadı.")
+            # Debug için screenshot alalım, neden görmediğini anlamak için
+            page.screenshot(path="debug-not-found.png")
             browser.close()
             return
 
@@ -333,7 +319,6 @@ def main():
         last_id = state.get("last_id")
 
         # Filtreleme: YENİ -> ESKİ (Site sırası)
-        # last_id görene kadar topla.
         for it in items:
             if last_id and it["id"] == last_id:
                 break 
@@ -351,9 +336,7 @@ def main():
             browser.close()
             return
 
-        # DİKKAT: Reverse YOK! 
         # En yeni haberi (listenin başı) önce atacağız.
-        
         log(f"Kuyrukta bekleyen tweet sayısı: {len(to_send)}")
 
         sent = 0
@@ -372,7 +355,6 @@ def main():
                     state["posted"] = sorted(list(posted_set))[-5000:]
                     state["count_today"] += 1
                     
-                    # Her başarılı işlemde last_id güncelle
                     state["last_id"] = it["id"]
                     save_state(state)
                     
