@@ -19,9 +19,9 @@ import tweepy
 # ================== AYARLAR ==================
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
 STATE_PATH = Path("state.json")
-MAX_PER_RUN = 10     # Her çalışmada en fazla kaç tweet
-MAX_TODAY = 150     # Günlük limit
-COOLDOWN_MIN = 15   # Ceza bekleme süresi
+MAX_PER_RUN = 10     
+MAX_TODAY = 150      
+COOLDOWN_MIN = 15    
 
 # ================== SECRETS ==================
 API_KEY = os.getenv("API_KEY")
@@ -107,29 +107,41 @@ def send_tweet(client, text: str) -> bool:
             
         return False
 
-# ================== EXTRACTOR ==================
+# ================== EXTRACTOR (ULTRA GENİŞ KAPSAMLI) ==================
 JS_EXTRACTOR = r"""
 () => {
   const out = [];
-  // CSS Selector: Link yapısı değişmediği sürece burası en güvenli yer.
-  const nodes = Array.from(document.querySelectorAll('a[href^="/borsa-haber-akisi/"]')).slice(0, 60);
   
-  const banList = ["KAP", "DUN", "BUGUN", "YARIN", "SAAT", "DÜN", "BUGÜN", "TL", "LOT", "USD", "EURO"];
+  // STRATEJİ DEĞİŞİKLİĞİ:
+  // Sadece belirli href'lere değil, sayfadaki TÜM görünür linklere bakıyoruz.
+  // Sonra içeriği analiz ederek haber olup olmadığına karar veriyoruz.
+  const nodes = Array.from(document.querySelectorAll('a')); 
+  
+  const banList = ["KAP", "DUN", "BUGUN", "YARIN", "SAAT", "DÜN", "BUGÜN", "TL", "LOT", "USD", "EURO", "BIST", "VIOP"];
 
   for (const a of nodes) {
-    let rawText = (a.textContent || "").replace(/\s+/g, " ").trim();
+    // Görünmez elemanları atla
+    if (a.offsetParent === null) continue;
 
+    let rawText = (a.textContent || "").replace(/\s+/g, " ").trim();
+    if (rawText.length < 10) continue; // Çok kısa linkleri atla (Menü vs)
+
+    // 1. KAP AYRACINI BUL (En güçlü sinyal)
     let splitIndex = rawText.search(/KAP\s*[:•·\-]/i);
+    
+    // Eğer 'KAP' kelimesi geçmiyorsa, bu muhtemelen bir haber satırı değildir.
     if (splitIndex === -1) continue;
     
     let afterKap = rawText.substring(splitIndex).replace(/^KAP\s*[:•·\-]/i, "").trim();
 
+    // 2. KELİME KELİME AYRIŞTIR
     let tokens = afterKap.split(" ");
     let codes = [];
     let contentStartIndex = 0;
 
     for (let i = 0; i < tokens.length; i++) {
         let t = tokens[i];
+        // Temizlenmiş büyük harf hali
         let upperT = t.toUpperCase().replace(/[^A-ZÇĞİÖŞÜ0-9]/g, ""); 
 
         const isAllLetters = /^[A-ZÇĞİÖŞÜ]+$/.test(upperT);
@@ -137,18 +149,23 @@ JS_EXTRACTOR = r"""
         const notBanned = !banList.includes(upperT);
         const isOriginalUpper = (t === t.toUpperCase());
 
+        // Hisse kodu kriterleri: Tamamı harf, 3-6 karakter, yasaklı değil, orijinali büyük harf
         if (isAllLetters && isLengthOk && notBanned && isOriginalUpper) {
             codes.push(upperT);
         } else {
+            // Kod olmayan ilk kelimeye geldik, içerik buradan başlıyor
             contentStartIndex = i;
             break; 
         }
     }
 
+    // Hiç hisse kodu bulamadıysak bu satırı geç
     if (codes.length === 0) continue;
 
+    // 3. İÇERİK OLUŞTURMA
     let content = tokens.slice(contentStartIndex).join(" ");
 
+    // 4. TEMİZLİK (Tarih, saat vb. temizle)
     let oldContent = "";
     while (content !== oldContent) {
         oldContent = content;
@@ -162,6 +179,7 @@ JS_EXTRACTOR = r"""
     
     if (content.length < 5) continue;
 
+    // ID OLUŞTURMA
     let hash = 0;
     const base = codes.join('') + content; 
     for (let i = 0; i < base.length; i++) {
@@ -175,7 +193,18 @@ JS_EXTRACTOR = r"""
       raw: rawText
     });
   }
-  return out;
+  
+  // Tekrar edenleri temizle (bazen aynı haber hem mobilde hem masaüstünde görünür)
+  const uniqueOut = [];
+  const seenIds = new Set();
+  for (const item of out) {
+    if (!seenIds.has(item.id)) {
+        seenIds.add(item.id);
+        uniqueOut.push(item);
+    }
+  }
+  
+  return uniqueOut;
 }
 """
 
@@ -213,8 +242,6 @@ def goto_with_retry(page, url, retries=3) -> bool:
         try:
             log(f"Sayfa yükleme deneme {i+1}/{retries}")
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            # Sayfa ilk açıldığında temel linklerin gelmesini bekle
-            page.wait_for_selector('a[href^="/borsa-haber-akisi/"]', timeout=30000)
             return True
         except Exception as e:
             log(f"Yükleme hatası: {e}")
@@ -230,14 +257,14 @@ def click_highlights(page):
         "[role='tab']:has-text('Öne çıkanlar')",
         "div[role='button']:has-text('Öne çıkanlar')"
     ]
-    page.wait_for_timeout(3000) # Sayfa otursun diye bekleme
+    page.wait_for_timeout(3000)
     for sel in selectors:
         try:
             loc = page.locator(sel)
             if loc.count() > 0 and loc.first.is_visible(timeout=5000):
                 loc.first.click()
                 log(">> 'ÖNE ÇIKANLAR' butonuna tıklandı.")
-                page.wait_for_timeout(3000) # Tıklama sonrası veri yüklemesi için kritik bekleme
+                page.wait_for_timeout(3000)
                 log(">> 'ÖNE ÇIKANLAR' sekmesi aktif!")
                 return True
         except Exception as e:
@@ -247,11 +274,8 @@ def click_highlights(page):
 
 def scroll_warmup(page):
     log(">> Scroll warmup başlıyor")
-    # Aşağı kaydır ve biraz bekle (Lazy load tetiklensin)
     page.evaluate("window.scrollTo(0,1000)")
-    page.wait_for_timeout(2000) # 1sn yetmeyebilir, 2sn yaptım
-    
-    # Yukarı çık ve yine bekle (DOM render olsun)
+    page.wait_for_timeout(2000) 
     page.evaluate("window.scrollTo(0,0)")
     page.wait_for_timeout(1000)
 
@@ -282,7 +306,7 @@ def main():
 
     tw = twitter_client()
     with sync_playwright() as pw:
-        # Args eklendi: --disable-blink-features=AutomationControlled bot yakalanmayı zorlaştırır
+        # Bot korumasını aşmak için ek argümanlar
         browser = pw.chromium.launch(
             headless=True, 
             args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-blink-features=AutomationControlled"]
@@ -301,24 +325,24 @@ def main():
         click_highlights(page)
         scroll_warmup(page)
 
-        # -----------------------------------------------------------
-        # KRİTİK DÜZELTME: Verilerin DOM'a yerleşmesini bekle!
-        # Tıkladık, scroll yaptık ama veriler hemen gelmez.
-        # Bu satır haber linklerinin görünür olmasını bekler.
-        # -----------------------------------------------------------
+        # Haberlerin yüklenmesi için güvenli bekleme
         try:
             log(">> Haberlerin ekrana düşmesi bekleniyor...")
-            # En az 3 tane haberin linkinin gelmesini bekleyelim
-            page.wait_for_selector('a[href^="/borsa-haber-akisi/"]', state="visible", timeout=15000)
+            page.wait_for_timeout(4000) # Sabit bekleme, seçiciye güvenmiyoruz
         except Exception:
-            log(">> DIKKAT: Haber elementleri süre dolmasına rağmen görünmedi!")
+            pass
 
         items = page.evaluate(JS_EXTRACTOR) or []
         log(f"Bulunan KAP haberi: {len(items)}")
 
         if not items:
             log("Haber bulunamadı.")
-            # Debug için screenshot alalım
+            # HATA AYIKLAMA: Sayfa kaynağını kaydet
+            content = page.content()
+            with open("debug_html_dump.html", "w", encoding="utf-8") as f:
+                f.write(content)
+            log(">> SAYFA KAYNAĞI 'debug_html_dump.html' OLARAK KAYDEDİLDİ. KONTROL ET!")
+            
             page.screenshot(path="debug-not-found.png")
             browser.close()
             return
@@ -327,7 +351,6 @@ def main():
         to_send = []
         last_id = state.get("last_id")
 
-        # Filtreleme: YENİ -> ESKİ (Site sırası)
         for it in items:
             if last_id and it["id"] == last_id:
                 break 
@@ -345,7 +368,6 @@ def main():
             browser.close()
             return
 
-        # En yeni haberi (listenin başı) önce atacağız.
         log(f"Kuyrukta bekleyen tweet sayısı: {len(to_send)}")
 
         sent = 0
