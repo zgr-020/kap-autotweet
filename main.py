@@ -107,41 +107,47 @@ def send_tweet(client, text: str) -> bool:
             
         return False
 
-# ================== EXTRACTOR (ULTRA GENİŞ KAPSAMLI) ==================
+# ================== EXTRACTOR (HER ŞEYİ TARA MODU) ==================
 JS_EXTRACTOR = r"""
 () => {
   const out = [];
-  
-  // STRATEJİ DEĞİŞİKLİĞİ:
-  // Sadece belirli href'lere değil, sayfadaki TÜM görünür linklere bakıyoruz.
-  // Sonra içeriği analiz ederek haber olup olmadığına karar veriyoruz.
-  const nodes = Array.from(document.querySelectorAll('a')); 
-  
   const banList = ["KAP", "DUN", "BUGUN", "YARIN", "SAAT", "DÜN", "BUGÜN", "TL", "LOT", "USD", "EURO", "BIST", "VIOP"];
 
-  for (const a of nodes) {
-    // Görünmez elemanları atla
-    if (a.offsetParent === null) continue;
+  // YÖNTEM DEĞİŞİKLİĞİ: Link (a) etiketi yerine, sayfadaki tüm 'div' ve 'li' elementlerine bakıyoruz.
+  // İçinde "KAP •" yazısı geçen her şeyi alacağız.
+  
+  // Sayfadaki potansiyel haber satırlarını bul (Genelde div veya li olur)
+  const potentialNodes = document.querySelectorAll('div, li, p, span');
+  const seenTexts = new Set(); // Aynı haberi 50 kere eklememek için
 
-    let rawText = (a.textContent || "").replace(/\s+/g, " ").trim();
-    if (rawText.length < 10) continue; // Çok kısa linkleri atla (Menü vs)
+  for (const node of potentialNodes) {
+    // 1. Sadece doğrudan metin içeren veya kısa metinli bloklara bak
+    // (Çok büyük kapsayıcı divleri alırsak tüm sayfayı alırız, bunu istemiyoruz)
+    if (!node.innerText) continue;
+    
+    // Performans için: Metin çok uzunsa veya çok kısaysa atla
+    let rawText = node.innerText.replace(/\s+/g, " ").trim();
+    if (rawText.length < 15 || rawText.length > 500) continue;
 
-    // 1. KAP AYRACINI BUL (En güçlü sinyal)
+    // 2. KAP SİNYALİ ARA
+    // Regex: KAP kelimesi, ardından boşluk olabilir, sonra nokta, tire veya orta nokta
     let splitIndex = rawText.search(/KAP\s*[:•·\-]/i);
     
-    // Eğer 'KAP' kelimesi geçmiyorsa, bu muhtemelen bir haber satırı değildir.
     if (splitIndex === -1) continue;
     
+    // Eğer bu metni daha önce işlediysek atla (İç içe divlerden dolayı aynı yazı 3 kere gelebilir)
+    if (seenTexts.has(rawText)) continue;
+    seenTexts.add(rawText);
+
+    // --- BURADAN SONRASI AYNI AYRIŞTIRMA MANTIĞI ---
     let afterKap = rawText.substring(splitIndex).replace(/^KAP\s*[:•·\-]/i, "").trim();
 
-    // 2. KELİME KELİME AYRIŞTIR
     let tokens = afterKap.split(" ");
     let codes = [];
     let contentStartIndex = 0;
 
     for (let i = 0; i < tokens.length; i++) {
         let t = tokens[i];
-        // Temizlenmiş büyük harf hali
         let upperT = t.toUpperCase().replace(/[^A-ZÇĞİÖŞÜ0-9]/g, ""); 
 
         const isAllLetters = /^[A-ZÇĞİÖŞÜ]+$/.test(upperT);
@@ -149,23 +155,18 @@ JS_EXTRACTOR = r"""
         const notBanned = !banList.includes(upperT);
         const isOriginalUpper = (t === t.toUpperCase());
 
-        // Hisse kodu kriterleri: Tamamı harf, 3-6 karakter, yasaklı değil, orijinali büyük harf
         if (isAllLetters && isLengthOk && notBanned && isOriginalUpper) {
             codes.push(upperT);
         } else {
-            // Kod olmayan ilk kelimeye geldik, içerik buradan başlıyor
             contentStartIndex = i;
             break; 
         }
     }
 
-    // Hiç hisse kodu bulamadıysak bu satırı geç
     if (codes.length === 0) continue;
 
-    // 3. İÇERİK OLUŞTURMA
     let content = tokens.slice(contentStartIndex).join(" ");
 
-    // 4. TEMİZLİK (Tarih, saat vb. temizle)
     let oldContent = "";
     while (content !== oldContent) {
         oldContent = content;
@@ -179,7 +180,6 @@ JS_EXTRACTOR = r"""
     
     if (content.length < 5) continue;
 
-    // ID OLUŞTURMA
     let hash = 0;
     const base = codes.join('') + content; 
     for (let i = 0; i < base.length; i++) {
@@ -194,17 +194,7 @@ JS_EXTRACTOR = r"""
     });
   }
   
-  // Tekrar edenleri temizle (bazen aynı haber hem mobilde hem masaüstünde görünür)
-  const uniqueOut = [];
-  const seenIds = new Set();
-  for (const item of out) {
-    if (!seenIds.has(item.id)) {
-        seenIds.add(item.id);
-        uniqueOut.push(item);
-    }
-  }
-  
-  return uniqueOut;
+  return out;
 }
 """
 
@@ -328,7 +318,7 @@ def main():
         # Haberlerin yüklenmesi için güvenli bekleme
         try:
             log(">> Haberlerin ekrana düşmesi bekleniyor...")
-            page.wait_for_timeout(4000) # Sabit bekleme, seçiciye güvenmiyoruz
+            page.wait_for_timeout(5000) # Sabit bekleme, garanti olsun
         except Exception:
             pass
 
@@ -337,11 +327,16 @@ def main():
 
         if not items:
             log("Haber bulunamadı.")
-            # HATA AYIKLAMA: Sayfa kaynağını kaydet
+            # HTML DUMP (Kesin kaydetmesi için full path veriyoruz)
+            cwd = os.getcwd()
+            dump_path = os.path.join(cwd, "debug_html_dump.html")
+            
             content = page.content()
-            with open("debug_html_dump.html", "w", encoding="utf-8") as f:
+            with open(dump_path, "w", encoding="utf-8") as f:
                 f.write(content)
-            log(">> SAYFA KAYNAĞI 'debug_html_dump.html' OLARAK KAYDEDİLDİ. KONTROL ET!")
+            
+            log(f">> SAYFA HTML KAYDEDİLDİ: {dump_path}")
+            log("Lütfen bu dosyayı kontrol et.")
             
             page.screenshot(path="debug-not-found.png")
             browser.close()
