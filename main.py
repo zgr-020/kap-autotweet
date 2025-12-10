@@ -113,35 +113,24 @@ JS_EXTRACTOR = r"""
   const out = [];
   const banList = ["KAP", "DUN", "BUGUN", "YARIN", "SAAT", "DÜN", "BUGÜN", "TL", "LOT", "USD", "EURO", "BIST", "VIOP"];
 
-  // YÖNTEM DEĞİŞİKLİĞİ: Link (a) etiketi yerine, sayfadaki tüm 'div' ve 'li' elementlerine bakıyoruz.
-  // İçinde "KAP •" yazısı geçen her şeyi alacağız.
-  
-  // Sayfadaki potansiyel haber satırlarını bul (Genelde div veya li olur)
+  // Sayfadaki potansiyel haber satırlarını bul
   const potentialNodes = document.querySelectorAll('div, li, p, span');
-  const seenTexts = new Set(); // Aynı haberi 50 kere eklememek için
+  const seenTexts = new Set(); 
 
   for (const node of potentialNodes) {
-    // 1. Sadece doğrudan metin içeren veya kısa metinli bloklara bak
-    // (Çok büyük kapsayıcı divleri alırsak tüm sayfayı alırız, bunu istemiyoruz)
     if (!node.innerText) continue;
     
-    // Performans için: Metin çok uzunsa veya çok kısaysa atla
     let rawText = node.innerText.replace(/\s+/g, " ").trim();
     if (rawText.length < 15 || rawText.length > 500) continue;
 
-    // 2. KAP SİNYALİ ARA
-    // Regex: KAP kelimesi, ardından boşluk olabilir, sonra nokta, tire veya orta nokta
+    // KAP SİNYALİ ARA
     let splitIndex = rawText.search(/KAP\s*[:•·\-]/i);
-    
     if (splitIndex === -1) continue;
     
-    // Eğer bu metni daha önce işlediysek atla (İç içe divlerden dolayı aynı yazı 3 kere gelebilir)
     if (seenTexts.has(rawText)) continue;
     seenTexts.add(rawText);
 
-    // --- BURADAN SONRASI AYNI AYRIŞTIRMA MANTIĞI ---
     let afterKap = rawText.substring(splitIndex).replace(/^KAP\s*[:•·\-]/i, "").trim();
-
     let tokens = afterKap.split(" ");
     let codes = [];
     let contentStartIndex = 0;
@@ -166,7 +155,6 @@ JS_EXTRACTOR = r"""
     if (codes.length === 0) continue;
 
     let content = tokens.slice(contentStartIndex).join(" ");
-
     let oldContent = "";
     while (content !== oldContent) {
         oldContent = content;
@@ -193,7 +181,6 @@ JS_EXTRACTOR = r"""
       raw: rawText
     });
   }
-  
   return out;
 }
 """
@@ -259,7 +246,9 @@ def click_highlights(page):
                 return True
         except Exception as e:
             pass 
-    log(">> 'ÖNE ÇIKANLAR' butonu BULUNAMADI, varsayılan akış okunacak.")
+    
+    # EĞER BURAYA GELDİYSE BUTONU BULAMADI DEMEKTİR
+    log(">> 'ÖNE ÇIKANLAR' butonu BULUNAMADI! İşlem iptal ediliyor.")
     return False
 
 def scroll_warmup(page):
@@ -296,7 +285,6 @@ def main():
 
     tw = twitter_client()
     with sync_playwright() as pw:
-        # Bot korumasını aşmak için ek argümanlar
         browser = pw.chromium.launch(
             headless=True, 
             args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-blink-features=AutomationControlled"]
@@ -312,13 +300,17 @@ def main():
             browser.close()
             return
 
-        click_highlights(page)
+        # EĞER BUTON BULUNAMAZSA FALSE DÖNECEK VE BURADA ÇIKACAĞIZ
+        if not click_highlights(page):
+            log("🛑 Önemli haber filtresi açılamadı. Hatalı işlem yapmamak için durduruluyor.")
+            browser.close()
+            return
+
         scroll_warmup(page)
 
-        # Haberlerin yüklenmesi için güvenli bekleme
         try:
             log(">> Haberlerin ekrana düşmesi bekleniyor...")
-            page.wait_for_timeout(5000) # Sabit bekleme, garanti olsun
+            page.wait_for_timeout(5000) 
         except Exception:
             pass
 
@@ -327,17 +319,6 @@ def main():
 
         if not items:
             log("Haber bulunamadı.")
-            # HTML DUMP (Kesin kaydetmesi için full path veriyoruz)
-            cwd = os.getcwd()
-            dump_path = os.path.join(cwd, "debug_html_dump.html")
-            
-            content = page.content()
-            with open(dump_path, "w", encoding="utf-8") as f:
-                f.write(content)
-            
-            log(f">> SAYFA HTML KAYDEDİLDİ: {dump_path}")
-            log("Lütfen bu dosyayı kontrol et.")
-            
             page.screenshot(path="debug-not-found.png")
             browser.close()
             return
