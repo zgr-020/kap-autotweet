@@ -1,3 +1,5 @@
+$ cat /home/user/kap-autotweet/main.py
+
 import os
 import re
 import json
@@ -19,9 +21,10 @@ import tweepy
 # ================== AYARLAR ==================
 AKIS_URL = "https://fintables.com/borsa-haber-akisi"
 STATE_PATH = Path("state.json")
-MAX_PER_RUN = 5     
-MAX_TODAY = 150      
-COOLDOWN_MIN = 15    
+MAX_PER_RUN = 5
+MAX_TODAY = 50
+COOLDOWN_MIN = 15
+SCORE_MIN = 3
 
 # ================== SECRETS ==================
 API_KEY = os.getenv("API_KEY")
@@ -159,10 +162,11 @@ JS_EXTRACTOR = r"""
     while (content !== oldContent) {
         oldContent = content;
         content = content
-            .replace(/^\s*(?:Dün|Bugün|Yarın|Pazartesi|Salı|Çarşamba|Perşembe|Cuma|Cumartesi|Pazar)\b/i, "") 
-            .replace(/^\s*\d{1,2}[:\.]\d{2}\b/, "") 
-            .replace(/^\s*(?:ün|ugün|arın)\b/i, "") 
-            .replace(/^[^\wÇĞİÖŞÜçğıöşü\d]+/, "")    
+            .replace(/^\s*(?:Dün|Bugün|Yarın|Pazartesi|Salı|Çarşamba|Perşembe|Cuma|Cumartesi|Pazar)\b/i, "")
+            .replace(/^\s*\d{1,2}[:\.]\d{2}\b/, "")
+            .replace(/^\s*\d{1,2}\s+(?:Ocak|Şubat|Mart|Nisan|Mayıs|Haziran|Temmuz|Ağustos|Eylül|Ekim|Kasım|Aralık)(?:\s+\d{4})?\b/i, "")
+            .replace(/^\s*(?:ün|ugün|arın)\b/i, "")
+            .replace(/^[^\wÇĞİÖŞÜçğıöşü\d]+/, "")
             .trim();
     }
     
@@ -188,12 +192,40 @@ JS_EXTRACTOR = r"""
 TWEET_EMOJI = "📣"
 ADD_UNIQ = False
 
-def build_tweet(codes, content, tweet_id="") -> str:
+# ================== ÖNEM SKORU ==================
+_HIGH = [
+    "temettü", "kar payı", "kâr payı",
+    "sermaye artırım", "bedelsiz", "rüçhan",
+    "birleşme", "satın alma", "devralma", "ortaklık",
+    "sözleşme", "ihale", "anlaşma",
+    "finansal sonuç", "bilanço", "kâr açıkladı", "zarar açıkladı",
+    "halka arz", "geri alım", "pay geri",
+    "yönetim kurulu", "genel müdür", "ceo",
+]
+_LOW = [
+    "faaliyet raporu", "iç kontrol", "bağımsız denetim",
+    "genel kurul toplantı", "bildirim yükümlülüğ",
+    "özel durum açıklaması güncellem",
+]
+
+def score_item(content: str) -> int:
+    text = content.lower()
+    score = 1
+    for kw in _HIGH:
+        if kw in text:
+            score += 2
+    for kw in _LOW:
+        if kw in text:
+            score -= 1
+    return max(score, 0)
+
+def build_tweet(codes, content, tweet_id=""):
     codes_str = " ".join(f"#{c}" for c in codes)
-    
+
     text = content.strip()
     text = re.sub(r'^(?:Dün|Bugün|Yarın)\s*', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'^\d{1,2}[:\.]\d{2}\s*', '', text) 
+    text = re.sub(r'^\d{1,2}[:\.]\d{2}\s*', '', text)
+    text = re.sub(r'^\d{1,2}\s+(?:Ocak|Şubat|Mart|Nisan|Mayıs|Haziran|Temmuz|Ağustos|Eylül|Ekim|Kasım|Aralık)(?:\s+\d{4})?\s*', '', text, flags=re.IGNORECASE)
 
     prefix = f"{TWEET_EMOJI} {codes_str} | "
     suffix = ""
@@ -203,15 +235,9 @@ def build_tweet(codes, content, tweet_id="") -> str:
 
     max_len = 279 - len(prefix) - len(suffix)
     if len(text) > max_len:
-        cut = text[:max_len]
-        dot = cut.rfind(".")
-        if dot >= 0 and dot >= max_len - 120:
-            cut = cut[:dot + 1]
-        else:
-            cut = cut.rsplit(" ", 1)[0] if " " in cut else cut
-        text = cut.rstrip() + "..."
+        return None
 
-    return (prefix + text + suffix)[:279]
+    return prefix + text + suffix
 
 # ================== SAYFA İŞLEMLERİ ==================
 def goto_with_retry(page, url, retries=3) -> bool:
@@ -352,8 +378,22 @@ def main():
                 log(f"Limit ({MAX_PER_RUN}) doldu.")
                 break
 
+            score = score_item(it["content"])
+            if score < SCORE_MIN:
+                log(f"Düşük skor ({score}), atlanıyor: {it['id']}")
+                posted_set.add(it["id"])
+                state["posted"] = sorted(list(posted_set))[-5000:]
+                save_state(state)
+                continue
+
             tweet = build_tweet(it["codes"], it["content"], it["id"])
-            log(f"Sıradaki Tweet: {tweet}")
+            if tweet is None:
+                log(f"Haber tweete sığmıyor, atlanıyor: {it['id']}")
+                posted_set.add(it["id"])
+                state["posted"] = sorted(list(posted_set))[-5000:]
+                save_state(state)
+                continue
+            log(f"Skor: {score} | Tweet: {tweet}")
             
             try:
                 ok = send_tweet(tw, tweet)
