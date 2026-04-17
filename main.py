@@ -1,5 +1,3 @@
-$ cat /home/user/kap-autotweet/main.py
-
 import os
 import re
 import json
