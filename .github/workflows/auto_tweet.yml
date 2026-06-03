@@ -1,7 +1,9 @@
 name: Run bot (remote dispatch)
 
 on:
-  workflow_dispatch: {}   # sadece dış tetikleme/manuel
+  schedule:
+    - cron: '*/15 7-18 * * 1-5'  # Her 15 dk, hafta içi 10:00-21:00 TR
+  workflow_dispatch: {}
 
 jobs:
   run:
